@@ -1,0 +1,64 @@
+[project]
+name = "ai-dev-team"
+version = "0.1.0"
+description = "AI Dev Team — multi-agent engineering platform with strict FSM, repo awareness, and contract enforcement."
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    ".venv",
+    ".pytest_tmp",
+    ".pytest_cache",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+ignore = [
+    "E501",   # line-too-long handled by formatter
+    "B008",   # function calls in default args (FastAPI-style)
+    "RUF001", # ambiguous-unicode in strings — Russian prompts are intentional
+    "RUF002", # ambiguous-unicode in docstrings — Russian docs are intentional
+    "RUF003", # ambiguous-unicode in comments
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = [
+    "B011",   # assert in tests is fine
+    "B017",   # pytest.raises(Exception) used to check frozen-dataclass mutations
+    "SIM300", # `assert actual == expected` is the conventional test style
+    "RUF005", # list concatenation is acceptable in tests for clarity
+    "RUF043", # `match=` strings with literal dots are acceptable in tests
+]
+"core/agents.py" = [
+    "E501",   # long prompt strings; intentional
+]
+
+[tool.coverage.run]
+branch = true
+source = ["core"]
+omit = [
+    "tests/*",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+precision = 1
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

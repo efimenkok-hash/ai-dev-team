@@ -1,0 +1,6 @@
+# Development dependencies. Install on top of runtime:
+#   pip install -r requirements-dev.txt
+-r requirements.txt
+pytest>=8.0,<10
+ruff>=0.6
+coverage>=7.4,<9

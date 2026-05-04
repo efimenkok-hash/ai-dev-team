@@ -1,0 +1,7 @@
+# Runtime dependencies (production).
+# Pin lower bounds; allow patch/minor updates.
+requests>=2.32,<3
+python-dotenv>=1.0,<2
+numpy>=1.26,<3
+sentence-transformers>=3.0
+faiss-cpu>=1.8
