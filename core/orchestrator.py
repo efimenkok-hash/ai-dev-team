@@ -26,6 +26,13 @@ CONTRACTS:
    при заданном cost_estimator также логируются tokens и cost_usd.
 9. Если cost_budget_usd задан, после каждого agent call проверяется
    накопленная стоимость. Превышение -> terminate FAIL.
+10. Если runtime_validator задан, после QA-PASS hook прогоняется в QA-state.
+    Возврат ok=False -> синтезируется REJECTED-payload (verdict+for_fixer)
+    в scratch.latest_review и pipeline переходит в FIX (qa_fix loop bump).
+    Возврат ok=True или None -> SUCCESS как обычно. Любая Exception из hook
+    -> FAIL с runtime_validator_exception причиной. Это закрывает Risk C
+    "pipeline возвращает SUCCESS на коде, который не проходит реальные
+    инструменты".
 """
 
 import contextlib
@@ -33,6 +40,7 @@ import json
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from core.fsm import (
     MAX_QA_FIX_LOOPS,
@@ -47,11 +55,16 @@ from core.fsm import (
 from core.memory import PipelineMemory, Snapshot
 from core.observability import Observability
 
+if TYPE_CHECKING:
+    from core.runtime_validator import ValidationReport
+
 AgentFn = Callable[..., str]
 AgentRegistry = dict[str, AgentFn]
 TaskValidator = Callable[[str], None]
 # (agent_name, args_tuple, output) -> (input_tokens, output_tokens, cost_usd)
 CostEstimator = Callable[[str, tuple, str], tuple[int, int, float]]
+# (task_id, snapshot) -> ValidationReport | None.  None means "skip".
+RuntimeValidationHook = Callable[[str, Snapshot], "ValidationReport | None"]
 
 
 def reject_long_task(max_chars: int = 10000) -> TaskValidator:
@@ -188,6 +201,7 @@ class Orchestrator:
         task_validators: Sequence[TaskValidator] = (),
         cost_estimator: CostEstimator | None = None,
         cost_budget_usd: float | None = None,
+        runtime_validator: RuntimeValidationHook | None = None,
     ) -> None:
         missing = [a for a in REQUIRED_AGENTS if a not in agents]
         if missing:
@@ -198,12 +212,17 @@ class Orchestrator:
             or cost_budget_usd <= 0
         ):
             raise ValueError(f"invalid_cost_budget:{cost_budget_usd}")
+        if runtime_validator is not None and not callable(runtime_validator):
+            raise ValueError(
+                f"invalid_runtime_validator:{type(runtime_validator).__name__}"
+            )
         self._memory = memory
         self._agents = agents
         self._obs = observability
         self._task_validators: tuple[TaskValidator, ...] = tuple(task_validators)
         self._cost_estimator = cost_estimator
         self._cost_budget = cost_budget_usd
+        self._runtime_validator = runtime_validator
 
     def run(self, task_id: str, raw_task: str) -> RunResult:
         for validator in self._task_validators:
@@ -459,6 +478,9 @@ class Orchestrator:
 
         verdict = parsed.get("verdict")
         if verdict == "PASS":
+            runtime_decision = self._invoke_runtime_validator(task_id)
+            if runtime_decision is not None:
+                return runtime_decision
             return StepDecision(next_state=State.SUCCESS)
         if verdict == "FAIL":
             for_fixer = parsed.get("for_fixer")
@@ -469,6 +491,89 @@ class Orchestrator:
                 return StepDecision(fail_reason="qa_fix_loop_exceeded")
             return StepDecision(next_state=State.FIX)
         return StepDecision()
+
+    def _invoke_runtime_validator(self, task_id: str) -> StepDecision | None:
+        """Runs the optional runtime validation hook after QA-PASS verdict.
+
+        Returns:
+          - None       -> SUCCESS path (no hook, hook returned None, or report.ok)
+          - StepDecision -> caller should return it directly (FIX or FAIL)
+        """
+        if self._runtime_validator is None:
+            return None
+        try:
+            report = self._runtime_validator(task_id, self._memory.snapshot(task_id))
+        except Exception as exc:
+            return StepDecision(
+                fail_reason=f"runtime_validator_exception:{type(exc).__name__}:{exc}"
+            )
+        if report is None:
+            return None
+        ok = getattr(report, "ok", None)
+        if ok is True:
+            return None
+        if ok is None:
+            return StepDecision(
+                fail_reason="runtime_validator_returned_invalid_report"
+            )
+
+        # report.ok is False — synthesize a REJECTED review and bump qa_fix loop.
+        try:
+            summary = report.failure_summary()
+        except Exception as exc:
+            summary = f"unrenderable_summary:{type(exc).__name__}:{exc}"
+
+        try:
+            loop = self._memory.increment_loop(task_id, "qa_fix")
+        except ValueError as exc:
+            return StepDecision(fail_reason=f"runtime_loop_failed:{exc}")
+        if loop > MAX_QA_FIX_LOOPS:
+            return StepDecision(
+                fail_reason=f"qa_fix_loop_exceeded:runtime:{summary[:120]}"
+            )
+
+        synthesized = self._build_runtime_review_payload(report, summary)
+        return StepDecision(next_state=State.FIX, latest_review=synthesized)
+
+    @staticmethod
+    def _build_runtime_review_payload(report, summary: str) -> str:
+        """Synthesizes a REJECTED review payload from a ValidationReport so
+        that the existing _handle_fix path can extract for_fixer items.
+        """
+        items = []
+        try:
+            checks = list(getattr(report, "checks", ()) or ())
+        except Exception:
+            checks = []
+        for check in checks:
+            try:
+                if getattr(check, "ok", False):
+                    continue
+                name = getattr(check, "name", "<unknown>")
+                check_summary = getattr(check, "summary", "")
+                raw_output = getattr(check, "raw_output", "") or ""
+                items.append(
+                    {
+                        "file": "<runtime>",
+                        "issue": f"{name}:{check_summary}",
+                        "severity": "error",
+                        "raw_excerpt": raw_output[:1000],
+                    }
+                )
+            except Exception:
+                continue
+        if not items:
+            items.append(
+                {
+                    "file": "<runtime>",
+                    "issue": f"runtime_validation_failed:{summary or 'unknown'}",
+                    "severity": "error",
+                }
+            )
+        return json.dumps(
+            {"verdict": "REJECTED", "for_fixer": items},
+            ensure_ascii=False,
+        )
 
     def _handle_fix(self, task_id: str, scratch: _Scratch) -> StepDecision:
         arch = self._memory.get_artifact(task_id, "architect") or ""
