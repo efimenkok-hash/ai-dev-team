@@ -8,7 +8,7 @@ the bridge (they need runtime state — orchestrator, adapter registry,
 observability — that doesn't belong in this pure-logic module).
 
 CONTRACTS:
-1. CommandName enum lists exactly the 8 commands the spec requires.
+1. CommandName enum lists exactly the 9 commands the spec requires.
 2. parse_command(text) is total: it never raises. Returns BotCommand or
    None. Recognises both '/cmd args' and '/cmd@botname args' (Telegram
    appends '@botname' in group chats).
@@ -38,6 +38,7 @@ class CommandName(str, Enum):
     LOG = "log"
     STOP = "stop"
     RETRY = "retry"
+    PUSH = "push"
     HELP = "help"
 
 
@@ -52,6 +53,7 @@ COMMAND_DESCRIPTIONS: dict[CommandName, str] = {
     CommandName.LOG: "лог последней задачи",
     CommandName.STOP: "остановить текущую задачу",
     CommandName.RETRY: "повторить (/retry [--different])",
+    CommandName.PUSH: "запушить ветку в GitHub (/push <task_id>)",
     CommandName.HELP: "эта справка",
 }
 
@@ -66,6 +68,7 @@ COMMAND_EMOJIS: dict[CommandName, str] = {
     CommandName.LOG: "📜",
     CommandName.STOP: "⏹",
     CommandName.RETRY: "🔁",
+    CommandName.PUSH: "🚀",
     CommandName.HELP: "❓",
 }
 

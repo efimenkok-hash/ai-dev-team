@@ -18,10 +18,10 @@ from core.bot_commands import (
 
 
 def test_command_name_enum_complete():
-    """All 9 commands from the spec must be in the enum."""
+    """All 10 commands must be in the enum."""
     expected = {
         "projects", "switch", "budget", "agents", "tier",
-        "log", "stop", "retry", "help",
+        "log", "stop", "retry", "push", "help",
     }
     assert {c.value for c in CommandName} == expected
 

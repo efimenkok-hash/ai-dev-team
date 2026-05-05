@@ -22,6 +22,7 @@ from core.bot_runner import (
     make_help_handler,
     make_log_handler,
     make_projects_handler,
+    make_push_handler,
     make_retry_handler,
     make_simple_task_handler,
     make_stop_handler,
@@ -31,6 +32,7 @@ from core.bot_runner import (
 )
 from core.confirmation_gate import ConfirmationGate
 from core.model_tier import default_registry as default_tier_registry
+from core.task_history import TaskHistory
 from core.telegram_bridge import (
     BridgeReply,
     IncomingMessage,
@@ -590,10 +592,10 @@ def test_tier_handler_marks_active_in_summary():
 # ---------------------------------------------------------------------------
 
 
-def test_build_command_registry_has_all_nine():
+def test_build_command_registry_has_all_ten():
     personas = default_registry()
     reg = build_command_registry(personas)
-    assert len(reg) == 9
+    assert len(reg) == 10
     for cmd_name in CommandName:
         assert cmd_name in reg
 
@@ -887,3 +889,173 @@ def test_build_bridge_from_env_no_send_progress_ok_when_repo_path_missing(tmp_pa
     send, _ = _captured_send()
     bridge = build_bridge_from_env(env, send_callable=send)
     assert isinstance(bridge, TelegramBridge)
+
+
+# ---------------------------------------------------------------------------
+# make_push_handler (Step 14c-1)
+# ---------------------------------------------------------------------------
+
+
+def _make_sandbox_for_push(tmp_path):
+    from core.sandbox_workspace import (
+        SandboxConfig,
+        SandboxWorkspace,
+        _RunResult,
+        _SubprocessRunner,
+    )
+
+    class _OkRunner(_SubprocessRunner):
+        def __init__(self):
+            self.calls = []
+
+        def run(self, cmd, cwd, env, timeout):
+            self.calls.append({"cmd": cmd, "cwd": cwd})
+            return _RunResult(returncode=0, stdout="", stderr="")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    cfg = SandboxConfig(
+        main_repo_path=repo,
+        worktree_root=tmp_path / "worktrees",
+    )
+    runner = _OkRunner()
+    return SandboxWorkspace(cfg, runner=runner), runner
+
+
+def _make_push_summary(task_id="task-push-001", commit_sha="deadbeef12345678"):
+    import time
+
+    from core.task_history import TaskSummary
+    return TaskSummary(
+        task_id=task_id,
+        branch=f"feature/{task_id}",
+        commit_sha=commit_sha,
+        final_state="SUCCESS",
+        failure_reason=None,
+        tier_name="ECONOMY",
+        finished_at=time.time(),
+    )
+
+
+def test_make_push_handler_returns_callable():
+    handler = make_push_handler()
+    assert callable(handler)
+
+
+def test_push_handler_stub_when_no_sandbox():
+    handler = make_push_handler(sandbox=None, task_history=None)
+    cmd = parse_command("/push task-001")
+    result = handler(cmd, None)
+    assert "REPO_PATH" in result or "полном режиме" in result
+
+
+def test_push_handler_rejects_invalid_sandbox():
+    with pytest.raises(ValueError, match="invalid_sandbox"):
+        make_push_handler(sandbox="not a sandbox")  # type: ignore[arg-type]
+
+
+def test_push_handler_rejects_invalid_task_history(tmp_path):
+    sandbox, _ = _make_sandbox_for_push(tmp_path)
+    with pytest.raises(ValueError, match="invalid_task_history"):
+        make_push_handler(sandbox=sandbox, task_history="not history")  # type: ignore[arg-type]
+
+
+def test_push_handler_missing_task_id_arg(tmp_path):
+    sandbox, _ = _make_sandbox_for_push(tmp_path)
+    history = TaskHistory()
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
+    cmd = parse_command("/push")
+    result = handler(cmd, None)
+    assert "task_id" in result.lower() or "укажи" in result.lower()
+
+
+def test_push_handler_unknown_task_id(tmp_path):
+    sandbox, _ = _make_sandbox_for_push(tmp_path)
+    history = TaskHistory()
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
+    cmd = parse_command("/push task-unknown")
+    result = handler(cmd, None)
+    assert "не найден" in result
+
+
+def test_push_handler_refuses_failed_task(tmp_path):
+    import time
+
+    from core.task_history import TaskSummary
+    sandbox, _ = _make_sandbox_for_push(tmp_path)
+    history = TaskHistory()
+    history.record(TaskSummary(
+        task_id="task-fail",
+        branch="feature/task-fail",
+        commit_sha=None,
+        final_state="FAIL",
+        failure_reason="ruff_error",
+        tier_name="ECONOMY",
+        finished_at=time.time(),
+    ))
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
+    cmd = parse_command("/push task-fail")
+    result = handler(cmd, None)
+    assert "SUCCESS" in result or "нечего пушить" in result
+
+
+def test_push_handler_success_calls_push_branch_from_main(tmp_path):
+    sandbox, runner = _make_sandbox_for_push(tmp_path)
+    history = TaskHistory()
+    summary = _make_push_summary()
+    history.record(summary)
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
+    cmd = parse_command("/push task-push-001")
+    result = handler(cmd, None)
+    assert "Запушено" in result
+    assert len(runner.calls) == 1
+    assert runner.calls[0]["cmd"] == ("git", "push", "origin", "feature/task-push-001")
+
+
+def test_push_handler_git_failure_returns_error_message(tmp_path):
+    from core.sandbox_workspace import (
+        SandboxConfig,
+        SandboxWorkspace,
+        _RunResult,
+        _SubprocessRunner,
+    )
+
+    class _FailRunner(_SubprocessRunner):
+        def run(self, cmd, cwd, env, timeout):
+            return _RunResult(returncode=1, stdout="", stderr="fatal: rejected")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    cfg = SandboxConfig(main_repo_path=repo, worktree_root=tmp_path / "wt")
+    sandbox = SandboxWorkspace(cfg, runner=_FailRunner())
+
+    history = TaskHistory()
+    history.record(_make_push_summary())
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
+    cmd = parse_command("/push task-push-001")
+    result = handler(cmd, None)
+    assert "Push не удался" in result or "❌" in result
+
+
+def test_push_handler_shows_commit_sha_short_on_success(tmp_path):
+    sandbox, _ = _make_sandbox_for_push(tmp_path)
+    history = TaskHistory()
+    history.record(_make_push_summary(commit_sha="cafebabe12345678"))
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
+    result = handler(parse_command("/push task-push-001"), None)
+    assert "cafebabe" in result  # first 8 chars of sha
+
+
+def test_build_command_registry_with_sandbox_wires_push(tmp_path):
+    """When sandbox+task_history are passed, /push performs real push logic."""
+    sandbox, runner = _make_sandbox_for_push(tmp_path)
+    history = TaskHistory()
+    history.record(_make_push_summary())
+
+    personas = default_registry()
+    reg = build_command_registry(personas, sandbox=sandbox, task_history=history)
+    result = reg.dispatch(parse_command("/push task-push-001"))
+    assert "Запушено" in result
+    assert len(runner.calls) == 1

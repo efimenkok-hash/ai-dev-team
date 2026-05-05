@@ -55,6 +55,7 @@ from core.llm_dispatcher import LLMDispatcher
 from core.model_tier import default_registry as default_tier_registry
 from core.real_task_handler import RealTaskHandlerConfig, make_real_task_handler
 from core.sandbox_workspace import SandboxConfig, SandboxWorkspace
+from core.task_history import TaskHistory
 from core.telegram_bridge import (
     BridgeReply,
     IncomingMessage,
@@ -188,6 +189,8 @@ def build_real_task_handler_from_env(
     *,
     tier_store: TierSessionStore,
     send_progress: Callable[[int, str], None],
+    sandbox: SandboxWorkspace | None = None,
+    task_history: TaskHistory | None = None,
 ) -> TaskHandler | None:
     """Assemble the full pipeline TaskHandler from env when possible.
 
@@ -197,6 +200,11 @@ def build_real_task_handler_from_env(
 
     Optional env vars:
       WORKTREE_ROOT      — where worktrees are placed (default: tmp dir)
+
+    Optional kwargs:
+      sandbox       — pre-built SandboxWorkspace (built from env if None).
+      task_history  — shared TaskHistory for /push and /log commands; each
+                      completed task summary is recorded in on_complete.
 
     Returns None (silently) if OPENROUTER_API_KEY or REPO_PATH are absent,
     or if any setup error occurs (invalid path, OSError, TypeError, ValueError
@@ -215,8 +223,8 @@ def build_real_task_handler_from_env(
     if dispatcher is None:
         return None
 
-    sandbox = _try_build_sandbox(env)
-    if sandbox is None:
+    _sandbox = sandbox if sandbox is not None else _try_build_sandbox(env)
+    if _sandbox is None:
         return None
 
     runner = BackgroundTaskRunner()
@@ -224,11 +232,12 @@ def build_real_task_handler_from_env(
         factory = build_dispatcher_agent_registry_factory(dispatcher)
         return make_real_task_handler(
             runner=runner,
-            sandbox=sandbox,
+            sandbox=_sandbox,
             tier_store=tier_store,
             send_progress=send_progress,
             agent_registry_factory=factory,
             config=RealTaskHandlerConfig(),
+            task_history=task_history,
         )
     except (ValueError, TypeError, OSError):
         runner.shutdown(wait=False)
@@ -383,6 +392,81 @@ def make_agents_handler(personas: PersonaRegistry) -> CommandHandler:
     return _handle
 
 
+def make_push_handler(
+    sandbox: SandboxWorkspace | None = None,
+    task_history: TaskHistory | None = None,
+) -> CommandHandler:
+    """Returns a /push <task_id> handler.
+
+    When sandbox and task_history are provided (real pipeline active):
+      - Looks up task_id in history to find branch and commit_sha.
+      - Calls sandbox.push_branch_from_main(branch) — works after worktree
+        release because it runs `git push` from the main repo.
+      - Refuses to push if the task never reached SUCCESS (no commit_sha).
+
+    When either is None (simple-stub pipeline):
+      - Returns a helpful message explaining how to enable the feature.
+    """
+    if sandbox is not None and not isinstance(sandbox, SandboxWorkspace):
+        raise ValueError(f"invalid_sandbox:{type(sandbox).__name__}")
+    if task_history is not None and not isinstance(task_history, TaskHistory):
+        raise ValueError(f"invalid_task_history:{type(task_history).__name__}")
+
+    _sandbox = sandbox
+    _history = task_history
+
+    def _handle(cmd: BotCommand, _ctx: Any) -> str:
+        if _sandbox is None or _history is None:
+            return (
+                "🚀 /push <task_id>\n"
+                "\n"
+                "🔜 Доступно только в полном режиме.\n"
+                "Настрой OPENROUTER_API_KEY + REPO_PATH чтобы включить."
+            )
+        positional = cmd.positional_args()
+        if not positional:
+            return (
+                "⚠️ Укажи task_id:\n"
+                "\n"
+                "  /push <task_id>\n"
+                "\n"
+                "Например: /push task-1714829400-7a3b9c"
+            )
+        task_id = positional[0]
+        summary = _history.get(task_id)
+        if summary is None:
+            return (
+                f"⚠️ task_id `{task_id}` не найден в истории.\n"
+                "\n"
+                "Задача ещё выполняется или id указан неверно."
+            )
+        if summary.commit_sha is None:
+            return (
+                f"⚠️ Задача `{task_id}` не достигла SUCCESS — нечего пушить.\n"
+                "\n"
+                f"  state   `{summary.final_state}`\n"
+                f"  reason  `{summary.failure_reason or '?'}`"
+            )
+        try:
+            _sandbox.push_branch_from_main(summary.branch)
+        except Exception as exc:
+            return (
+                f"❌ Push не удался\n"
+                "\n"
+                f"  branch  `{summary.branch}`\n"
+                f"  ошибка  {type(exc).__name__}: {str(exc)[:200]}"
+            )
+        return (
+            f"🚀 Запушено!\n"
+            "\n"
+            f"  task-id `{task_id}`\n"
+            f"  branch  `{summary.branch}`\n"
+            f"  commit  `{summary.commit_sha[:8]}`"
+        )
+
+    return _handle
+
+
 def make_log_handler() -> CommandHandler:
     def _handle(_cmd: BotCommand, _ctx: Any) -> str:
         return (
@@ -520,12 +604,18 @@ def build_command_registry(
     initial_budget_usd: float = 10.0,
     active_project: str = "ai-dev-team",
     tier_store: TierSessionStore | None = None,
+    sandbox: SandboxWorkspace | None = None,
+    task_history: TaskHistory | None = None,
 ) -> CommandRegistry:
-    """Build a CommandRegistry pre-populated with all 9 default handlers.
+    """Build a CommandRegistry pre-populated with all 10 default handlers.
 
     If tier_store is None, a fresh store backed by default_tier_registry()
     is created. Pass an explicit store when the bridge wants to share tier
     state with other components (e.g. real_task_handler).
+
+    sandbox + task_history are optional: when both are provided the /push
+    handler is fully wired (real push to GitHub). When either is None,
+    /push returns a "настрой REPO_PATH" stub.
     """
     if not isinstance(personas, PersonaRegistry):
         raise ValueError("invalid_personas")
@@ -548,6 +638,7 @@ def build_command_registry(
     reg.register(CommandName.LOG, make_log_handler())
     reg.register(CommandName.STOP, make_stop_handler())
     reg.register(CommandName.RETRY, make_retry_handler())
+    reg.register(CommandName.PUSH, make_push_handler(sandbox, task_history))
     # /help is registered LAST so it can list everything else.
     reg.register(
         CommandName.HELP,
@@ -630,7 +721,18 @@ def build_bridge_from_env(
     whisper = build_whisper_client(env)
     vision = build_vision_client(env)
     tier_store = TierSessionStore(default_tier_registry())
-    commands = build_command_registry(personas, tier_store=tier_store)
+
+    # Build sandbox once so it can be shared between the task handler
+    # (acquire/release worktrees) and the /push command handler (push_branch_from_main).
+    sandbox = _try_build_sandbox(env)
+    task_history = TaskHistory() if sandbox is not None else None
+
+    commands = build_command_registry(
+        personas,
+        tier_store=tier_store,
+        sandbox=sandbox,
+        task_history=task_history,
+    )
 
     # Attempt to build the full dispatcher-backed pipeline; fall back to stub.
     # Guard: if the real pipeline would actually activate (API key present AND
@@ -649,6 +751,8 @@ def build_bridge_from_env(
         env,
         tier_store=tier_store,
         send_progress=_send_progress,
+        sandbox=sandbox,
+        task_history=task_history,
     ) or make_simple_task_handler(personas)
 
     return TelegramBridge(

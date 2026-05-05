@@ -86,6 +86,7 @@ from core.sandbox_workspace import (
     SandboxWorkspace,
     WorktreeHandle,
 )
+from core.task_history import TaskHistory, TaskSummary
 from core.telegram_bridge import BridgeReply, IncomingMessage, TaskHandler
 from core.tier_session import TierSessionStore
 
@@ -196,6 +197,7 @@ def make_real_task_handler(
     observability: Observability | None = None,
     memory_factory: Callable[[], PipelineMemory] = PipelineMemory,
     task_id_factory: Callable[[], str] = generate_task_id,
+    task_history: TaskHistory | None = None,
 ) -> TaskHandler:
     """Build a TaskHandler that runs the full agent pipeline asynchronously.
 
@@ -233,6 +235,8 @@ def make_real_task_handler(
         raise ValueError("memory_factory_not_callable")
     if not callable(task_id_factory):
         raise ValueError("task_id_factory_not_callable")
+    if task_history is not None and not isinstance(task_history, TaskHistory):
+        raise ValueError(f"invalid_task_history:{type(task_history).__name__}")
 
     available_tiers = ", ".join(tier_store.registry.list_names())
 
@@ -410,6 +414,22 @@ def make_real_task_handler(
             tier_name = result.get("tier_name", "?")
             commit_sha = result.get("commit_sha") or ""
             sha_short = commit_sha[:8] if commit_sha else ""
+
+            # Record to shared TaskHistory so /push and /log can access it.
+            if task_history is not None:
+                with contextlib.suppress(Exception):
+                    task_history.record(
+                        TaskSummary(
+                            task_id=handle.task_id,
+                            branch=branch,
+                            commit_sha=commit_sha or None,
+                            final_state=final_state,
+                            failure_reason=result.get("failure_reason"),
+                            tier_name=tier_name,
+                            finished_at=time.time(),
+                        )
+                    )
+
             if final_state == State.SUCCESS.value:
                 _safe_send(
                     chat_id,

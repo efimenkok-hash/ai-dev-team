@@ -321,6 +321,32 @@ class SandboxWorkspace:
             )
         return result_sha.stdout.strip()
 
+    def push_branch_from_main(
+        self,
+        branch: str,
+        *,
+        remote: str = "origin",
+    ) -> None:
+        """`git push <remote> <branch>` from the main repo directory.
+
+        Unlike push_branch(), this does NOT require the worktree to exist —
+        it works after release(). Intended for the /push bot command.
+
+        Raises:
+            ValueError: on invalid branch or remote name.
+            SandboxError("git_push_failed"): when git returns non-zero.
+        """
+        if not isinstance(branch, str) or not _BRANCH_NAME_RE.match(branch):
+            raise ValueError(f"invalid_branch:{branch!r}")
+        if not isinstance(remote, str) or not _REMOTE_NAME_RE.match(remote):
+            raise ValueError(f"invalid_remote_name:{remote!r}")
+        result = self._git("push", remote, branch)
+        if result.returncode != 0:
+            raise SandboxError(
+                "git_push_failed",
+                _excerpt(result.stderr),
+            )
+
     def push_branch(
         self,
         handle: WorktreeHandle,
