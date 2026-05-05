@@ -145,6 +145,33 @@ def build_dispatcher_from_env(env: Mapping[str, str]) -> LLMDispatcher | None:
     return LLMDispatcher(api_key=key.strip())
 
 
+def cleanup_orphan_worktrees_from_env(env: Mapping[str, str]) -> int:
+    """Sweep stale worktree directories at bot startup. Returns count removed.
+
+    A worktree is "orphan" when its directory exists under WORKTREE_ROOT
+    but git has no record of it (e.g. previous bot crashed mid-task and
+    left a directory behind, or the user rebooted). cleanup_orphans()
+    removes the directory and runs `git worktree prune`.
+
+    Returns:
+      - 0 if env doesn't configure a real pipeline (no sandbox to query)
+      - 0 if there were no orphans
+      - N >= 1 if N orphan directories were removed
+
+    Failures are swallowed so startup never crashes; errors are returned
+    as 0. Caller logs the count.
+    """
+    if not isinstance(env, Mapping):
+        raise ValueError("env_must_be_mapping")
+    sandbox = _try_build_sandbox(env)
+    if sandbox is None:
+        return 0
+    try:
+        return sandbox.cleanup_orphans()
+    except Exception:
+        return 0
+
+
 def _try_build_sandbox(env: Mapping[str, str]) -> SandboxWorkspace | None:
     """Build SandboxWorkspace from env-vars, or return None on any failure.
 
@@ -489,6 +516,129 @@ def make_push_handler(
     return _handle
 
 
+def make_pr_handler(
+    sandbox: SandboxWorkspace | None = None,
+    task_history: TaskHistory | None = None,
+) -> CommandHandler:
+    """Returns a /pr <task_id> handler that creates a draft GitHub PR.
+
+    Behaviour:
+      - When sandbox + task_history are both wired (real pipeline active):
+        * Validate task_id regex (rejects shell-meta, traversal, uppercase).
+        * Look up summary in TaskHistory; require commit_sha is not None.
+        * Push the branch (idempotent — safe if already pushed).
+        * Run `gh pr create --draft` with title/body derived from the task.
+        * Return PR URL on success.
+      - When either is None: returns "настрой REPO_PATH" stub.
+
+    The PR is created as a DRAFT so user can review before requesting review.
+    """
+    if sandbox is not None and not isinstance(sandbox, SandboxWorkspace):
+        raise ValueError(f"invalid_sandbox:{type(sandbox).__name__}")
+    if task_history is not None and not isinstance(task_history, TaskHistory):
+        raise ValueError(f"invalid_task_history:{type(task_history).__name__}")
+
+    from core.sandbox_workspace import _TASK_ID_RE as _TID_RE
+
+    def _handle(cmd: BotCommand, _ctx: Any) -> str:
+        if sandbox is None or task_history is None:
+            return (
+                "🪄 /pr <task_id>\n"
+                "\n"
+                "PR недоступен: настрой REPO_PATH чтобы включить полный pipeline.\n"
+                "Также нужен `gh` CLI с авторизацией: `gh auth login`."
+            )
+        positional = cmd.positional_args()
+        if not positional:
+            return (
+                "⚠️ Укажи task_id:\n"
+                "\n"
+                "  /pr <task_id>\n"
+                "\n"
+                "Например: /pr task-1714829400-7a3b9c"
+            )
+        task_id = positional[0]
+        if not isinstance(task_id, str) or not _TID_RE.match(task_id):
+            return (
+                f"❌ Некорректный task_id: `{task_id[:80]}`\n"
+                "\n"
+                "task_id должен содержать только строчные буквы, цифры, "
+                "дефис и подчёркивание."
+            )
+        summary = task_history.get(task_id)
+        if summary is None:
+            return (
+                f"⚠️ task_id `{task_id}` не найден в истории.\n"
+                "\n"
+                "Задача ещё выполняется или id указан неверно."
+            )
+        if summary.commit_sha is None:
+            return (
+                f"⚠️ Задача `{task_id}` не достигла SUCCESS — нечего пушить.\n"
+                "\n"
+                f"  state   `{summary.final_state}`\n"
+                f"  reason  `{summary.failure_reason or '?'}`"
+            )
+
+        # 1. Idempotent push first — `gh pr create` requires the branch on remote.
+        try:
+            sandbox.push_named_branch(summary.branch)
+        except Exception as exc:
+            return (
+                f"❌ Push перед PR не удался\n"
+                "\n"
+                f"  branch  `{summary.branch}`\n"
+                f"  ошибка  {type(exc).__name__}: {str(exc)[:200]}"
+            )
+
+        # 2. Create the draft PR. Title from task_id+branch; body cites task summary.
+        pr_title = f"AI Dev Team: {summary.task_id}"
+        pr_body = (
+            f"Автоматически сгенерированный PR от AI Dev Team.\n\n"
+            f"- task-id: `{summary.task_id}`\n"
+            f"- branch: `{summary.branch}`\n"
+            f"- commit: `{summary.commit_sha}`\n"
+            f"- тариф: `{summary.tier_name}`\n\n"
+            f"Этот PR создан как **draft** — проверьте код и нажмите "
+            f"\"Ready for review\" в GitHub когда будете готовы.\n"
+        )
+        try:
+            url = sandbox.gh_pr_create(
+                summary.branch,
+                title=pr_title,
+                body=pr_body,
+            )
+        except Exception as exc:
+            from core.sandbox_workspace import SandboxError
+
+            if isinstance(exc, SandboxError) and exc.code == "gh_not_found":
+                return (
+                    "❌ `gh` CLI не найден\n"
+                    "\n"
+                    "Установи GitHub CLI: https://cli.github.com\n"
+                    "Затем авторизуйся:  `gh auth login`"
+                )
+            return (
+                f"❌ Не удалось создать PR\n"
+                "\n"
+                f"  branch  `{summary.branch}`\n"
+                f"  ошибка  {type(exc).__name__}: {str(exc)[:200]}\n"
+                f"\n"
+                f"Если это первый PR — проверь `gh auth status`."
+            )
+        return (
+            f"🪄 Draft PR создан\n"
+            "\n"
+            f"  task-id  `{task_id}`\n"
+            f"  branch   `{summary.branch}`\n"
+            f"  commit   `{summary.commit_sha[:8]}`\n"
+            f"\n"
+            f"  {url}"
+        )
+
+    return _handle
+
+
 def _format_task_summary(summary: Any) -> str:  # summary: TaskSummary
     """Render one TaskSummary as a human-readable Telegram message."""
     import time as _time
@@ -759,6 +909,7 @@ def build_command_registry(
     reg.register(CommandName.STOP, make_stop_handler(runner))
     reg.register(CommandName.RETRY, make_retry_handler())
     reg.register(CommandName.PUSH, make_push_handler(sandbox, task_history))
+    reg.register(CommandName.PR, make_pr_handler(sandbox, task_history))
     # /help is registered LAST so it can list everything else.
     reg.register(
         CommandName.HELP,
@@ -774,10 +925,12 @@ def build_command_registry(
 
 
 def make_simple_task_handler(_personas: PersonaRegistry) -> TaskHandler:
-    """MVP task handler. Acknowledges receipt from the Менеджер persona.
+    """MVP task handler. Acknowledges receipt — used when the real LLM
+    pipeline isn't fully configured.
 
-    Real Orchestrator integration (text → run pipeline → stream agents)
-    lives in Module 7b.
+    The bot falls into this mode when either OPENROUTER_API_KEY or
+    REPO_PATH is missing from the environment. The reply explicitly tells
+    the user what's missing so they don't think the bot is broken.
     """
 
     def _handle(text: str, _msg: IncomingMessage) -> BridgeReply:
@@ -785,13 +938,17 @@ def make_simple_task_handler(_personas: PersonaRegistry) -> TaskHandler:
         return BridgeReply(
             persona_role="pm_agent",
             body=(
-                f"👋 Принял задачу\n"
+                f"⚠️ Реальный pipeline не настроен — задачу не могу выполнить.\n"
                 f"\n"
+                f"Получил:\n"
                 f"«{excerpt}»\n"
                 f"\n"
-                f"🔜 Реальное выполнение через orchestrator — в Модуле 7b. "
-                f"Сейчас это MVP-каркас: проверяем транспорт, "
-                f"распознавание и подписи персон."
+                f"Чтобы агенты заработали, добавь в .env:\n"
+                f"  • OPENROUTER_API_KEY (https://openrouter.ai/keys)\n"
+                f"  • REPO_PATH = путь к git-репозиторию (с .git/)\n"
+                f"\n"
+                f"Затем перезапусти бота. Без этих переменных я могу только "
+                f"подтверждать приём, а не запускать пайплайн."
             ),
         )
 
@@ -840,7 +997,17 @@ def build_bridge_from_env(
     gate = build_confirmation_gate(env)
     whisper = build_whisper_client(env)
     vision = build_vision_client(env)
-    tier_store = TierSessionStore(default_tier_registry())
+
+    # Persistent state (Step 19): if BOT_STATE_DIR is set, tier-session
+    # store survives bot restarts. Otherwise we fall back to in-memory only.
+    bot_state_dir_raw = env.get("BOT_STATE_DIR", "").strip()
+    tier_persistence_path: Path | None = None
+    if bot_state_dir_raw:
+        tier_persistence_path = Path(bot_state_dir_raw) / "tier_sessions.json"
+    tier_store = TierSessionStore(
+        default_tier_registry(),
+        persistence_path=tier_persistence_path,
+    )
 
     # Build sandbox once so it can be shared between the task handler
     # (acquire/release worktrees) and the /push command handler (push_branch_from_main).

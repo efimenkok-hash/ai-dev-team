@@ -293,6 +293,17 @@ async def main(argv: list[str] | None = None) -> int:
         )
     )
 
+    # Sweep stale worktrees from previous sessions before accepting messages.
+    # A previous bot crash or kill -9 can leave /tmp/aidt_worktrees/<task_id>
+    # directories that git no longer tracks. Cleaning them on startup keeps
+    # disk usage bounded and prevents stale state from interfering with new
+    # acquire() calls that could trip the worktree_exists guard.
+    from core.bot_runner import cleanup_orphan_worktrees_from_env
+
+    orphans = cleanup_orphan_worktrees_from_env(env)
+    if orphans > 0:
+        logger.info("Cleaned %d orphan worktree(s) from previous sessions", orphans)
+
     logger.info("Bot starting. Owner whitelist: %s", env.get("TELEGRAM_OWNER_CHAT_ID"))
     logger.info("Whisper enabled: %s", bool(env.get("OPENAI_API_KEY")))
     logger.info("Vision enabled: %s", bool(env.get("OPENROUTER_API_KEY")))

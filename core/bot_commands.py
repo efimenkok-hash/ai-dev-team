@@ -39,6 +39,7 @@ class CommandName(str, Enum):
     STOP = "stop"
     RETRY = "retry"
     PUSH = "push"
+    PR = "pr"
     HELP = "help"
 
 
@@ -54,6 +55,7 @@ COMMAND_DESCRIPTIONS: dict[CommandName, str] = {
     CommandName.STOP: "остановить текущую задачу",
     CommandName.RETRY: "повторить (/retry [--different])",
     CommandName.PUSH: "запушить ветку в GitHub (/push <task_id>)",
+    CommandName.PR: "создать draft PR (/pr <task_id>)",
     CommandName.HELP: "эта справка",
 }
 
@@ -69,6 +71,7 @@ COMMAND_EMOJIS: dict[CommandName, str] = {
     CommandName.STOP: "⏹",
     CommandName.RETRY: "🔁",
     CommandName.PUSH: "🚀",
+    CommandName.PR: "🪄",
     CommandName.HELP: "❓",
 }
 

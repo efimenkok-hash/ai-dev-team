@@ -821,3 +821,136 @@ def test_integration_cleanup_orphans_with_real_git(real_repo, tmp_path):
     removed = ws.cleanup_orphans()
     assert removed == 1
     assert not orphan.exists()
+
+
+# ---------------------------------------------------------------------------
+# gh_pr_create (Step 17)
+# ---------------------------------------------------------------------------
+
+
+def _ws_with_canned_gh(fake_repo, tmp_path, *, gh_returncode=0,
+                        gh_stdout="", gh_stderr=""):
+    """Build a SandboxWorkspace whose runner returns canned `gh` results."""
+
+    class _GhCanned(_SubprocessRunner):
+        def __init__(self):
+            self.calls = []
+
+        def run(self, cmd, cwd, env, timeout):
+            self.calls.append({"cmd": cmd, "cwd": cwd})
+            if cmd[0] == "gh":
+                return _RunResult(
+                    returncode=gh_returncode,
+                    stdout=gh_stdout,
+                    stderr=gh_stderr,
+                )
+            return _RunResult(returncode=0, stdout="", stderr="")
+
+    cfg = SandboxConfig(main_repo_path=fake_repo, worktree_root=tmp_path / "wt")
+    runner = _GhCanned()
+    return SandboxWorkspace(cfg, runner=runner), runner
+
+
+def test_gh_pr_create_happy_path(fake_repo, tmp_path):
+    pr_url = "https://github.com/user/repo/pull/42"
+    ws, runner = _ws_with_canned_gh(
+        fake_repo, tmp_path,
+        gh_stdout=f"Creating pull request\n{pr_url}\n",
+    )
+    url = ws.gh_pr_create(
+        "feature/task-001",
+        title="My PR",
+        body="Some body text.",
+    )
+    assert url == pr_url
+    gh_call = next(c for c in runner.calls if c["cmd"][0] == "gh")
+    assert gh_call["cmd"][:3] == ("gh", "pr", "create")
+    assert "--draft" in gh_call["cmd"]
+    assert "--head" in gh_call["cmd"]
+    assert "--base" in gh_call["cmd"]
+
+
+def test_gh_pr_create_invalid_branch(fake_repo, tmp_path):
+    ws, _ = _ws_with_canned_gh(fake_repo, tmp_path)
+    with pytest.raises(ValueError, match="invalid_branch"):
+        ws.gh_pr_create("BAD;BRANCH", title="t", body="b")
+
+
+def test_gh_pr_create_invalid_base(fake_repo, tmp_path):
+    ws, _ = _ws_with_canned_gh(fake_repo, tmp_path)
+    with pytest.raises(ValueError, match="invalid_base"):
+        ws.gh_pr_create("feature/x", title="t", body="b", base="bad;base")
+
+
+@pytest.mark.parametrize("bad", ["", "  "])
+def test_gh_pr_create_empty_title(fake_repo, tmp_path, bad):
+    ws, _ = _ws_with_canned_gh(fake_repo, tmp_path)
+    with pytest.raises(ValueError, match="empty_title"):
+        ws.gh_pr_create("feature/x", title=bad, body="b")
+
+
+def test_gh_pr_create_long_title(fake_repo, tmp_path):
+    ws, _ = _ws_with_canned_gh(fake_repo, tmp_path)
+    with pytest.raises(ValueError, match="title_too_long"):
+        ws.gh_pr_create("feature/x", title="X" * 257, body="b")
+
+
+def test_gh_pr_create_null_in_body(fake_repo, tmp_path):
+    ws, _ = _ws_with_canned_gh(fake_repo, tmp_path)
+    with pytest.raises(ValueError, match="invalid_body_chars"):
+        ws.gh_pr_create("feature/x", title="t", body="bad\x00body")
+
+
+def test_gh_pr_create_shell_meta_in_branch(fake_repo, tmp_path):
+    """shell-meta IS rejected in branch (used as git ref) — but allowed in title/body
+    (freeform PR content; backticks for markdown code formatting are common)."""
+    ws, _ = _ws_with_canned_gh(fake_repo, tmp_path)
+    with pytest.raises(ValueError, match="invalid_branch"):
+        ws.gh_pr_create("feature/x;rm-rf", title="t", body="b")
+
+
+def test_gh_pr_create_allows_backticks_in_body(fake_repo, tmp_path):
+    """Markdown code-formatting backticks in PR body must NOT raise. They go
+    through subprocess argv, never through a shell."""
+    ws, _ = _ws_with_canned_gh(
+        fake_repo, tmp_path,
+        gh_stdout="https://github.com/x/y/pull/1\n",
+    )
+    url = ws.gh_pr_create(
+        "feature/x",
+        title="My PR with `code`",
+        body="Body with `task-id` and `branch` references.",
+    )
+    assert url == "https://github.com/x/y/pull/1"
+
+
+def test_gh_pr_create_gh_not_found(fake_repo, tmp_path):
+    ws, _ = _ws_with_canned_gh(
+        fake_repo, tmp_path,
+        gh_returncode=127,
+        gh_stderr="gh: command not found",
+    )
+    with pytest.raises(SandboxError) as exc_info:
+        ws.gh_pr_create("feature/x", title="t", body="b")
+    assert exc_info.value.code == "gh_not_found"
+
+
+def test_gh_pr_create_failure(fake_repo, tmp_path):
+    ws, _ = _ws_with_canned_gh(
+        fake_repo, tmp_path,
+        gh_returncode=1,
+        gh_stderr="GraphQL error: Resource not accessible",
+    )
+    with pytest.raises(SandboxError) as exc_info:
+        ws.gh_pr_create("feature/x", title="t", body="b")
+    assert exc_info.value.code == "gh_pr_create_failed"
+
+
+def test_gh_pr_create_returns_stdout_when_no_url(fake_repo, tmp_path):
+    """If `gh` succeeds but stdout doesn't include a URL — return stdout as-is."""
+    ws, _ = _ws_with_canned_gh(
+        fake_repo, tmp_path,
+        gh_stdout="Created PR (no URL parseable)\n",
+    )
+    result = ws.gh_pr_create("feature/x", title="t", body="b")
+    assert "Created PR" in result

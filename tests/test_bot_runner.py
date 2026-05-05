@@ -1,9 +1,12 @@
 """Tests for core.bot_runner (Step 14a Module 7 + 14b-6/7: builders + handlers)."""
 
+import time
+
 import pytest
 
 from core.agent_personas import default_registry
 from core.bot_commands import (
+    BotCommand,
     CommandName,
     parse_command,
 )
@@ -21,6 +24,7 @@ from core.bot_runner import (
     make_budget_handler,
     make_help_handler,
     make_log_handler,
+    make_pr_handler,
     make_projects_handler,
     make_push_handler,
     make_retry_handler,
@@ -120,6 +124,81 @@ def test_get_required_env_rejects_non_mapping():
 def test_get_required_env_rejects_empty_key():
     with pytest.raises(ValueError, match="empty_env_key"):
         get_required_env({"X": "v"}, "")
+
+
+# ---------------------------------------------------------------------------
+# cleanup_orphan_worktrees_from_env
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_orphans_returns_zero_without_real_pipeline():
+    """No OPENROUTER_API_KEY / REPO_PATH → no sandbox → 0 orphans removed."""
+    from core.bot_runner import cleanup_orphan_worktrees_from_env
+    assert cleanup_orphan_worktrees_from_env({}) == 0
+
+
+def test_cleanup_orphans_returns_zero_when_repo_invalid(tmp_path):
+    """REPO_PATH points at non-git directory → sandbox build fails → returns 0."""
+    from core.bot_runner import cleanup_orphan_worktrees_from_env
+    not_repo = tmp_path / "not_repo"
+    not_repo.mkdir()
+    result = cleanup_orphan_worktrees_from_env({
+        "OPENROUTER_API_KEY": "sk-or-test",
+        "REPO_PATH": str(not_repo),
+    })
+    assert result == 0
+
+
+def test_cleanup_orphans_calls_sandbox_cleanup_when_eligible(tmp_path):
+    """With valid REPO_PATH and API key → calls sandbox.cleanup_orphans()."""
+    from unittest.mock import patch
+
+    from core.bot_runner import cleanup_orphan_worktrees_from_env
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    # Mock cleanup_orphans on whatever SandboxWorkspace _try_build_sandbox returns
+    with patch(
+        "core.sandbox_workspace.SandboxWorkspace.cleanup_orphans",
+        return_value=3,
+    ) as mock_cleanup:
+        result = cleanup_orphan_worktrees_from_env({
+            "OPENROUTER_API_KEY": "sk-or-test",
+            "REPO_PATH": str(repo),
+        })
+
+    assert result == 3
+    mock_cleanup.assert_called_once()
+
+
+def test_cleanup_orphans_swallows_exceptions(tmp_path):
+    """If cleanup_orphans raises, we MUST return 0 — startup must never crash."""
+    from unittest.mock import patch
+
+    from core.bot_runner import cleanup_orphan_worktrees_from_env
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    with patch(
+        "core.sandbox_workspace.SandboxWorkspace.cleanup_orphans",
+        side_effect=RuntimeError("git exploded"),
+    ):
+        result = cleanup_orphan_worktrees_from_env({
+            "OPENROUTER_API_KEY": "sk-or-test",
+            "REPO_PATH": str(repo),
+        })
+
+    assert result == 0  # startup must not crash
+
+
+def test_cleanup_orphans_rejects_non_mapping():
+    from core.bot_runner import cleanup_orphan_worktrees_from_env
+    with pytest.raises(ValueError, match="env_must_be_mapping"):
+        cleanup_orphan_worktrees_from_env("not a mapping")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -776,10 +855,10 @@ def test_tier_handler_marks_active_in_summary():
 # ---------------------------------------------------------------------------
 
 
-def test_build_command_registry_has_all_ten():
+def test_build_command_registry_has_all_eleven():
     personas = default_registry()
     reg = build_command_registry(personas)
-    assert len(reg) == 10
+    assert len(reg) == 11
     for cmd_name in CommandName:
         assert cmd_name in reg
 
@@ -1319,3 +1398,205 @@ def test_build_command_registry_with_sandbox_wires_push(tmp_path):
     result = reg.dispatch(parse_command("/push task-push-001"))
     assert "✅" in result
     assert len(runner.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# make_pr_handler (Step 17)
+# ---------------------------------------------------------------------------
+
+
+def _make_sandbox_for_pr(tmp_path, *, gh_returns: tuple[int, str, str] = (0, "", "")):
+    """Build a SandboxWorkspace whose subprocess runner returns canned results.
+
+    gh_returns: (returncode, stdout, stderr) for the gh subprocess.
+    Both `git push` and `gh pr create` go through the same runner — for
+    these tests we don't need to distinguish, just feed back success.
+    """
+    from core.sandbox_workspace import (
+        SandboxConfig,
+        SandboxWorkspace,
+        _RunResult,
+        _SubprocessRunner,
+    )
+
+    class _CannedRunner(_SubprocessRunner):
+        def __init__(self):
+            self.calls = []
+
+        def run(self, cmd, cwd, env, timeout):
+            self.calls.append({"cmd": cmd, "cwd": cwd})
+            # Distinguish: git push (cmd[0]="git") vs gh (cmd[0]="gh")
+            if cmd[0] == "gh":
+                return _RunResult(*gh_returns)
+            return _RunResult(returncode=0, stdout="", stderr="")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    cfg = SandboxConfig(main_repo_path=repo, worktree_root=tmp_path / "wt")
+    runner = _CannedRunner()
+    return SandboxWorkspace(cfg, runner=runner), runner
+
+
+def test_pr_handler_stub_when_no_sandbox():
+    handler = make_pr_handler(sandbox=None, task_history=None)
+    result = handler(parse_command("/pr task-x"), None)
+    assert "недоступен" in result.lower() or "REPO_PATH" in result
+    assert "/pr" in result
+
+
+def test_pr_handler_stub_when_no_history(tmp_path):
+    sandbox, _ = _make_sandbox_for_pr(tmp_path)
+    handler = make_pr_handler(sandbox=sandbox, task_history=None)
+    result = handler(parse_command("/pr task-x"), None)
+    assert "недоступен" in result.lower() or "REPO_PATH" in result
+
+
+def test_pr_handler_rejects_invalid_sandbox():
+    with pytest.raises(ValueError, match="invalid_sandbox"):
+        make_pr_handler(sandbox="not a sandbox")  # type: ignore[arg-type]
+
+
+def test_pr_handler_rejects_invalid_task_history():
+    with pytest.raises(ValueError, match="invalid_task_history"):
+        make_pr_handler(task_history="not a history")  # type: ignore[arg-type]
+
+
+def test_pr_handler_no_args(tmp_path):
+    sandbox, _ = _make_sandbox_for_pr(tmp_path)
+    history = _make_push_summary()
+    handler = make_pr_handler(sandbox=sandbox, task_history=history)
+    result = handler(parse_command("/pr"), None)
+    assert "укажи task_id" in result.lower() or "task_id" in result.lower()
+
+
+def test_pr_handler_rejects_invalid_task_id(tmp_path):
+    sandbox, _ = _make_sandbox_for_pr(tmp_path)
+    history = _make_push_summary()
+    handler = make_pr_handler(sandbox=sandbox, task_history=history)
+    # Uppercase, semicolons, traversal — must all be rejected
+    for bad in ["FOO", "task-id;rm-rf", "../etc"]:
+        cmd = BotCommand(name=CommandName.PR, args=(bad,), raw_text=f"/pr {bad}")
+        result = handler(cmd, None)
+        assert "Некорректный" in result or "❌" in result
+
+
+def test_pr_handler_task_not_in_history(tmp_path):
+    sandbox, _ = _make_sandbox_for_pr(tmp_path)
+    from core.task_history import TaskHistory
+    empty = TaskHistory()
+    handler = make_pr_handler(sandbox=sandbox, task_history=empty)
+    result = handler(parse_command("/pr task-missing-001"), None)
+    assert "не найден" in result.lower()
+
+
+def test_pr_handler_refuses_failed_task(tmp_path):
+    """Failed task (commit_sha=None) → нечего пушить, no gh call."""
+    from core.task_history import TaskHistory, TaskSummary
+
+    sandbox, runner = _make_sandbox_for_pr(tmp_path)
+    history = TaskHistory()
+    history.record(TaskSummary(
+        task_id="task-fail-001",
+        branch="feature/task-fail-001",
+        commit_sha=None,
+        final_state="FAIL",
+        failure_reason="agent_exception",
+        tier_name="ECONOMY",
+        finished_at=time.time(),
+    ))
+    handler = make_pr_handler(sandbox=sandbox, task_history=history)
+    result = handler(parse_command("/pr task-fail-001"), None)
+    assert "не достигла SUCCESS" in result or "нечего пушить" in result
+    # No git push, no gh — the guard fires before any subprocess is run
+    assert all(c["cmd"][0] != "gh" for c in runner.calls)
+
+
+def test_pr_handler_happy_path(tmp_path):
+    """Successful task → push + gh pr create + return PR URL."""
+    pr_url = "https://github.com/user/repo/pull/42"
+    gh_stdout = f"\nCreating draft pull request for X into Y\n{pr_url}\n"
+    sandbox, runner = _make_sandbox_for_pr(
+        tmp_path, gh_returns=(0, gh_stdout, ""),
+    )
+    history = _make_push_summary()
+    handler = make_pr_handler(sandbox=sandbox, task_history=history)
+    result = handler(parse_command("/pr task-push-001"), None)
+    assert "🪄" in result or "Draft PR" in result
+    assert pr_url in result
+    # Verify both git push (idempotent) and gh pr create were invoked
+    cmd_kinds = [c["cmd"][0] for c in runner.calls]
+    assert "git" in cmd_kinds  # push
+    assert "gh" in cmd_kinds
+
+
+def test_pr_handler_gh_not_found(tmp_path):
+    """When gh CLI returns 127 (not installed), surface a helpful message."""
+    sandbox, _ = _make_sandbox_for_pr(
+        tmp_path,
+        gh_returns=(127, "", "gh: command not found"),
+    )
+    history = _make_push_summary()
+    handler = make_pr_handler(sandbox=sandbox, task_history=history)
+    result = handler(parse_command("/pr task-push-001"), None)
+    assert "`gh`" in result or "gh CLI" in result.lower()
+    assert "не найден" in result.lower() or "auth login" in result
+
+
+def test_pr_handler_gh_failure(tmp_path):
+    """When gh returns non-zero (auth, network, branch missing), report error."""
+    sandbox, _ = _make_sandbox_for_pr(
+        tmp_path,
+        gh_returns=(1, "", "GraphQL: Resource not accessible by integration"),
+    )
+    history = _make_push_summary()
+    handler = make_pr_handler(sandbox=sandbox, task_history=history)
+    result = handler(parse_command("/pr task-push-001"), None)
+    assert "❌" in result
+    assert "gh_pr_create_failed" in result or "PR" in result
+
+
+def test_pr_handler_push_failure(tmp_path):
+    """If the idempotent push fails BEFORE gh, surface that, don't run gh."""
+    from core.sandbox_workspace import (
+        SandboxConfig,
+        SandboxWorkspace,
+        _RunResult,
+        _SubprocessRunner,
+    )
+
+    class _PushFailRunner(_SubprocessRunner):
+        def __init__(self):
+            self.calls = []
+
+        def run(self, cmd, cwd, env, timeout):
+            self.calls.append({"cmd": cmd})
+            if cmd[0] == "git":
+                return _RunResult(returncode=1, stdout="", stderr="rejected")
+            return _RunResult(returncode=0, stdout="", stderr="")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    cfg = SandboxConfig(main_repo_path=repo, worktree_root=tmp_path / "wt")
+    runner = _PushFailRunner()
+    sandbox = SandboxWorkspace(cfg, runner=runner)
+    history = _make_push_summary()
+    handler = make_pr_handler(sandbox=sandbox, task_history=history)
+    result = handler(parse_command("/pr task-push-001"), None)
+    assert "❌" in result
+    assert "Push" in result or "push" in result.lower()
+    # gh must NOT have been called when push failed
+    assert all(c["cmd"][0] != "gh" for c in runner.calls)
+
+
+def test_build_command_registry_with_sandbox_wires_pr(tmp_path):
+    sandbox, _ = _make_sandbox_for_pr(
+        tmp_path,
+        gh_returns=(0, "https://github.com/x/y/pull/1\n", ""),
+    )
+    history = _make_push_summary()
+    personas = default_registry()
+    reg = build_command_registry(personas, sandbox=sandbox, task_history=history)
+    result = reg.dispatch(parse_command("/pr task-push-001"))
+    assert "🪄" in result or "Draft PR" in result

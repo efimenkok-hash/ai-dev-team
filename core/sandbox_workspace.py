@@ -361,6 +361,97 @@ class SandboxWorkspace:
         """
         return self.push_named_branch(branch, remote=remote)
 
+    def gh_pr_create(
+        self,
+        branch_name: str,
+        *,
+        title: str,
+        body: str,
+        base: str = "main",
+    ) -> str:
+        """Create a draft GitHub PR via the `gh` CLI from main_repo.
+
+        Runs `gh pr create --base <base> --head <branch_name> --title "..." --body "..." --draft`
+        from main_repo. The `gh` binary must be installed and authenticated
+        (`gh auth status` should report authenticated).
+
+        Args:
+            branch_name: feature branch (must already be pushed to remote).
+            title:       PR title (1-256 chars, no NULs).
+            body:        PR body (any UTF-8 text, no NULs).
+            base:        target branch (default "main").
+
+        Returns:
+            PR URL on success (parsed from `gh` stdout).
+
+        Raises:
+            ValueError: invalid args.
+            SandboxError("gh_not_found"): `gh` binary missing.
+            SandboxError("gh_pr_create_failed"): non-zero exit (auth issue,
+                branch not on remote, network, etc.).
+        """
+        if not isinstance(branch_name, str) or not _BRANCH_NAME_RE.match(branch_name):
+            raise ValueError(f"invalid_branch:{branch_name!r}")
+        if not isinstance(base, str) or not _BRANCH_NAME_RE.match(base):
+            raise ValueError(f"invalid_base:{base!r}")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("empty_title")
+        if "\x00" in title:
+            raise ValueError("invalid_title_chars")
+        if len(title) > 256:
+            raise ValueError(f"title_too_long:{len(title)}")
+        if not isinstance(body, str):
+            raise ValueError("body_must_be_str")
+        if "\x00" in body:
+            raise ValueError("invalid_body_chars")
+
+        # Reject shell metas only in identifiers (branch/base) — they're
+        # consumed as git refs and need to be strict. title/body are
+        # freeform PR content (backticks for code formatting are common
+        # in markdown) and pass through subprocess argv, not a shell, so
+        # there's nothing to escape.
+        for tok in (branch_name, base):
+            for meta in _SHELL_META_TOKENS:
+                if meta in tok:
+                    raise ValueError(f"shell_meta_in_arg:{meta!r}")
+
+        cmd = (
+            "gh", "pr", "create",
+            "--base", base,
+            "--head", branch_name,
+            "--title", title.strip(),
+            "--body", body,
+            "--draft",
+        )
+        env = _build_subprocess_env()
+        try:
+            result = self._runner.run(
+                cmd=cmd,
+                cwd=str(self._cfg.main_repo_path),
+                env=env,
+                timeout=self._cfg.git_timeout_seconds,
+            )
+        except Exception as exc:
+            raise SandboxError("gh_subprocess_error", str(exc)) from exc
+
+        # Subprocess runner returns rc=127 with "git_not_found"-style stderr
+        # when the binary is missing; we surface that as gh_not_found.
+        if result.returncode == 127 or "not found" in (result.stderr or "").lower():
+            raise SandboxError("gh_not_found", _excerpt(result.stderr))
+        if result.returncode != 0:
+            raise SandboxError(
+                "gh_pr_create_failed",
+                _excerpt(result.stderr or result.stdout),
+            )
+
+        # `gh pr create` prints the PR URL on its own line. Pick the last URL.
+        for line in reversed((result.stdout or "").splitlines()):
+            line = line.strip()
+            if line.startswith("https://") and "/pull/" in line:
+                return line
+        # Fallback: return whole stdout if URL not found (rare).
+        return (result.stdout or "").strip()
+
     def push_branch(
         self,
         handle: WorktreeHandle,

@@ -341,3 +341,148 @@ def test_format_summary_works_with_custom_registry():
     lines = text.split("\n")
     economy_line = next(line for line in lines if "ECONOMY" in line and "$" in line)
     assert economy_line.startswith("▸")
+
+
+# ---------------------------------------------------------------------------
+# Persistence (Step 19)
+# ---------------------------------------------------------------------------
+
+
+def test_persistence_path_optional_in_memory_default():
+    """Without persistence_path, store works as before — pure in-memory."""
+    s = TierSessionStore(default_registry())
+    assert s.persistence_path is None
+    s.set_active(1, "ECONOMY")
+    assert s.active_tier_name(1) == "ECONOMY"
+
+
+def test_persistence_path_must_be_path_or_none():
+    with pytest.raises(ValueError, match="persistence_path_must_be_path_or_none"):
+        TierSessionStore(default_registry(), persistence_path="not a path")  # type: ignore[arg-type]
+
+
+def test_persistence_set_active_writes_file(tmp_path):
+    state_file = tmp_path / "tier_sessions.json"
+    s = TierSessionStore(default_registry(), persistence_path=state_file)
+    assert not state_file.exists()  # empty store does NOT write
+    s.set_active(42, "PREMIUM")
+    assert state_file.exists()
+    import json
+    raw = json.loads(state_file.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == 1
+    sessions = raw["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["chat_id"] == 42
+    assert sessions[0]["active_tier"] == "PREMIUM"
+
+
+def test_persistence_round_trip(tmp_path):
+    """Restart simulation: write via store A, read via store B."""
+    state_file = tmp_path / "tier_sessions.json"
+
+    a = TierSessionStore(default_registry(), persistence_path=state_file)
+    a.set_active(1, "ECONOMY")
+    a.set_active(2, "STANDARD")
+    a.set_active(3, "PREMIUM")
+
+    # Fresh store reads the same file.
+    b = TierSessionStore(default_registry(), persistence_path=state_file)
+    assert b.active_tier_name(1) == "ECONOMY"
+    assert b.active_tier_name(2) == "STANDARD"
+    assert b.active_tier_name(3) == "PREMIUM"
+
+
+def test_persistence_reset_writes_file(tmp_path):
+    state_file = tmp_path / "tier_sessions.json"
+    s = TierSessionStore(default_registry(), persistence_path=state_file)
+    s.set_active(42, "PREMIUM")
+    s.set_active(7, "ECONOMY")
+    s.reset(42)
+
+    # New store should see only chat 7
+    b = TierSessionStore(default_registry(), persistence_path=state_file)
+    assert b.active_tier_name(42) is None
+    assert b.active_tier_name(7) == "ECONOMY"
+
+
+def test_persistence_corrupt_json_starts_fresh(tmp_path):
+    """Corrupt or unreadable JSON must NOT crash the bot — start with empty state."""
+    state_file = tmp_path / "tier_sessions.json"
+    state_file.write_text("this is not valid json {{{ ", encoding="utf-8")
+
+    s = TierSessionStore(default_registry(), persistence_path=state_file)
+    assert len(s) == 0  # corrupt file ignored, empty store
+
+
+def test_persistence_unknown_tier_dropped_on_load(tmp_path):
+    """If a saved tier name no longer exists in the registry, drop that entry
+    cleanly rather than failing or restoring zombie state."""
+    import json
+    state_file = tmp_path / "tier_sessions.json"
+    state_file.write_text(json.dumps({
+        "schema_version": 1,
+        "sessions": [
+            {"chat_id": 1, "active_tier": "PREMIUM", "last_changed_at": 1234.5},
+            {"chat_id": 2, "active_tier": "GHOST_TIER", "last_changed_at": 2345.6},
+        ],
+    }), encoding="utf-8")
+
+    s = TierSessionStore(default_registry(), persistence_path=state_file)
+    assert s.active_tier_name(1) == "PREMIUM"
+    assert s.active_tier_name(2) is None  # GHOST_TIER dropped
+
+
+def test_persistence_missing_file_starts_fresh(tmp_path):
+    """No file at construction time → empty store, no crash."""
+    state_file = tmp_path / "does_not_exist.json"
+    s = TierSessionStore(default_registry(), persistence_path=state_file)
+    assert len(s) == 0
+    # And first set_active creates the file.
+    s.set_active(1, "ECONOMY")
+    assert state_file.exists()
+
+
+def test_persistence_creates_parent_directory(tmp_path):
+    """If parent directory doesn't exist, save creates it."""
+    state_file = tmp_path / "nested" / "deeper" / "tier_sessions.json"
+    s = TierSessionStore(default_registry(), persistence_path=state_file)
+    s.set_active(42, "STANDARD")
+    assert state_file.exists()
+
+
+def test_persistence_atomic_via_tmp_replace(tmp_path):
+    """Save uses .tmp + os.replace so a crash mid-write doesn't corrupt the
+    main file. Verify by checking that an existing valid file is replaced
+    only with another valid file."""
+    state_file = tmp_path / "tier_sessions.json"
+    s = TierSessionStore(default_registry(), persistence_path=state_file)
+    s.set_active(1, "ECONOMY")
+    first_content = state_file.read_text(encoding="utf-8")
+    s.set_active(1, "PREMIUM")
+    second_content = state_file.read_text(encoding="utf-8")
+    assert first_content != second_content
+    # And no .tmp left behind on disk
+    tmp_files = list(state_file.parent.glob("*.tmp"))
+    assert tmp_files == []
+
+
+def test_persistence_io_errors_swallowed_after_construction(tmp_path):
+    """If the disk goes read-only mid-operation, set_active still updates
+    in-memory state — disk is best-effort durability."""
+    state_file = tmp_path / "tier_sessions.json"
+    s = TierSessionStore(default_registry(), persistence_path=state_file)
+    s.set_active(1, "ECONOMY")
+
+    # Make the file unwritable to simulate disk issues.
+    # Then calling set_active again must not raise — in-memory must update.
+    import os as _os
+    state_file.chmod(0o444)  # read-only
+    state_file.parent.chmod(0o555)  # read+execute, no write
+    try:
+        s.set_active(1, "PREMIUM")
+        assert s.active_tier_name(1) == "PREMIUM"  # in-memory still works
+    finally:
+        # Restore so tmp_path can be cleaned up.
+        state_file.parent.chmod(0o755)
+        state_file.chmod(0o644)
+        _ = _os  # silence ruff unused-import in CI (noop)

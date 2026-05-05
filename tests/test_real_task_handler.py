@@ -906,7 +906,15 @@ def test_cancellation_overrides_success_to_cancelled(
     runner, sandbox, tier_store, fake_repo, tmp_path,
 ):
     """14c-fix critical bug: if /stop pressed while pipeline runs, the handler
-    must NOT commit and must send ⏹ Отменено — not ✅ Готово."""
+    must NOT commit and must send ⏹ Отменено — not ✅ Готово.
+
+    Determinism: planning_agent blocks on `agent_in_flight` until the test
+    explicitly calls `runner.cancel()` and then `release_agent.set()`. This
+    guarantees the cancel token is observed by `_run` after `orch.run()`,
+    eliminating the timing race where happy_agents could finish before the
+    main thread calls cancel().
+    """
+    import threading
     from unittest.mock import MagicMock, patch
 
     from core.task_history import TaskHistory
@@ -914,6 +922,23 @@ def test_cancellation_overrides_success_to_cancelled(
     tier_store.set_active(42, "STANDARD")
     send, captured = _make_progress_capture()
     history = TaskHistory()
+
+    # Synchronisation: planning_agent waits on `release_agent`, but signals
+    # `agent_in_flight` first so the main thread knows the worker has reached
+    # the pipeline and it's safe to cancel.
+    agent_in_flight = threading.Event()
+    release_agent = threading.Event()
+
+    def _blocking_planning(*_a) -> str:
+        agent_in_flight.set()
+        # Wait until the test releases us (after issuing cancel).
+        release_agent.wait(timeout=5.0)
+        return '{"plan": "ok"}'
+
+    def blocking_agents(_tier):
+        agents = happy_agents(_tier)
+        agents["planning_agent"] = _blocking_planning
+        return agents
 
     mock_report = _ok_validation_report()
     mock_hook_fn = MagicMock(return_value=mock_report)
@@ -929,15 +954,23 @@ def test_cancellation_overrides_success_to_cancelled(
             sandbox=sandbox,
             tier_store=tier_store,
             send_progress=send,
-            agent_registry_factory=happy_agents,
+            agent_registry_factory=blocking_agents,
             task_id_factory=lambda: "task-cancel-001",
             task_history=history,
         )
 
         handler("build something", _msg(chat_id=42))
-        # Cancel before worker finishes (race is acceptable — we just
-        # need the token set before _run reads it after orch.run()).
+        # 1. Wait for the worker to enter planning_agent so we KNOW the
+        #    pipeline has started before we cancel.
+        assert agent_in_flight.wait(timeout=5.0), (
+            "planning_agent never started — fixture wiring bug"
+        )
+        # 2. Cancel — this sets the token on the runner.
         runner.cancel()
+        # 3. Release the agent so the rest of the pipeline can finish.
+        #    Now the post-orch.run() check `cancelled = token.is_set()`
+        #    will deterministically observe True.
+        release_agent.set()
         _wait_until_idle(runner)
 
     _wait_for_count(
@@ -959,8 +992,10 @@ def test_cancellation_overrides_success_to_cancelled(
     # commit_in_worktree must NOT be called after cancellation
     mock_commit.assert_not_called()
 
-    # TaskHistory must record CANCELLED with no commit_sha
+    # TaskHistory record is written in _build_on_complete BEFORE the
+    # ⏹ message is sent, so by the time _wait_for_count returns the
+    # record is guaranteed to be present.
     summary = history.get("task-cancel-001")
-    if summary is not None:  # history may be None if cancel raced ahead of pipeline
-        assert summary.final_state == "CANCELLED"
-        assert summary.commit_sha is None
+    assert summary is not None, "TaskHistory must record cancelled task"
+    assert summary.final_state == "CANCELLED"
+    assert summary.commit_sha is None
