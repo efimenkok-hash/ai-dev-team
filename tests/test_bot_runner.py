@@ -12,6 +12,7 @@ from core.bot_commands import (
 )
 from core.bot_runner import (
     _BudgetState,
+    _build_observability,
     build_bridge_from_env,
     build_command_registry,
     build_confirmation_gate,
@@ -404,6 +405,107 @@ def test_build_real_task_handler_does_not_shutdown_external_runner_on_failure(tm
 
     assert result is None
     external_runner.shutdown.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _build_observability — OBS_LOG_PATH wiring
+# ---------------------------------------------------------------------------
+
+
+def test_obs_log_path_creates_observability_with_jsonlines_sink(tmp_path):
+    """OBS_LOG_PATH in env → make_real_task_handler receives Observability."""
+    from core.observability import JsonLinesSink, Observability
+
+    log_file = tmp_path / "obs.jsonl"
+    obs = _build_observability({"OBS_LOG_PATH": str(log_file)})
+
+    assert isinstance(obs, Observability)
+    assert isinstance(obs.sink, JsonLinesSink)
+    assert obs.sink.path == log_file
+
+
+def test_obs_log_path_absent_returns_none():
+    """No OBS_LOG_PATH → _build_observability returns None."""
+    assert _build_observability({}) is None
+    assert _build_observability({"OBS_LOG_PATH": ""}) is None
+    assert _build_observability({"OBS_LOG_PATH": "   "}) is None
+
+
+def test_obs_log_path_bad_path_returns_none(tmp_path):
+    """Unreachable path (parent does not exist and cannot be created)
+    must not raise — returns None silently."""
+    # /dev/null is a file; writing a directory under it will fail with OSError
+    obs = _build_observability({"OBS_LOG_PATH": "/dev/null/impossible/x.jsonl"})
+    assert obs is None
+
+
+def test_obs_wired_into_make_real_task_handler_when_obs_log_path_set(tmp_path):
+    """build_real_task_handler_from_env passes observability= to make_real_task_handler
+    when OBS_LOG_PATH is set."""
+    from unittest.mock import patch
+
+    from core.observability import Observability
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    log_file = tmp_path / "obs.jsonl"
+    store = TierSessionStore(default_tier_registry())
+
+    captured: list[Observability | None] = []
+
+    original_make = __import__(
+        "core.real_task_handler", fromlist=["make_real_task_handler"]
+    ).make_real_task_handler
+
+    def capturing_make(**kwargs):
+        captured.append(kwargs.get("observability"))
+        return original_make(**kwargs)
+
+    with patch("core.bot_runner.make_real_task_handler", side_effect=capturing_make):
+        build_real_task_handler_from_env(
+            {
+                "OPENROUTER_API_KEY": "sk-or-test",
+                "REPO_PATH": str(repo),
+                "OBS_LOG_PATH": str(log_file),
+            },
+            tier_store=store,
+            send_progress=_noop_progress,
+        )
+
+    assert len(captured) == 1
+    assert isinstance(captured[0], Observability)
+
+
+def test_obs_none_when_obs_log_path_absent_in_full_env(tmp_path):
+    """build_real_task_handler_from_env passes observability=None when
+    OBS_LOG_PATH is not set."""
+    from unittest.mock import patch
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    store = TierSessionStore(default_tier_registry())
+
+    captured: list = []
+
+    original_make = __import__(
+        "core.real_task_handler", fromlist=["make_real_task_handler"]
+    ).make_real_task_handler
+
+    def capturing_make(**kwargs):
+        captured.append(kwargs.get("observability"))
+        return original_make(**kwargs)
+
+    with patch("core.bot_runner.make_real_task_handler", side_effect=capturing_make):
+        build_real_task_handler_from_env(
+            {"OPENROUTER_API_KEY": "sk-or-test", "REPO_PATH": str(repo)},
+            tier_store=store,
+            send_progress=_noop_progress,
+        )
+
+    assert len(captured) == 1
+    assert captured[0] is None
 
 
 # ---------------------------------------------------------------------------

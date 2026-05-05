@@ -53,6 +53,7 @@ from core.confirmation_gate import DEFAULT_COST_THRESHOLD_USD, ConfirmationGate
 from core.dispatcher_agents import build_dispatcher_agent_registry_factory
 from core.llm_dispatcher import LLMDispatcher
 from core.model_tier import default_registry as default_tier_registry
+from core.observability import JsonLinesSink, Observability
 from core.real_task_handler import RealTaskHandlerConfig, make_real_task_handler
 from core.sandbox_workspace import SandboxConfig, SandboxWorkspace
 from core.task_history import TaskHistory
@@ -197,6 +198,21 @@ def _try_build_sandbox(env: Mapping[str, str]) -> SandboxWorkspace | None:
         return None
 
 
+def _build_observability(env: Mapping[str, str]) -> Observability | None:
+    """Return Observability(JsonLinesSink(path)) if OBS_LOG_PATH is set in env.
+
+    Returns None silently if the var is absent, empty, or the path cannot be
+    opened (e.g. directory does not exist and cannot be created).
+    """
+    path = env.get("OBS_LOG_PATH", "").strip()
+    if not path:
+        return None
+    try:
+        return Observability(sink=JsonLinesSink(path))
+    except (OSError, ValueError):
+        return None
+
+
 def _real_pipeline_eligible(env: Mapping[str, str]) -> bool:
     """True iff `build_real_task_handler_from_env` would return a real handler.
 
@@ -262,6 +278,7 @@ def build_real_task_handler_from_env(
 
     _runner_owned = runner is None
     _runner = runner if runner is not None else BackgroundTaskRunner()
+    obs = _build_observability(env)
     try:
         factory = build_dispatcher_agent_registry_factory(dispatcher)
         return make_real_task_handler(
@@ -272,6 +289,7 @@ def build_real_task_handler_from_env(
             agent_registry_factory=factory,
             config=RealTaskHandlerConfig(),
             task_history=task_history,
+            observability=obs,
         )
     except (ValueError, TypeError, OSError):
         if _runner_owned:
