@@ -402,34 +402,32 @@ def make_agents_handler(personas: PersonaRegistry) -> CommandHandler:
 
 def make_push_handler(
     sandbox: SandboxWorkspace | None = None,
-    task_history: TaskHistory | None = None,
 ) -> CommandHandler:
     """Returns a /push <task_id> handler.
 
-    When sandbox and task_history are provided (real pipeline active):
-      - Looks up task_id in history to find branch and commit_sha.
-      - Calls sandbox.push_branch_from_main(branch) — works after worktree
-        release because it runs `git push` from the main repo.
-      - Refuses to push if the task never reached SUCCESS (no commit_sha).
+    When *sandbox* is provided (real pipeline active):
+      - Validates task_id against _TASK_ID_RE (rejects shell-meta, path traversal).
+      - Derives branch = f"feature/{task_id}" (mirrors real_task_handler convention).
+      - Calls sandbox.push_named_branch(branch) — works after worktree release
+        because it runs `git push` from the main repo.
+      - Returns ✅ on success, ❌ with reason on git failure.
 
-    When either is None (simple-stub pipeline):
-      - Returns a helpful message explaining how to enable the feature.
+    When *sandbox* is None (pipeline not configured):
+      - Returns an informative stub explaining how to enable the feature.
     """
     if sandbox is not None and not isinstance(sandbox, SandboxWorkspace):
         raise ValueError(f"invalid_sandbox:{type(sandbox).__name__}")
-    if task_history is not None and not isinstance(task_history, TaskHistory):
-        raise ValueError(f"invalid_task_history:{type(task_history).__name__}")
+
+    from core.sandbox_workspace import _TASK_ID_RE as _TID_RE
 
     _sandbox = sandbox
-    _history = task_history
 
     def _handle(cmd: BotCommand, _ctx: Any) -> str:
-        if _sandbox is None or _history is None:
+        if _sandbox is None:
             return (
                 "🚀 /push <task_id>\n"
                 "\n"
-                "🔜 Доступно только в полном режиме.\n"
-                "Настрой OPENROUTER_API_KEY + REPO_PATH чтобы включить."
+                "Push недоступен: настрой REPO_PATH чтобы включить."
             )
         positional = cmd.positional_args()
         if not positional:
@@ -441,36 +439,24 @@ def make_push_handler(
                 "Например: /push task-1714829400-7a3b9c"
             )
         task_id = positional[0]
-        summary = _history.get(task_id)
-        if summary is None:
+        if not isinstance(task_id, str) or not _TID_RE.match(task_id):
             return (
-                f"⚠️ task_id `{task_id}` не найден в истории.\n"
+                f"❌ Некорректный task_id: `{task_id[:80]}`\n"
                 "\n"
-                "Задача ещё выполняется или id указан неверно."
+                "task_id должен содержать только строчные буквы, цифры, "
+                "дефис и подчёркивание."
             )
-        if summary.commit_sha is None:
-            return (
-                f"⚠️ Задача `{task_id}` не достигла SUCCESS — нечего пушить.\n"
-                "\n"
-                f"  state   `{summary.final_state}`\n"
-                f"  reason  `{summary.failure_reason or '?'}`"
-            )
+        branch = f"feature/{task_id}"
         try:
-            _sandbox.push_branch_from_main(summary.branch)
+            _sandbox.push_named_branch(branch)
         except Exception as exc:
             return (
-                f"❌ Push не удался\n"
+                f"❌ Не удалось запушить\n"
                 "\n"
-                f"  branch  `{summary.branch}`\n"
+                f"  branch  `{branch}`\n"
                 f"  ошибка  {type(exc).__name__}: {str(exc)[:200]}"
             )
-        return (
-            f"🚀 Запушено!\n"
-            "\n"
-            f"  task-id `{task_id}`\n"
-            f"  branch  `{summary.branch}`\n"
-            f"  commit  `{summary.commit_sha[:8]}`"
-        )
+        return f"✅ Запушено в GitHub: `{branch}`"
 
     return _handle
 
@@ -744,7 +730,7 @@ def build_command_registry(
     reg.register(CommandName.LOG, make_log_handler(task_history))
     reg.register(CommandName.STOP, make_stop_handler(runner))
     reg.register(CommandName.RETRY, make_retry_handler())
-    reg.register(CommandName.PUSH, make_push_handler(sandbox, task_history))
+    reg.register(CommandName.PUSH, make_push_handler(sandbox))
     # /help is registered LAST so it can list everything else.
     reg.register(
         CommandName.HELP,

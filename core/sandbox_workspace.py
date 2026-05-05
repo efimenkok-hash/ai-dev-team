@@ -321,31 +321,41 @@ class SandboxWorkspace:
             )
         return result_sha.stdout.strip()
 
+    def push_named_branch(
+        self,
+        branch_name: str,
+        *,
+        remote: str = "origin",
+    ) -> None:
+        """`git push <remote> <branch_name>` from main_repo (worktree NOT required).
+
+        Use after worktree release: branch persists in main_repo so push works.
+        Validates branch_name against _BRANCH_NAME_RE; raises SandboxError on
+        git failure.
+
+        Raises:
+            ValueError: on invalid branch_name or remote name.
+            SandboxError("git_push_failed"): when git returns non-zero.
+        """
+        if not isinstance(branch_name, str) or not _BRANCH_NAME_RE.match(branch_name):
+            raise ValueError(f"invalid_branch:{branch_name!r}")
+        if not isinstance(remote, str) or not _REMOTE_NAME_RE.match(remote):
+            raise ValueError(f"invalid_remote_name:{remote!r}")
+        result = self._git("push", remote, branch_name)
+        if result.returncode != 0:
+            raise SandboxError(
+                "git_push_failed",
+                _excerpt(result.stderr),
+            )
+
     def push_branch_from_main(
         self,
         branch: str,
         *,
         remote: str = "origin",
     ) -> None:
-        """`git push <remote> <branch>` from the main repo directory.
-
-        Unlike push_branch(), this does NOT require the worktree to exist —
-        it works after release(). Intended for the /push bot command.
-
-        Raises:
-            ValueError: on invalid branch or remote name.
-            SandboxError("git_push_failed"): when git returns non-zero.
-        """
-        if not isinstance(branch, str) or not _BRANCH_NAME_RE.match(branch):
-            raise ValueError(f"invalid_branch:{branch!r}")
-        if not isinstance(remote, str) or not _REMOTE_NAME_RE.match(remote):
-            raise ValueError(f"invalid_remote_name:{remote!r}")
-        result = self._git("push", remote, branch)
-        if result.returncode != 0:
-            raise SandboxError(
-                "git_push_failed",
-                _excerpt(result.stderr),
-            )
+        """Alias for push_named_branch — kept for backward compatibility."""
+        return self.push_named_branch(branch, remote=remote)
 
     def push_branch(
         self,

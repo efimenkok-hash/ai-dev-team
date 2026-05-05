@@ -519,7 +519,67 @@ def test_push_branch_raises_on_failure(fake_repo, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# push_branch_from_main (Step 14c-1)
+# push_named_branch (Step 16) — canonical post-release push
+# ---------------------------------------------------------------------------
+
+
+def test_push_named_branch_runs_git_push_from_main_repo(fake_repo, tmp_path):
+    """Happy path: correct git command, runs from main_repo_path."""
+    cfg = _make_config(fake_repo, tmp_path)
+    runner = FakeRunner()
+    ws = SandboxWorkspace(cfg, runner=runner)
+    ws.push_named_branch("feature/task-99")
+    cmd = runner.calls[0]["cmd"]
+    cwd = runner.calls[0]["cwd"]
+    assert cmd == ("git", "push", "origin", "feature/task-99")
+    assert cwd == str(cfg.main_repo_path)
+
+
+def test_push_named_branch_custom_remote(fake_repo, tmp_path):
+    cfg = _make_config(fake_repo, tmp_path)
+    runner = FakeRunner()
+    ws = SandboxWorkspace(cfg, runner=runner)
+    ws.push_named_branch("feature/task-99", remote="upstream")
+    assert runner.calls[0]["cmd"][2] == "upstream"
+
+
+def test_push_named_branch_rejects_invalid_branch(fake_repo, tmp_path):
+    cfg = _make_config(fake_repo, tmp_path)
+    ws = SandboxWorkspace(cfg, runner=FakeRunner())
+    with pytest.raises(ValueError, match="invalid_branch"):
+        ws.push_named_branch("bad branch name!")
+
+
+def test_push_named_branch_rejects_invalid_remote(fake_repo, tmp_path):
+    cfg = _make_config(fake_repo, tmp_path)
+    ws = SandboxWorkspace(cfg, runner=FakeRunner())
+    with pytest.raises(ValueError, match="invalid_remote_name"):
+        ws.push_named_branch("feature/ok", remote="bad;remote")
+
+
+def test_push_named_branch_raises_sandbox_error_on_git_failure(fake_repo, tmp_path):
+    cfg = _make_config(fake_repo, tmp_path)
+    runner = FakeRunner(
+        responses=[_RunResult(returncode=1, stdout="", stderr="fatal: rejected")]
+    )
+    ws = SandboxWorkspace(cfg, runner=runner)
+    with pytest.raises(SandboxError) as exc_info:
+        ws.push_named_branch("feature/task-99")
+    assert exc_info.value.code == "git_push_failed"
+
+
+def test_push_named_branch_works_without_worktree_on_disk(fake_repo, tmp_path):
+    """Must NOT require the worktree path to exist — runs from main_repo."""
+    cfg = _make_config(fake_repo, tmp_path)
+    runner = FakeRunner()
+    ws = SandboxWorkspace(cfg, runner=runner)
+    worktree_path = cfg.worktree_root / "task-99"
+    assert not worktree_path.exists()
+    ws.push_named_branch("feature/task-99")
+    assert len(runner.calls) == 1
+
+
+# push_branch_from_main — backward-compat alias for push_named_branch
 # ---------------------------------------------------------------------------
 
 
@@ -531,7 +591,6 @@ def test_push_branch_from_main_runs_git_push_from_main_repo(fake_repo, tmp_path)
     cmd = runner.calls[0]["cmd"]
     cwd = runner.calls[0]["cwd"]
     assert cmd == ("git", "push", "origin", "feature/task-99")
-    # Must run from main_repo_path, not from a worktree.
     assert cwd == str(cfg.main_repo_path)
 
 
@@ -574,7 +633,6 @@ def test_push_branch_from_main_works_without_worktree_on_disk(fake_repo, tmp_pat
     cfg = _make_config(fake_repo, tmp_path)
     runner = FakeRunner()
     ws = SandboxWorkspace(cfg, runner=runner)
-    # Worktree directory does NOT exist — should still succeed (runs from main repo).
     worktree_path = cfg.worktree_root / "task-99"
     assert not worktree_path.exists()
     ws.push_branch_from_main("feature/task-99")
