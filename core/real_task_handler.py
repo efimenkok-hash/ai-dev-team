@@ -171,11 +171,12 @@ def _format_event(event: ProgressEvent) -> str:
 
 
 def _default_agent_registry_factory(_tier: TierConfig) -> AgentRegistry:
-    """Default factory used until LLMDispatcher-tiered agents land in 14b-5b.
+    """Fallback factory for tests and local runs without a configured LLMDispatcher.
 
-    Returns the current single-model `core.agents.*` registry. The tier
-    argument is accepted but unused — once 14b-5b lands, we'll swap this
-    out for a dispatcher-aware version.
+    Returns the legacy single-model `core.agents.*` registry (ask_openrouter
+    hard-coded to qwen/qwen3-coder). Production wiring passes a dispatcher-aware
+    factory built by build_dispatcher_agent_registry_factory() from
+    core.dispatcher_agents instead.
     """
     return default_agent_registry()
 
@@ -203,7 +204,7 @@ def make_real_task_handler(
           sandbox=SandboxWorkspace(SandboxConfig(main_repo_path=...)),
           tier_store=TierSessionStore(default_tier_registry()),
           send_progress=lambda chat_id, text: bot.send_message(chat_id, text),
-          agent_registry_factory=build_dispatcher_agents(dispatcher),
+          agent_registry_factory=build_dispatcher_agent_registry_factory(dispatcher),
       )
     """
     if not isinstance(runner, BackgroundTaskRunner):
