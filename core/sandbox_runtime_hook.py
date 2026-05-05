@@ -29,6 +29,7 @@ CONTRACTS:
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -86,7 +87,18 @@ def make_sandbox_hook(
             )
 
         # Materialise files inside the worktree.
+        # Always write the original writer files as a baseline so the worktree
+        # contains every file the architect specified.
         write_artifact_to_worktree(writer_artifact, handle.path)
+
+        # If fixer_agent has run at least once, overlay its output on top of
+        # the writer baseline.  The fix artifact uses the same {"files":[...]}
+        # JSON schema as the writer, so write_artifact_to_worktree handles it
+        # directly.  Errors are suppressed — the baseline is already on disk.
+        fix_artifact = artifacts.get("fix") if hasattr(artifacts, "get") else None
+        if isinstance(fix_artifact, str) and fix_artifact.strip():
+            with contextlib.suppress(ValueError, OSError):
+                write_artifact_to_worktree(fix_artifact, handle.path)
 
         # Build an adapter targeting the worktree directory.
         adapter = adapter_factory(handle.path)

@@ -243,3 +243,83 @@ def test_hook_propagates_path_escape_error(tmp_path):
 
     with pytest.raises(ValueError, match="path_escape"):
         hook("task-1", snapshot)
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: hook must overlay fix artifact on top of writer baseline
+# ---------------------------------------------------------------------------
+
+
+def _make_snapshot_with_fix(writer_artifact: str, fix_artifact: str) -> object:
+    """Snapshot that has both writer and fix artifacts."""
+    class _Snap:
+        pass
+    snap = _Snap()
+    snap.artifacts = {"writer": writer_artifact, "fix": fix_artifact}  # type: ignore[attr-defined]
+    return snap
+
+
+def test_hook_overlays_fix_artifact_on_writer_baseline(tmp_path):
+    """When fix artifact exists, the hook must write it on top of the writer
+    baseline so the worktree contains the corrected code, not the original."""
+    writer = json.dumps({
+        "files": [{"path": "calc.py", "content": "def add(a,b): return a+b\n"}]
+    })
+    fix = json.dumps({
+        "files": [{"path": "calc.py", "content": "def add(a: int, b: int) -> int:\n    return a + b\n"}]
+    })
+
+    handle = _make_handle(tmp_path)
+    mock_validator = MagicMock(spec=RuntimeValidator)
+    mock_validator.validate.return_value = _ok_report()
+
+    hook = make_sandbox_hook(handle, _adapter_factory, mock_validator)
+    snapshot = _make_snapshot_with_fix(writer, fix)
+    hook("task-fix-overlay", snapshot)
+
+    result = (tmp_path / "calc.py").read_text(encoding="utf-8")
+    # Must contain the FIXED version (with type annotations), not the original
+    assert "int" in result, f"worktree should have fixed code, got: {result!r}"
+    assert "a: int" in result, f"fix artifact should override writer, got: {result!r}"
+
+
+def test_hook_uses_writer_when_no_fix_artifact(tmp_path):
+    """Without a fix artifact the hook behaves exactly as before."""
+    writer = json.dumps({
+        "files": [{"path": "utils.py", "content": "def greet(): return 'hi'\n"}]
+    })
+    handle = _make_handle(tmp_path)
+    mock_validator = MagicMock(spec=RuntimeValidator)
+    mock_validator.validate.return_value = _ok_report()
+
+    hook = make_sandbox_hook(handle, _adapter_factory, mock_validator)
+    snapshot = _make_snapshot(writer)
+    hook("task-no-fix", snapshot)
+
+    result = (tmp_path / "utils.py").read_text(encoding="utf-8")
+    assert "greet" in result
+
+
+def test_hook_silently_ignores_malformed_fix_artifact(tmp_path):
+    """If fix artifact is malformed JSON, hook falls back to writer baseline
+    without raising — the validation gate for writer already ran successfully."""
+    writer = json.dumps({
+        "files": [{"path": "base.py", "content": "x = 1\n"}]
+    })
+
+    handle = _make_handle(tmp_path)
+    mock_validator = MagicMock(spec=RuntimeValidator)
+    mock_validator.validate.return_value = _ok_report()
+
+    hook = make_sandbox_hook(handle, _adapter_factory, mock_validator)
+
+    class _Snap:
+        pass
+    snap = _Snap()
+    snap.artifacts = {"writer": writer, "fix": "THIS IS NOT JSON {{{{"}  # type: ignore[attr-defined]
+
+    # Must not raise — fallback to writer baseline
+    report = hook("task-bad-fix", snap)
+    assert report.ok is True
+    result = (tmp_path / "base.py").read_text(encoding="utf-8")
+    assert "x = 1" in result
