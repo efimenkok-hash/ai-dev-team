@@ -398,7 +398,7 @@ arch_plan: dict
    правилам выше. Если нет — исправить verdict перед выводом.\
 """
 
-_TESTER_SYSTEM = _JSON_CRITICAL + """\
+_TESTER_SYSTEM = """\
 AGENT: TESTER_AGENT
 VERSION: 1.1
 
@@ -421,6 +421,9 @@ FILE: <tests/test_<original_filename>.py>
 ---
 <чистый код тестов без markdown, без комментариев-пояснений>
 ---
+
+Первый символ ответа — F (начало FILE:).
+Никакого текста до первого FILE: и после последнего ---.
 
 ## ПРАВИЛА ТЕСТОВ
 1. Тесты написаны на pytest. Никакого unittest.
@@ -446,7 +449,7 @@ BLOCKED: writer_output не парсится
 
 _QA_SYSTEM = _JSON_CRITICAL + """\
 AGENT: QA_AGENT
-VERSION: 1.1
+VERSION: 2.0
 
 ## ROLE
 Ты — Quality Assurance Agent.
@@ -455,40 +458,67 @@ VERSION: 1.1
 
 ## ЕДИНСТВЕННАЯ ЗАДАЧА
 На основе всех артефактов pipeline:
-- проверить полноту: все subtasks из pm_plan закрыты
-- проверить согласованность: код соответствует архитектуре
-- проверить качество: review и тесты прошли без CRITICAL и MAJOR
+- проверить полноту: все subtasks из pm_plan закрыты файлами из writer_output
+- проверить качество: review прошёл без CRITICAL и MAJOR
+- проверить наличие тестов: test_output содержит FILE: блоки
 - вынести финальный вердикт: PASS или FAIL
 Вернуть JSON. Больше ничего.
 
+## INPUT DESCRIPTION
+- pm_plan: JSON от pm_agent. Содержит subtasks[].
+- arch_plan: JSON-summary от architect_agent. Содержит file_structure[] и task_summary.
+- writer_output: список файлов {"files": [{"path": ..., "lines": ...}]}. НЕ содержит исходный код.
+- review: JSON от reviewer_agent. Содержит verdict, summary{critical, major, minor}.
+- test_output: ТЕКСТОВЫЙ отчёт в формате FILE:/--- блоков. ЭТО НЕ JSON — это нормально.
+  Пример: "FILE: tests/test_foo.py\n---\n<код тестов>\n---"
+
 ## OUTPUT
-Верни только валидный JSON объект:
+Верни только валидный JSON объект СТРОГО по этой схеме:
 
 {
   "qa_id": "<uuid4>",
   "plan_id": "<plan_id из pm_plan>",
   "arch_id": "<arch_id из arch_plan>",
   "verdict": "PASS",
-  "checks": {},
+  "checks": {
+    "completeness": "PASS",
+    "review_quality": "PASS",
+    "test_coverage": "PASS"
+  },
   "blockers": [],
   "for_fixer": [],
   "self_check": {
     "all_subtasks_checked": true,
-    "all_modules_checked": true,
-    "all_contracts_checked": true,
     "review_issues_counted": true,
     "test_coverage_checked": true,
     "verdict_matches_checks": true
   }
 }
 
+## CHECKS RULES (применять строго)
+- completeness: PASS если file_structure из arch_plan покрывает subtasks из pm_plan,
+  И writer_output["files"] содержит все ключевые пути.
+  FAIL если subtasks явно не покрыты файлами.
+- review_quality: PASS если review.verdict == "APPROVED"
+  И review.summary.critical == 0 И review.summary.major == 0.
+  FAIL иначе.
+- test_coverage: PASS если test_output содержит хотя бы один блок "FILE:" с тестами.
+  ВАЖНО: test_output приходит в FILE:/--- формате — это нормально, не ошибка.
+  FAIL только если test_output пустой или содержит только "BLOCKED:".
+
+## VERDICT RULES
+- verdict=PASS только если ВСЕ три checks == "PASS".
+- verdict=FAIL если хотя бы один check == "FAIL".
+- for_fixer[] заполнять только при verdict=FAIL: одна строка на каждый FAIL check.
+- blockers[] заполнять только при наличии внешних блокеров (зависимости, недоступные ресурсы).
+
 ## POLICY
 1. Никакого markdown.
 2. Не исправлять — только фиксировать.
 3. verdict=PASS при наличии FAIL в любом check — недопустимо.
-4. blockers[] пуст только если verdict=PASS.
-5. for_fixer[] содержит unresolved issues и FAIL checks.
-6. Если любой вход пустой или не парсится → verdict=FAIL.\
+4. test_output в FILE:/--- формате — это штатная ситуация, не повод для FAIL.
+5. Если pm_plan или arch_plan пустые → completeness=FAIL.
+6. Если review пустой или review.verdict отсутствует → review_quality=FAIL.\
 """
 
 _FIXER_SYSTEM = _JSON_CRITICAL + """\
@@ -655,10 +685,51 @@ def build_dispatcher_agent_registry_factory(
             review: str,
             test_output: str,
         ) -> str:
+            import json as _json
+
+            # Summarize arch_plan: send only task_summary + file_structure,
+            # drop modules/contracts/functions (too large, not needed for QA checks).
+            arch_summary = arch_plan
+            try:
+                arch_obj = _json.loads(arch_plan)
+                arch_summary = _json.dumps(
+                    {
+                        "arch_id": arch_obj.get("arch_id", ""),
+                        "plan_id": arch_obj.get("plan_id", ""),
+                        "task_summary": arch_obj.get("task_summary", ""),
+                        "file_structure": arch_obj.get("file_structure", []),
+                        "blockers": arch_obj.get("blockers", []),
+                    },
+                    ensure_ascii=False,
+                )
+            except Exception:
+                pass  # keep original if not parseable
+
+            # Summarize writer_output: send only file paths + line counts,
+            # drop full source content (can be 10k+ tokens, not needed for QA).
+            code_summary = writer_output
+            try:
+                code_obj = _json.loads(writer_output)
+                files = code_obj.get("files", [])
+                code_summary = _json.dumps(
+                    {
+                        "files": [
+                            {
+                                "path": f.get("path", ""),
+                                "lines": len(f.get("content", "").splitlines()),
+                            }
+                            for f in files
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            except Exception:
+                pass  # keep original if not parseable
+
             user_content = (
                 f"pm_plan:\n{pm_plan}\n\n"
-                f"arch_plan:\n{arch_plan}\n\n"
-                f"writer_output:\n{writer_output}\n\n"
+                f"arch_plan:\n{arch_summary}\n\n"
+                f"writer_output:\n{code_summary}\n\n"
                 f"review:\n{review}\n\n"
                 f"test_output:\n{test_output}"
             )
