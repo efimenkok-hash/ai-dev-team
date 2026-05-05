@@ -491,11 +491,114 @@ def test_agents_handler_rejects_non_personas():
         make_agents_handler("not personas")  # type: ignore[arg-type]
 
 
-def test_log_handler_returns_string():
+def test_log_handler_no_history_returns_stub():
+    """Without task_history /log must return an informative stub."""
     handler = make_log_handler()
     text = handler(parse_command("/log"), None)
     assert isinstance(text, str)
-    assert "лог" in text.lower()
+    assert "📜" in text
+    assert "недоступен" in text.lower() or "не настроен" in text.lower()
+
+
+def test_log_handler_rejects_invalid_task_history():
+    with pytest.raises(ValueError, match="invalid_task_history"):
+        make_log_handler(task_history="not history")  # type: ignore[arg-type]
+
+
+def test_log_handler_empty_history():
+    from core.task_history import TaskHistory
+
+    h = TaskHistory()
+    handler = make_log_handler(task_history=h)
+    text = handler(parse_command("/log"), None)
+    assert "пуста" in text.lower()
+
+
+def test_log_handler_recent_list():
+    """Without args, /log lists up to 5 most recent tasks."""
+    import time
+
+    from core.task_history import TaskHistory, TaskSummary
+
+    h = TaskHistory()
+    for i in range(3):
+        h.record(
+            TaskSummary(
+                task_id=f"task-{i}",
+                branch=f"feature/task-{i}",
+                commit_sha="abc1234",
+                final_state="SUCCESS",
+                failure_reason=None,
+                tier_name="ECONOMY",
+                finished_at=time.time() + i,
+            )
+        )
+    handler = make_log_handler(task_history=h)
+    text = handler(parse_command("/log"), None)
+    assert "task-0" in text
+    assert "task-2" in text
+    assert "✅" in text
+
+
+def test_log_handler_task_id_lookup_found():
+    """'/log task-x' returns details for a known task."""
+    import time
+
+    from core.task_history import TaskHistory, TaskSummary
+
+    h = TaskHistory()
+    h.record(
+        TaskSummary(
+            task_id="task-abc",
+            branch="feature/task-abc",
+            commit_sha="deadbeef12345",
+            final_state="SUCCESS",
+            failure_reason=None,
+            tier_name="PREMIUM",
+            finished_at=time.time(),
+        )
+    )
+    handler = make_log_handler(task_history=h)
+    text = handler(parse_command("/log task-abc"), None)
+    assert "task-abc" in text
+    assert "deadbee" in text   # first 7 chars of SHA
+    assert "PREMIUM" in text
+    assert "SUCCESS" in text
+
+
+def test_log_handler_task_id_lookup_not_found():
+    """'/log unknown' returns a not-found message without crashing."""
+    from core.task_history import TaskHistory
+
+    h = TaskHistory()
+    handler = make_log_handler(task_history=h)
+    text = handler(parse_command("/log unknown-task"), None)
+    assert "unknown-task" in text
+    assert "не найден" in text.lower()
+
+
+def test_log_handler_failed_task_shows_reason():
+    """Failed task with failure_reason shows the reason."""
+    import time
+
+    from core.task_history import TaskHistory, TaskSummary
+
+    h = TaskHistory()
+    h.record(
+        TaskSummary(
+            task_id="task-fail",
+            branch="feature/task-fail",
+            commit_sha=None,
+            final_state="FAIL",
+            failure_reason="ruff_error",
+            tier_name="ECONOMY",
+            finished_at=time.time(),
+        )
+    )
+    handler = make_log_handler(task_history=h)
+    text = handler(parse_command("/log task-fail"), None)
+    assert "❌" in text
+    assert "ruff_error" in text
 
 
 def test_stop_handler_no_runner_returns_stub():

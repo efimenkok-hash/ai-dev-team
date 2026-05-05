@@ -475,15 +475,84 @@ def make_push_handler(
     return _handle
 
 
-def make_log_handler() -> CommandHandler:
-    def _handle(_cmd: BotCommand, _ctx: Any) -> str:
-        return (
-            "📜 Лог последней задачи\n"
-            "\n"
-            "▸ Файл: .pipeline_log.jsonl (корень проекта)\n"
-            "\n"
-            "🔜 Стриминг в чат и /log <task_id> — в Модуле 7b."
-        )
+def _format_task_summary(summary: Any) -> str:  # summary: TaskSummary
+    """Render one TaskSummary as a human-readable Telegram message."""
+    import time as _time
+
+    from core.task_history import TaskSummary
+
+    s: TaskSummary = summary
+    state_icon = "✅" if s.final_state == "SUCCESS" else "❌"
+    sha_short = s.commit_sha[:7] if s.commit_sha else "—"
+    try:
+        ts = _time.strftime("%Y-%m-%d %H:%M UTC", _time.gmtime(s.finished_at))
+    except Exception:
+        ts = "—"
+    lines = [
+        f"📜 Задача `{s.task_id}`",
+        "",
+        f"{state_icon} Статус:  {s.final_state}",
+        f"🌿 Ветка:   {s.branch}",
+        f"🔖 SHA:    {sha_short}",
+        f"💼 Тариф:  {s.tier_name}",
+        f"🕐 Время:  {ts}",
+    ]
+    if s.failure_reason:
+        lines.append(f"⚠️  Причина: {s.failure_reason}")
+    return "\n".join(lines)
+
+
+def make_log_handler(
+    task_history: "TaskHistory | None" = None,
+) -> CommandHandler:
+    """Returns a /log handler.
+
+    Subcommands:
+      /log              → list the 5 most recent completed tasks
+      /log <task_id>    → show details for a specific task
+
+    When *task_history* is None, returns an informative stub.
+    """
+    if task_history is not None:
+        from core.task_history import TaskHistory as _TH
+
+        if not isinstance(task_history, _TH):
+            raise ValueError(f"invalid_task_history:{type(task_history).__name__}")
+
+    def _handle(cmd: BotCommand, _ctx: Any) -> str:
+        if task_history is None:
+            return (
+                "📜 Лог задач недоступен\n"
+                "\n"
+                "Пайплайн не настроен — история задач не ведётся."
+            )
+
+        positional = cmd.positional_args()
+
+        # /log <task_id>
+        if positional:
+            task_id = positional[0]
+            summary = task_history.get(task_id)
+            if summary is None:
+                return (
+                    f"📜 Задача `{task_id}` не найдена\n"
+                    "\n"
+                    "Возможно, задача ещё выполняется или история была сброшена."
+                )
+            return _format_task_summary(summary)
+
+        # /log — show 5 most recent
+        recent = task_history.recent(5)
+        if not recent:
+            return "📜 История задач пуста — ещё ни одна задача не завершена."
+
+        header = f"📜 Последние задачи ({len(recent)}):\n"
+        rows = []
+        for s in reversed(recent):  # newest first
+            icon = "✅" if s.final_state == "SUCCESS" else "❌"
+            sha = s.commit_sha[:7] if s.commit_sha else "—"
+            rows.append(f"{icon} `{s.task_id}` · {s.branch} · {sha}")
+        return header + "\n".join(rows) + "\n\n/log <task_id> — подробности"
 
     return _handle
 
@@ -648,6 +717,9 @@ def build_command_registry(
     handler is fully wired (real push to GitHub). When either is None,
     /push returns a "настрой REPO_PATH" stub.
 
+    task_history is also passed to /log: when provided, /log lists recent
+    completed tasks and shows per-task details. When None, /log returns a stub.
+
     runner is optional: when provided, /stop calls runner.cancel() for real
     cooperative cancellation. When None, /stop returns an informative stub.
     """
@@ -669,7 +741,7 @@ def build_command_registry(
     reg.register(CommandName.BUDGET, make_budget_handler(budget_state))
     reg.register(CommandName.AGENTS, make_agents_handler(personas))
     reg.register(CommandName.TIER, make_tier_handler(tier_store))
-    reg.register(CommandName.LOG, make_log_handler())
+    reg.register(CommandName.LOG, make_log_handler(task_history))
     reg.register(CommandName.STOP, make_stop_handler(runner))
     reg.register(CommandName.RETRY, make_retry_handler())
     reg.register(CommandName.PUSH, make_push_handler(sandbox, task_history))
