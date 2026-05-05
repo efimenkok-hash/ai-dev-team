@@ -27,8 +27,9 @@ CONTRACTS:
 7. build_real_task_handler_from_env assembles the full
    BackgroundTaskRunner + SandboxWorkspace + LLMDispatcher pipeline when
    OPENROUTER_API_KEY and REPO_PATH are both present in env.  Returns
-   None (silently) if any required env var is missing or the repo path is
-   invalid — callers fall back to make_simple_task_handler in that case.
+   None (silently) if any required env var is missing or any setup error
+   occurs (invalid path, OSError, TypeError, ValueError from subsystems)
+   — callers fall back to make_simple_task_handler in that case.
 8. build_bridge_from_env tries build_real_task_handler_from_env first;
    falls back to make_simple_task_handler when the full stack is absent.
 """
@@ -189,9 +190,12 @@ def build_real_task_handler_from_env(
             sandbox_cfg_kwargs["worktree_root"] = worktree_root
 
         sandbox = SandboxWorkspace(SandboxConfig(**sandbox_cfg_kwargs))
-        runner = BackgroundTaskRunner()
-        factory = build_dispatcher_agent_registry_factory(dispatcher)
+    except (ValueError, TypeError, OSError):
+        return None
 
+    runner = BackgroundTaskRunner()
+    try:
+        factory = build_dispatcher_agent_registry_factory(dispatcher)
         return make_real_task_handler(
             runner=runner,
             sandbox=sandbox,
@@ -201,6 +205,7 @@ def build_real_task_handler_from_env(
             config=RealTaskHandlerConfig(),
         )
     except (ValueError, TypeError, OSError):
+        runner.shutdown(wait=False)
         return None
 
 
@@ -602,6 +607,16 @@ def build_bridge_from_env(
     commands = build_command_registry(personas, tier_store=tier_store)
 
     # Attempt to build the full dispatcher-backed pipeline; fall back to stub.
+    # Guard: if the real pipeline would be active but no progress callback was
+    # provided, we must raise rather than silently swallow all progress events
+    # for 30+ seconds (UX bug).
+    _real_possible = bool(
+        env.get("OPENROUTER_API_KEY", "").strip()
+        and env.get("REPO_PATH", "").strip()
+    )
+    if _real_possible and send_progress_callable is None:
+        raise ValueError("send_progress_required_for_real_pipeline")
+
     _send_progress: Callable[[int, str], None] = (
         send_progress_callable if send_progress_callable is not None
         else lambda _cid, _txt: None

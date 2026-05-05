@@ -265,6 +265,37 @@ def test_build_real_task_handler_rejects_non_callable_progress():
         )
 
 
+def test_build_real_task_handler_shuts_down_runner_on_factory_failure(tmp_path):
+    """Resource-leak fix: if factory/make_real_task_handler raises after
+    BackgroundTaskRunner is created, runner.shutdown(wait=False) must be called
+    so the thread-pool worker does not linger.
+    """
+    from unittest.mock import MagicMock, patch
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    store = TierSessionStore(default_tier_registry())
+
+    mock_runner = MagicMock()
+
+    with (
+        patch("core.bot_runner.BackgroundTaskRunner", return_value=mock_runner),
+        patch(
+            "core.bot_runner.build_dispatcher_agent_registry_factory",
+            side_effect=ValueError("factory_boom"),
+        ),
+    ):
+        result = build_real_task_handler_from_env(
+            {"OPENROUTER_API_KEY": "sk-or-test", "REPO_PATH": str(repo)},
+            tier_store=store,
+            send_progress=_noop_progress,
+        )
+
+    assert result is None
+    mock_runner.shutdown.assert_called_once_with(wait=False)
+
+
 # ---------------------------------------------------------------------------
 # build_whisper_client / build_vision_client (optional clients)
 # ---------------------------------------------------------------------------
@@ -747,7 +778,9 @@ def test_build_bridge_from_env_uses_simple_handler_no_repo_path():
 
 
 def test_build_bridge_from_env_uses_real_handler_with_full_env(tmp_path):
-    """OPENROUTER_API_KEY + valid REPO_PATH → real handler (tier-selection prompt)."""
+    """OPENROUTER_API_KEY + valid REPO_PATH → real handler (tier-selection prompt).
+    send_progress_callable is required when the real pipeline is active.
+    """
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".git").mkdir()
@@ -757,7 +790,11 @@ def test_build_bridge_from_env_uses_real_handler_with_full_env(tmp_path):
         "REPO_PATH": str(repo),
     }
     send, captured = _captured_send()
-    bridge = build_bridge_from_env(env, send_callable=send)
+    bridge = build_bridge_from_env(
+        env,
+        send_callable=send,
+        send_progress_callable=lambda _cid, _txt: None,
+    )
     msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="build me a CLI")
     bridge.handle(msg)
     # Real handler: no tier set → prompts to pick a tier
@@ -782,4 +819,30 @@ def test_build_bridge_from_env_accepts_send_progress_callable(tmp_path):
         send_callable=send,
         send_progress_callable=lambda cid, txt: progress_log.append((cid, txt)),
     )
+    assert isinstance(bridge, TelegramBridge)
+
+
+def test_build_bridge_from_env_requires_send_progress_when_real_pipeline(tmp_path):
+    """Real pipeline active (API key + REPO_PATH set) but send_progress_callable
+    omitted → ValueError so caller is not silently losing 30+ seconds of events.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    env = {
+        "TELEGRAM_OWNER_CHAT_ID": "777",
+        "OPENROUTER_API_KEY": "sk-or-test",
+        "REPO_PATH": str(repo),
+    }
+    send, _ = _captured_send()
+    with pytest.raises(ValueError, match="send_progress_required_for_real_pipeline"):
+        build_bridge_from_env(env, send_callable=send)  # no send_progress_callable
+
+
+def test_build_bridge_from_env_no_send_progress_ok_without_real_pipeline():
+    """Simple pipeline (no REPO_PATH) → send_progress_callable can be omitted."""
+    env = {"TELEGRAM_OWNER_CHAT_ID": "777", "OPENROUTER_API_KEY": "sk-or-test"}
+    send, _ = _captured_send()
+    # Must not raise — real pipeline won't activate without REPO_PATH
+    bridge = build_bridge_from_env(env, send_callable=send)
     assert isinstance(bridge, TelegramBridge)
