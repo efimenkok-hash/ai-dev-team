@@ -62,19 +62,17 @@ def test_build_send_progress_callable_not_none():
 
 def test_send_progress_schedules_run_coroutine_threadsafe():
     """Calling send_progress must invoke run_coroutine_threadsafe with the
-    correct loop and bot.send_message coroutine."""
+    correct loop and register a done-callback (fire-and-forget)."""
     app, loop = _make_app_and_loop()
     try:
         fn = script._build_send_progress_callable(app, loop)
 
         fake_future = MagicMock()
-        fake_future.result.return_value = None
 
         with patch(
             "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
             return_value=fake_future,
         ) as mock_rctf:
-            # send_message must be awaitable — use AsyncMock
             app.bot.send_message = AsyncMock(return_value=None)
             fn(chat_id=42, text="hello progress")
 
@@ -83,8 +81,9 @@ def test_send_progress_schedules_run_coroutine_threadsafe():
         _coro_arg, loop_arg = mock_rctf.call_args.args
         assert loop_arg is loop
 
-        # future.result called to block until send completes
-        fake_future.result.assert_called_once_with(timeout=30)
+        # Fire-and-forget: callback registered, result() NEVER called
+        fake_future.add_done_callback.assert_called_once()
+        fake_future.result.assert_not_called()
     finally:
         loop.close()
 
@@ -127,27 +126,6 @@ def test_send_progress_passes_chat_id_and_text_to_send_message():
 # ---------------------------------------------------------------------------
 
 
-def test_send_progress_swallows_future_result_exception():
-    """If future.result() raises (e.g. network error), send_progress must NOT
-    re-raise — the worker thread must stay alive."""
-    app, loop = _make_app_and_loop()
-    try:
-        fn = script._build_send_progress_callable(app, loop)
-
-        fake_future = MagicMock()
-        fake_future.result.side_effect = RuntimeError("network blip")
-
-        with patch(
-            "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
-            return_value=fake_future,
-        ):
-            app.bot.send_message = AsyncMock(return_value=None)
-            # Must not raise
-            fn(chat_id=42, text="this will fail silently")
-    finally:
-        loop.close()
-
-
 def test_send_progress_swallows_run_coroutine_threadsafe_exception():
     """If run_coroutine_threadsafe itself raises, send_progress must not propagate."""
     app, loop = _make_app_and_loop()
@@ -164,16 +142,18 @@ def test_send_progress_swallows_run_coroutine_threadsafe_exception():
         loop.close()
 
 
-def test_send_progress_logs_exception_on_failure(caplog):
-    """Errors must be logged (not silently dropped with no trace)."""
+def test_send_progress_done_callback_logs_send_message_error(caplog):
+    """_on_send_done callback must log errors from the Telegram send coroutine."""
     import logging
 
     app, loop = _make_app_and_loop()
     try:
+        # Grab the _on_send_done callback by capturing add_done_callback call
         fn = script._build_send_progress_callable(app, loop)
 
         fake_future = MagicMock()
-        fake_future.result.side_effect = OSError("timeout")
+        captured_callbacks: list = []
+        fake_future.add_done_callback.side_effect = captured_callbacks.append
 
         with (
             patch(
@@ -185,7 +165,76 @@ def test_send_progress_logs_exception_on_failure(caplog):
             app.bot.send_message = AsyncMock(return_value=None)
             fn(chat_id=5, text="log me")
 
-        assert any("send_progress failed" in r.message for r in caplog.records)
+        assert len(captured_callbacks) == 1
+        on_done = captured_callbacks[0]
+
+        # Simulate a failed future
+        error_future = MagicMock()
+        error_future.exception.return_value = OSError("Telegram 429")
+        on_done(error_future)
+
+        assert any("send_progress send_message failed" in r.message for r in caplog.records)
+    finally:
+        loop.close()
+
+
+def test_send_progress_done_callback_silent_on_success(caplog):
+    """_on_send_done must not log anything when the future succeeded."""
+    import logging
+
+    app, loop = _make_app_and_loop()
+    try:
+        fn = script._build_send_progress_callable(app, loop)
+
+        fake_future = MagicMock()
+        captured_callbacks: list = []
+        fake_future.add_done_callback.side_effect = captured_callbacks.append
+
+        with (
+            patch(
+                "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+                return_value=fake_future,
+            ),
+            caplog.at_level(logging.ERROR, logger="ai_dev_team.bot"),
+        ):
+            app.bot.send_message = AsyncMock(return_value=None)
+            fn(chat_id=5, text="ok send")
+
+        on_done = captured_callbacks[0]
+        ok_future = MagicMock()
+        ok_future.exception.return_value = None
+        on_done(ok_future)
+
+        assert not caplog.records
+    finally:
+        loop.close()
+
+
+def test_send_progress_does_not_block_worker_on_slow_telegram():
+    """Fire-and-forget: _send_progress must return without waiting for the
+    future to complete, even if result() would block/raise immediately."""
+    import time
+
+    app, loop = _make_app_and_loop()
+    try:
+        fn = script._build_send_progress_callable(app, loop)
+
+        fake_future = MagicMock()
+        # Simulate a future whose result() blocks forever (rate-limit scenario)
+        fake_future.result.side_effect = RuntimeError("should never be called")
+
+        with patch(
+            "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+            return_value=fake_future,
+        ):
+            app.bot.send_message = AsyncMock(return_value=None)
+            start = time.monotonic()
+            fn(chat_id=1, text="fire and forget")
+            elapsed = time.monotonic() - start
+
+        # Should return in well under 1 second (no blocking network call)
+        assert elapsed < 1.0
+        fake_future.result.assert_not_called()
     finally:
         loop.close()
 

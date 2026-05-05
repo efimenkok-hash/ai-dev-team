@@ -93,9 +93,17 @@ def _build_send_progress_callable(application, loop):
     Called from a non-async worker thread — uses run_coroutine_threadsafe to
     safely schedule the PTB coroutine on the main event loop.
 
-    Errors are logged and swallowed: the worker must not crash because a
-    single Telegram send failed (network blip, rate limit, etc.).
+    Fire-and-forget: we do NOT call future.result() so the worker thread is
+    never blocked waiting for Telegram's network round-trip.  A pipeline
+    emits ~16 progress events; blocking on each would add up to 8 minutes of
+    stall under a Telegram rate-limit (429).  Errors are surfaced via
+    add_done_callback and logged without crashing the worker.
     """
+
+    def _on_send_done(future) -> None:
+        exc = future.exception()
+        if exc is not None:
+            logger.error("send_progress send_message failed: %s", exc)
 
     def _send_progress(chat_id: int, text: str) -> None:
         try:
@@ -103,10 +111,14 @@ def _build_send_progress_callable(application, loop):
                 application.bot.send_message(chat_id=chat_id, text=text),
                 loop,
             )
-            future.result(timeout=30)
+            future.add_done_callback(_on_send_done)
+            # NB: не вызываем future.result() — это сериализовало бы worker
+            # на сетевом I/O, превращая 16 событий × 30с в 8-минутный затык
+            # под rate-limit'ом Telegram. Ошибки логируются в callback.
         except Exception:
             logger.exception(
-                "send_progress failed for chat_id=%s; worker continues", chat_id
+                "send_progress submission failed for chat_id=%s; worker continues",
+                chat_id,
             )
 
     return _send_progress
