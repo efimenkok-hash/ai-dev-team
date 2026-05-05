@@ -2,7 +2,7 @@
 """
 scripts/run_telegram_bot.py
 
-Step 14a Module 7: entry point for the AI Dev Team Telegram bot.
+Step 14a Module 7 + 14b-8: entry point for the AI Dev Team Telegram bot.
 Wires components from core/* into a running long-poll loop.
 
 Usage:
@@ -16,11 +16,21 @@ Required env (loaded from .env via python-dotenv):
 Optional env:
     OPENAI_API_KEY              — enables voice (Whisper)
     OPENROUTER_API_KEY          — enables vision (image description)
+    REPO_PATH                   — git repo path; enables real LLM pipeline
+                                  (requires OPENROUTER_API_KEY)
+    WORKTREE_ROOT               — optional custom worktree directory
     BOT_COST_THRESHOLD_USD      — confirmation gate cost threshold (default 1.0)
 
 This script keeps PTB-specific code at the boundary; all logic lives in
 core.bot_runner and core.telegram_bridge, both fully unit-tested without
 network or PTB dependencies.
+
+Threading contract:
+    send_callable        — called from executor threads via bridge.handle()
+    send_progress_callable — called from BackgroundTaskRunner worker thread
+    Both use asyncio.run_coroutine_threadsafe to safely schedule PTB coroutines
+    onto the main event loop. Errors in send_progress are logged and swallowed
+    so the worker thread stays alive.
 """
 
 import argparse
@@ -74,6 +84,32 @@ def _build_send_callable(application, loop):
         future.result(timeout=30)
 
     return _send
+
+
+def _build_send_progress_callable(application, loop):
+    """Create a sync `send_progress(chat_id, text)` callable for streaming
+    progress events from the BackgroundTaskRunner worker thread to the user.
+
+    Called from a non-async worker thread — uses run_coroutine_threadsafe to
+    safely schedule the PTB coroutine on the main event loop.
+
+    Errors are logged and swallowed: the worker must not crash because a
+    single Telegram send failed (network blip, rate limit, etc.).
+    """
+
+    def _send_progress(chat_id: int, text: str) -> None:
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                application.bot.send_message(chat_id=chat_id, text=text),
+                loop,
+            )
+            future.result(timeout=30)
+        except Exception:
+            logger.exception(
+                "send_progress failed for chat_id=%s; worker continues", chat_id
+            )
+
+    return _send_progress
 
 
 def _ptb_update_to_incoming(update) -> IncomingMessage | None:
@@ -223,8 +259,13 @@ async def main(argv: list[str] | None = None) -> int:
     loop = asyncio.get_running_loop()
 
     send_callable = _build_send_callable(application, loop)
+    send_progress_callable = _build_send_progress_callable(application, loop)
     try:
-        bridge = build_bridge_from_env(env, send_callable=send_callable)
+        bridge = build_bridge_from_env(
+            env,
+            send_callable=send_callable,
+            send_progress_callable=send_progress_callable,
+        )
     except ValueError as exc:
         logger.error("Bridge construction failed: %s", exc)
         return 4
@@ -243,6 +284,10 @@ async def main(argv: list[str] | None = None) -> int:
     logger.info("Bot starting. Owner whitelist: %s", env.get("TELEGRAM_OWNER_CHAT_ID"))
     logger.info("Whisper enabled: %s", bool(env.get("OPENAI_API_KEY")))
     logger.info("Vision enabled: %s", bool(env.get("OPENROUTER_API_KEY")))
+    logger.info(
+        "Real LLM pipeline: %s",
+        bool(env.get("OPENROUTER_API_KEY") and env.get("REPO_PATH")),
+    )
 
     await application.initialize()
     await application.start()
