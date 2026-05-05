@@ -414,6 +414,32 @@ def test_commit_runs_add_status_commit_revparse(fake_repo, tmp_path):
     assert sha == "abc123def"
 
 
+def test_commit_accepts_safe_shell_like_text_in_message(fake_repo, tmp_path):
+    cfg = _make_config(fake_repo, tmp_path)
+    handle = _handle_for(cfg)
+    runner = FakeRunner(
+        responses=[
+            _RunResult(returncode=0, stdout="", stderr=""),                  # add
+            _RunResult(returncode=0, stdout=" M file.py\n", stderr=""),      # status
+            _RunResult(returncode=0, stdout="", stderr=""),                  # commit
+            _RunResult(returncode=0, stdout="abc123def\n", stderr=""),       # rev-parse
+        ],
+    )
+    ws = SandboxWorkspace(cfg, runner=runner)
+    sha = ws.commit_in_worktree(
+        handle,
+        message="AI Dev Team: add square(x: int) -> int",
+        author_name="Bot",
+        author_email="bot@example.com",
+    )
+
+    assert sha == "abc123def"
+    commit_cmd = runner.calls[2]["cmd"]
+    assert "-F" in commit_cmd
+    assert "-m" not in commit_cmd
+    assert not list(handle.path.glob(".ai-dev-team-commit-*.txt"))
+
+
 def test_commit_raises_on_nothing_to_commit(fake_repo, tmp_path):
     cfg = _make_config(fake_repo, tmp_path)
     handle = _handle_for(cfg)

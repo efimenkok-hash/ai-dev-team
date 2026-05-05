@@ -300,12 +300,33 @@ class SandboxWorkspace:
             )
 
         # 3. Commit with explicit author identity.
-        commit_args = (
-            "-c", f"user.name={author_name.strip()}",
-            "-c", f"user.email={author_email.strip()}",
-            "commit", "-m", message.strip(),
-        )
-        result_commit = self._git_in(handle.path, *commit_args)
+        # Use a temporary message file instead of `git commit -m <message>` so
+        # human task text containing safe shell-looking characters (for example
+        # Python annotations like `-> int`) is not treated as a git argv token.
+        # `_run_git` still validates all git arguments; the untrusted commit
+        # message is passed as file content, not as a command argument.
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(handle.path),
+            prefix=".ai-dev-team-commit-",
+            suffix=".txt",
+            delete=False,
+        ) as msg_file:
+            msg_path = Path(msg_file.name)
+            msg_file.write(message.strip())
+            msg_file.write("\n")
+
+        try:
+            commit_args = (
+                "-c", f"user.name={author_name.strip()}",
+                "-c", f"user.email={author_email.strip()}",
+                "commit", "-F", str(msg_path),
+            )
+            result_commit = self._git_in(handle.path, *commit_args)
+        finally:
+            msg_path.unlink(missing_ok=True)
+
         if result_commit.returncode != 0:
             raise SandboxError(
                 "git_commit_failed",
