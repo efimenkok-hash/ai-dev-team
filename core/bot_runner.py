@@ -191,6 +191,7 @@ def build_real_task_handler_from_env(
     send_progress: Callable[[int, str], None],
     sandbox: SandboxWorkspace | None = None,
     task_history: TaskHistory | None = None,
+    runner: BackgroundTaskRunner | None = None,
 ) -> TaskHandler | None:
     """Assemble the full pipeline TaskHandler from env when possible.
 
@@ -205,6 +206,11 @@ def build_real_task_handler_from_env(
       sandbox       — pre-built SandboxWorkspace (built from env if None).
       task_history  — shared TaskHistory for /push and /log commands; each
                       completed task summary is recorded in on_complete.
+      runner        — pre-built BackgroundTaskRunner (created internally if
+                      None). Pass the same runner that was given to
+                      build_command_registry so /stop can cancel real tasks.
+                      When a caller-owned runner is passed, this function
+                      will NOT shut it down on error (the caller owns it).
 
     Returns None (silently) if OPENROUTER_API_KEY or REPO_PATH are absent,
     or if any setup error occurs (invalid path, OSError, TypeError, ValueError
@@ -227,11 +233,12 @@ def build_real_task_handler_from_env(
     if _sandbox is None:
         return None
 
-    runner = BackgroundTaskRunner()
+    _runner_owned = runner is None
+    _runner = runner if runner is not None else BackgroundTaskRunner()
     try:
         factory = build_dispatcher_agent_registry_factory(dispatcher)
         return make_real_task_handler(
-            runner=runner,
+            runner=_runner,
             sandbox=_sandbox,
             tier_store=tier_store,
             send_progress=send_progress,
@@ -240,7 +247,8 @@ def build_real_task_handler_from_env(
             task_history=task_history,
         )
     except (ValueError, TypeError, OSError):
-        runner.shutdown(wait=False)
+        if _runner_owned:
+            _runner.shutdown(wait=False)
         return None
 
 
@@ -480,14 +488,36 @@ def make_log_handler() -> CommandHandler:
     return _handle
 
 
-def make_stop_handler() -> CommandHandler:
+def make_stop_handler(
+    runner: BackgroundTaskRunner | None = None,
+) -> CommandHandler:
+    """Returns a /stop handler.
+
+    When *runner* is provided (real pipeline is active), calls runner.cancel():
+      - cancel() returns True  → active task was signalled → "Задача остановлена"
+      - cancel() returns False → nothing running            → "Ничего не выполняется"
+
+    When *runner* is None (pipeline not configured), returns an informative stub.
+    """
+    if runner is not None and not isinstance(runner, BackgroundTaskRunner):
+        raise ValueError(f"invalid_runner:{type(runner).__name__}")
+
     def _handle(_cmd: BotCommand, _ctx: Any) -> str:
-        return (
-            "⏹ Запрос на остановку принят\n"
-            "\n"
-            "🔜 Реальная остановка in-flight задач — в Модуле 7b "
-            "(нужен флаг отмены в orchestrator)."
-        )
+        if runner is None:
+            return (
+                "⏹ Остановка недоступна\n"
+                "\n"
+                "Пайплайн не настроен — задачи не выполняются в фоне."
+            )
+        cancelled = runner.cancel()
+        if cancelled:
+            return (
+                "⏹ Задача остановлена\n"
+                "\n"
+                "Запрос на отмену отправлен воркеру. "
+                "Дожидайся сообщения о завершении."
+            )
+        return "⏹ Сейчас ничего не выполняется"
 
     return _handle
 
@@ -606,6 +636,7 @@ def build_command_registry(
     tier_store: TierSessionStore | None = None,
     sandbox: SandboxWorkspace | None = None,
     task_history: TaskHistory | None = None,
+    runner: BackgroundTaskRunner | None = None,
 ) -> CommandRegistry:
     """Build a CommandRegistry pre-populated with all 10 default handlers.
 
@@ -616,6 +647,9 @@ def build_command_registry(
     sandbox + task_history are optional: when both are provided the /push
     handler is fully wired (real push to GitHub). When either is None,
     /push returns a "настрой REPO_PATH" stub.
+
+    runner is optional: when provided, /stop calls runner.cancel() for real
+    cooperative cancellation. When None, /stop returns an informative stub.
     """
     if not isinstance(personas, PersonaRegistry):
         raise ValueError("invalid_personas")
@@ -636,7 +670,7 @@ def build_command_registry(
     reg.register(CommandName.AGENTS, make_agents_handler(personas))
     reg.register(CommandName.TIER, make_tier_handler(tier_store))
     reg.register(CommandName.LOG, make_log_handler())
-    reg.register(CommandName.STOP, make_stop_handler())
+    reg.register(CommandName.STOP, make_stop_handler(runner))
     reg.register(CommandName.RETRY, make_retry_handler())
     reg.register(CommandName.PUSH, make_push_handler(sandbox, task_history))
     # /help is registered LAST so it can list everything else.
@@ -727,11 +761,19 @@ def build_bridge_from_env(
     sandbox = _try_build_sandbox(env)
     task_history = TaskHistory() if sandbox is not None else None
 
+    # Build a single BackgroundTaskRunner so /stop can cancel the active task.
+    # The runner is passed to both build_command_registry (for /stop) and
+    # build_real_task_handler_from_env (for task execution).  When the real
+    # pipeline is not configured the runner is still created but remains idle;
+    # it's lightweight and runner.cancel() safely returns False when idle.
+    runner = BackgroundTaskRunner()
+
     commands = build_command_registry(
         personas,
         tier_store=tier_store,
         sandbox=sandbox,
         task_history=task_history,
+        runner=runner,
     )
 
     # Attempt to build the full dispatcher-backed pipeline; fall back to stub.
@@ -753,6 +795,7 @@ def build_bridge_from_env(
         send_progress=_send_progress,
         sandbox=sandbox,
         task_history=task_history,
+        runner=runner,
     ) or make_simple_task_handler(personas)
 
     return TelegramBridge(

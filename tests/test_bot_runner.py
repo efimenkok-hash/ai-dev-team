@@ -298,6 +298,35 @@ def test_build_real_task_handler_shuts_down_runner_on_factory_failure(tmp_path):
     mock_runner.shutdown.assert_called_once_with(wait=False)
 
 
+def test_build_real_task_handler_does_not_shutdown_external_runner_on_failure(tmp_path):
+    """When caller passes an external runner and factory fails, the caller
+    owns the runner — we must NOT shut it down inside the function."""
+    from unittest.mock import MagicMock, patch
+
+    from core.background_runner import BackgroundTaskRunner
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    store = TierSessionStore(default_tier_registry())
+
+    external_runner = MagicMock(spec=BackgroundTaskRunner)
+
+    with patch(
+        "core.bot_runner.build_dispatcher_agent_registry_factory",
+        side_effect=ValueError("factory_boom"),
+    ):
+        result = build_real_task_handler_from_env(
+            {"OPENROUTER_API_KEY": "sk-or-test", "REPO_PATH": str(repo)},
+            tier_store=store,
+            send_progress=_noop_progress,
+            runner=external_runner,
+        )
+
+    assert result is None
+    external_runner.shutdown.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # build_whisper_client / build_vision_client (optional clients)
 # ---------------------------------------------------------------------------
@@ -469,11 +498,65 @@ def test_log_handler_returns_string():
     assert "лог" in text.lower()
 
 
-def test_stop_handler_returns_string():
+def test_stop_handler_no_runner_returns_stub():
+    """Without a runner /stop should return an informative stub, not crash."""
     handler = make_stop_handler()
     text = handler(parse_command("/stop"), None)
     assert isinstance(text, str)
-    assert "остановк" in text.lower()
+    assert "⏹" in text
+    # Must NOT claim "остановлена" or "ничего" — those belong to real handler.
+    assert "недоступна" in text.lower() or "не настроен" in text.lower()
+
+
+def test_stop_handler_rejects_invalid_runner():
+    with pytest.raises(ValueError, match="invalid_runner"):
+        make_stop_handler(runner="not a runner")  # type: ignore[arg-type]
+
+
+def test_stop_handler_cancels_active_task():
+    """runner.cancel() returns True (active task) → "остановлена" message."""
+    from unittest.mock import MagicMock
+
+    from core.background_runner import BackgroundTaskRunner
+
+    mock_runner = MagicMock(spec=BackgroundTaskRunner)
+    mock_runner.cancel.return_value = True
+
+    handler = make_stop_handler(runner=mock_runner)
+    text = handler(parse_command("/stop"), None)
+
+    mock_runner.cancel.assert_called_once()
+    assert "⏹" in text
+    assert "остановлена" in text.lower()
+
+
+def test_stop_handler_nothing_running():
+    """runner.cancel() returns False (idle) → "ничего не выполняется" message."""
+    from unittest.mock import MagicMock
+
+    from core.background_runner import BackgroundTaskRunner
+
+    mock_runner = MagicMock(spec=BackgroundTaskRunner)
+    mock_runner.cancel.return_value = False
+
+    handler = make_stop_handler(runner=mock_runner)
+    text = handler(parse_command("/stop"), None)
+
+    mock_runner.cancel.assert_called_once()
+    assert "ничего" in text.lower()
+
+
+def test_stop_handler_with_real_runner_idle():
+    """Integration: real BackgroundTaskRunner (idle) → cancel() == False."""
+    from core.background_runner import BackgroundTaskRunner
+
+    runner = BackgroundTaskRunner()
+    try:
+        handler = make_stop_handler(runner=runner)
+        text = handler(parse_command("/stop"), None)
+        assert "ничего" in text.lower()
+    finally:
+        runner.shutdown(wait=False)
 
 
 def test_retry_handler_default():
@@ -642,6 +725,36 @@ def test_build_command_registry_dispatches_each_command():
         result = reg.dispatch(parse_command(f"/{cmd_name.value}"))
         assert isinstance(result, str)
         assert result.strip()
+
+
+def test_build_command_registry_stop_with_runner_idle():
+    """When a real idle runner is wired, /stop says nothing is running."""
+    from core.background_runner import BackgroundTaskRunner
+
+    runner = BackgroundTaskRunner()
+    try:
+        personas = default_registry()
+        reg = build_command_registry(personas, runner=runner)
+        text = reg.dispatch(parse_command("/stop"))
+        assert "ничего" in text.lower()
+    finally:
+        runner.shutdown(wait=False)
+
+
+def test_build_command_registry_stop_with_mocked_active_runner():
+    """When runner.cancel() returns True, /stop says task was stopped."""
+    from unittest.mock import MagicMock
+
+    from core.background_runner import BackgroundTaskRunner
+
+    mock_runner = MagicMock(spec=BackgroundTaskRunner)
+    mock_runner.cancel.return_value = True
+
+    personas = default_registry()
+    reg = build_command_registry(personas, runner=mock_runner)
+    text = reg.dispatch(parse_command("/stop"))
+    assert "остановлена" in text.lower()
+    mock_runner.cancel.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
