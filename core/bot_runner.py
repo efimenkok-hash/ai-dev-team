@@ -19,16 +19,27 @@ CONTRACTS:
    /agents) or a clear "будет в 7b" placeholder so users see what's
    wired and what's coming.
 4. make_simple_task_handler returns a BridgeReply ack from the Менеджер;
-   this is the MVP behaviour until real orchestrator integration lands.
+   this is the MVP behaviour when the full pipeline is not configured.
 5. parse_owner_chat_ids accepts comma-separated env value, strips spaces,
    rejects non-int/empty/negative, returns frozenset[int].
+6. build_dispatcher_from_env returns LLMDispatcher if OPENROUTER_API_KEY
+   is set, else None.
+7. build_real_task_handler_from_env assembles the full
+   BackgroundTaskRunner + SandboxWorkspace + LLMDispatcher pipeline when
+   OPENROUTER_API_KEY and REPO_PATH are both present in env.  Returns
+   None (silently) if any required env var is missing or the repo path is
+   invalid — callers fall back to make_simple_task_handler in that case.
+8. build_bridge_from_env tries build_real_task_handler_from_env first;
+   falls back to make_simple_task_handler when the full stack is absent.
 """
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 from core.agent_personas import PersonaRegistry, default_registry
+from core.background_runner import BackgroundTaskRunner
 from core.bot_commands import (
     BotCommand,
     CommandHandler,
@@ -38,7 +49,11 @@ from core.bot_commands import (
     parse_budget_amount,
 )
 from core.confirmation_gate import DEFAULT_COST_THRESHOLD_USD, ConfirmationGate
+from core.dispatcher_agents import build_dispatcher_agent_registry_factory
+from core.llm_dispatcher import LLMDispatcher
 from core.model_tier import default_registry as default_tier_registry
+from core.real_task_handler import RealTaskHandlerConfig, make_real_task_handler
+from core.sandbox_workspace import SandboxConfig, SandboxWorkspace
 from core.telegram_bridge import (
     BridgeReply,
     IncomingMessage,
@@ -112,6 +127,81 @@ def build_vision_client(env: Mapping[str, str]) -> VisionClient | None:
     if not isinstance(key, str) or not key.strip():
         return None
     return VisionClient(api_key=key.strip())
+
+
+def build_dispatcher_from_env(env: Mapping[str, str]) -> LLMDispatcher | None:
+    """Return LLMDispatcher if OPENROUTER_API_KEY is set in env, else None.
+
+    Raises ValueError for non-Mapping env (same contract as get_required_env).
+    Returns None when the key is absent or empty — callers decide the fallback.
+    """
+    if not isinstance(env, Mapping):
+        raise ValueError("env_must_be_mapping")
+    key = env.get("OPENROUTER_API_KEY")
+    if not isinstance(key, str) or not key.strip():
+        return None
+    return LLMDispatcher(api_key=key.strip())
+
+
+def build_real_task_handler_from_env(
+    env: Mapping[str, str],
+    *,
+    tier_store: TierSessionStore,
+    send_progress: Callable[[int, str], None],
+) -> TaskHandler | None:
+    """Assemble the full pipeline TaskHandler from env when possible.
+
+    Required env vars:
+      OPENROUTER_API_KEY — passed to LLMDispatcher
+      REPO_PATH          — path to the main git repository (must exist + have .git)
+
+    Optional env vars:
+      WORKTREE_ROOT      — where worktrees are placed (default: tmp dir)
+
+    Returns None (silently) if OPENROUTER_API_KEY or REPO_PATH are absent,
+    or if the repo path does not exist / is not a git repository.
+    Callers fall back to make_simple_task_handler in that case.
+
+    Raises ValueError for non-Mapping env or non-TierSessionStore tier_store.
+    """
+    if not isinstance(env, Mapping):
+        raise ValueError("env_must_be_mapping")
+    if not isinstance(tier_store, TierSessionStore):
+        raise ValueError(f"invalid_tier_store:{type(tier_store).__name__}")
+    if not callable(send_progress):
+        raise ValueError("send_progress_not_callable")
+
+    dispatcher = build_dispatcher_from_env(env)
+    if dispatcher is None:
+        return None
+
+    repo_path_raw = env.get("REPO_PATH", "").strip()
+    if not repo_path_raw:
+        return None
+
+    try:
+        repo_path = Path(repo_path_raw)
+        worktree_raw = env.get("WORKTREE_ROOT", "").strip()
+        worktree_root = Path(worktree_raw) if worktree_raw else None
+
+        sandbox_cfg_kwargs: dict = {"main_repo_path": repo_path}
+        if worktree_root is not None:
+            sandbox_cfg_kwargs["worktree_root"] = worktree_root
+
+        sandbox = SandboxWorkspace(SandboxConfig(**sandbox_cfg_kwargs))
+        runner = BackgroundTaskRunner()
+        factory = build_dispatcher_agent_registry_factory(dispatcher)
+
+        return make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send_progress,
+            agent_registry_factory=factory,
+            config=RealTaskHandlerConfig(),
+        )
+    except (ValueError, TypeError, OSError):
+        return None
 
 
 def build_confirmation_gate(env: Mapping[str, str]) -> ConfirmationGate:
@@ -475,12 +565,24 @@ def build_bridge_from_env(
     env: Mapping[str, str] | None = None,
     *,
     send_callable=None,
+    send_progress_callable: Callable[[int, str], None] | None = None,
 ) -> TelegramBridge:
     """Top-level builder. Reads env, assembles all components, returns
     a ready TelegramBridge.
 
     `send_callable` must be supplied at call time (it's transport-specific
     — wraps PTB bot.send_message in scripts/run_telegram_bot.py).
+
+    `send_progress_callable` is optional: a (chat_id: int, text: str) -> None
+    callback used to stream pipeline progress back to Telegram. When absent,
+    progress events are silently swallowed. In production, pass something like
+    `lambda cid, txt: bot.send_message(chat_id=cid, text=txt)`.
+
+    Pipeline selection:
+      - If OPENROUTER_API_KEY + REPO_PATH are set → full LLMDispatcher pipeline
+        via make_real_task_handler (dispatcher_agents + BackgroundTaskRunner +
+        SandboxWorkspace). Progress routed through send_progress_callable.
+      - Otherwise → make_simple_task_handler (MVP stub, always available).
 
     Raises ValueError if required env vars are missing.
     """
@@ -498,7 +600,17 @@ def build_bridge_from_env(
     vision = build_vision_client(env)
     tier_store = TierSessionStore(default_tier_registry())
     commands = build_command_registry(personas, tier_store=tier_store)
-    task_handler = make_simple_task_handler(personas)
+
+    # Attempt to build the full dispatcher-backed pipeline; fall back to stub.
+    _send_progress: Callable[[int, str], None] = (
+        send_progress_callable if send_progress_callable is not None
+        else lambda _cid, _txt: None
+    )
+    task_handler: TaskHandler = build_real_task_handler_from_env(
+        env,
+        tier_store=tier_store,
+        send_progress=_send_progress,
+    ) or make_simple_task_handler(personas)
 
     return TelegramBridge(
         owner_chat_ids=owner_chat_ids,

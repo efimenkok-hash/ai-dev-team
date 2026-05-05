@@ -1,4 +1,4 @@
-"""Tests for core.bot_runner (Step 14a Module 7: builders + default handlers)."""
+"""Tests for core.bot_runner (Step 14a Module 7 + 14b-6/7: builders + handlers)."""
 
 import pytest
 
@@ -12,6 +12,8 @@ from core.bot_runner import (
     build_bridge_from_env,
     build_command_registry,
     build_confirmation_gate,
+    build_dispatcher_from_env,
+    build_real_task_handler_from_env,
     build_vision_client,
     build_whisper_client,
     get_required_env,
@@ -116,6 +118,151 @@ def test_get_required_env_rejects_non_mapping():
 def test_get_required_env_rejects_empty_key():
     with pytest.raises(ValueError, match="empty_env_key"):
         get_required_env({"X": "v"}, "")
+
+
+# ---------------------------------------------------------------------------
+# build_dispatcher_from_env
+# ---------------------------------------------------------------------------
+
+
+def test_build_dispatcher_from_env_with_key():
+    from core.llm_dispatcher import LLMDispatcher
+    d = build_dispatcher_from_env({"OPENROUTER_API_KEY": "sk-or-test"})
+    assert isinstance(d, LLMDispatcher)
+
+
+def test_build_dispatcher_from_env_without_key_returns_none():
+    assert build_dispatcher_from_env({}) is None
+
+
+def test_build_dispatcher_from_env_empty_key_returns_none():
+    assert build_dispatcher_from_env({"OPENROUTER_API_KEY": "   "}) is None
+
+
+def test_build_dispatcher_from_env_rejects_non_mapping():
+    with pytest.raises(ValueError, match="env_must_be_mapping"):
+        build_dispatcher_from_env("not a mapping")  # type: ignore[arg-type]
+
+
+def test_build_dispatcher_from_env_strips_whitespace():
+    from core.llm_dispatcher import LLMDispatcher
+    d = build_dispatcher_from_env({"OPENROUTER_API_KEY": "  sk-or-padded  "})
+    assert isinstance(d, LLMDispatcher)
+
+
+# ---------------------------------------------------------------------------
+# build_real_task_handler_from_env
+# ---------------------------------------------------------------------------
+
+
+def _noop_progress(chat_id: int, text: str) -> None:
+    pass
+
+
+def test_build_real_task_handler_no_api_key_returns_none(tmp_path):
+    store = TierSessionStore(default_tier_registry())
+    result = build_real_task_handler_from_env(
+        {"REPO_PATH": str(tmp_path)},
+        tier_store=store,
+        send_progress=_noop_progress,
+    )
+    assert result is None
+
+
+def test_build_real_task_handler_no_repo_path_returns_none():
+    store = TierSessionStore(default_tier_registry())
+    result = build_real_task_handler_from_env(
+        {"OPENROUTER_API_KEY": "sk-or-test"},
+        tier_store=store,
+        send_progress=_noop_progress,
+    )
+    assert result is None
+
+
+def test_build_real_task_handler_invalid_repo_path_returns_none(tmp_path):
+    store = TierSessionStore(default_tier_registry())
+    result = build_real_task_handler_from_env(
+        {
+            "OPENROUTER_API_KEY": "sk-or-test",
+            "REPO_PATH": str(tmp_path / "nonexistent"),
+        },
+        tier_store=store,
+        send_progress=_noop_progress,
+    )
+    assert result is None
+
+
+def test_build_real_task_handler_path_without_git_returns_none(tmp_path):
+    # Directory exists but no .git
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = TierSessionStore(default_tier_registry())
+    result = build_real_task_handler_from_env(
+        {"OPENROUTER_API_KEY": "sk-or-test", "REPO_PATH": str(repo)},
+        tier_store=store,
+        send_progress=_noop_progress,
+    )
+    assert result is None
+
+
+def test_build_real_task_handler_full_env_returns_callable(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    store = TierSessionStore(default_tier_registry())
+    result = build_real_task_handler_from_env(
+        {"OPENROUTER_API_KEY": "sk-or-test", "REPO_PATH": str(repo)},
+        tier_store=store,
+        send_progress=_noop_progress,
+    )
+    assert callable(result)
+
+
+def test_build_real_task_handler_custom_worktree_root(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    worktree = tmp_path / "wt"
+    store = TierSessionStore(default_tier_registry())
+    result = build_real_task_handler_from_env(
+        {
+            "OPENROUTER_API_KEY": "sk-or-test",
+            "REPO_PATH": str(repo),
+            "WORKTREE_ROOT": str(worktree),
+        },
+        tier_store=store,
+        send_progress=_noop_progress,
+    )
+    assert callable(result)
+
+
+def test_build_real_task_handler_rejects_non_mapping():
+    store = TierSessionStore(default_tier_registry())
+    with pytest.raises(ValueError, match="env_must_be_mapping"):
+        build_real_task_handler_from_env(
+            "bad",  # type: ignore[arg-type]
+            tier_store=store,
+            send_progress=_noop_progress,
+        )
+
+
+def test_build_real_task_handler_rejects_invalid_tier_store():
+    with pytest.raises(ValueError, match="invalid_tier_store"):
+        build_real_task_handler_from_env(
+            {},
+            tier_store="not a store",  # type: ignore[arg-type]
+            send_progress=_noop_progress,
+        )
+
+
+def test_build_real_task_handler_rejects_non_callable_progress():
+    store = TierSessionStore(default_tier_registry())
+    with pytest.raises(ValueError, match="send_progress_not_callable"):
+        build_real_task_handler_from_env(
+            {},
+            tier_store=store,
+            send_progress="not callable",  # type: ignore[arg-type]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -571,3 +718,68 @@ def test_build_bridge_from_env_intruder_denied():
     assert len(captured) == 1
     assert "Доступ" in captured[0].text
     assert "ограничен" in captured[0].text
+
+
+def test_build_bridge_from_env_uses_simple_handler_when_no_full_env():
+    """Without OPENROUTER_API_KEY + REPO_PATH, falls back to simple handler."""
+    env = {"TELEGRAM_OWNER_CHAT_ID": "777"}
+    send, captured = _captured_send()
+    bridge = build_bridge_from_env(env, send_callable=send)
+    msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="test task")
+    bridge.handle(msg)
+    # Simple handler acks with the task text
+    assert len(captured) == 1
+    assert "test task" in captured[0].text
+
+
+def test_build_bridge_from_env_uses_simple_handler_no_repo_path():
+    """OPENROUTER_API_KEY alone (no REPO_PATH) → still simple handler."""
+    env = {
+        "TELEGRAM_OWNER_CHAT_ID": "777",
+        "OPENROUTER_API_KEY": "sk-or-test",
+    }
+    send, captured = _captured_send()
+    bridge = build_bridge_from_env(env, send_callable=send)
+    msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="hello task")
+    bridge.handle(msg)
+    assert len(captured) == 1
+    assert "hello task" in captured[0].text
+
+
+def test_build_bridge_from_env_uses_real_handler_with_full_env(tmp_path):
+    """OPENROUTER_API_KEY + valid REPO_PATH → real handler (tier-selection prompt)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    env = {
+        "TELEGRAM_OWNER_CHAT_ID": "777",
+        "OPENROUTER_API_KEY": "sk-or-test",
+        "REPO_PATH": str(repo),
+    }
+    send, captured = _captured_send()
+    bridge = build_bridge_from_env(env, send_callable=send)
+    msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="build me a CLI")
+    bridge.handle(msg)
+    # Real handler: no tier set → prompts to pick a tier
+    assert len(captured) == 1
+    assert "тариф" in captured[0].text.lower() or "/tier" in captured[0].text
+
+
+def test_build_bridge_from_env_accepts_send_progress_callable(tmp_path):
+    """send_progress_callable is accepted without error."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    progress_log: list = []
+    env = {
+        "TELEGRAM_OWNER_CHAT_ID": "777",
+        "OPENROUTER_API_KEY": "sk-or-test",
+        "REPO_PATH": str(repo),
+    }
+    send, _ = _captured_send()
+    bridge = build_bridge_from_env(
+        env,
+        send_callable=send,
+        send_progress_callable=lambda cid, txt: progress_log.append((cid, txt)),
+    )
+    assert isinstance(bridge, TelegramBridge)
