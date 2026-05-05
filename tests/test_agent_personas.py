@@ -77,6 +77,62 @@ def test_default_personas_callsign_property_matches_human_name():
         assert p.callsign == p.human_name
 
 
+def test_default_personas_all_have_emoji():
+    """Every default persona must have a thematic emoji for chat formatting."""
+    for p in DEFAULT_PERSONAS:
+        assert p.emoji, f"{p.agent_role} has no emoji"
+        assert isinstance(p.emoji, str)
+
+
+def test_default_personas_emojis_are_unique():
+    """Emojis should be distinguishable so users can recognise agents at a glance."""
+    emojis = [p.emoji for p in DEFAULT_PERSONAS]
+    assert len(set(emojis)) == len(emojis)
+
+
+def test_emoji_field_optional_default_empty():
+    p = AgentPersona(
+        agent_role="architect_agent",
+        human_name="Test",
+        title="Test",
+        voice_traits=("y",),
+    )
+    assert p.emoji == ""
+
+
+def test_emoji_field_accepts_unicode():
+    p = AgentPersona(
+        agent_role="architect_agent",
+        human_name="Test",
+        title="Test",
+        voice_traits=("y",),
+        emoji="🧠",
+    )
+    assert p.emoji == "🧠"
+
+
+def test_emoji_field_strips_whitespace():
+    p = AgentPersona(
+        agent_role="architect_agent",
+        human_name="Test",
+        title="Test",
+        voice_traits=("y",),
+        emoji="  🧠  ",
+    )
+    assert p.emoji == "🧠"
+
+
+def test_emoji_field_rejects_non_string():
+    with pytest.raises(ValueError, match="non_string_emoji"):
+        AgentPersona(
+            agent_role="architect_agent",
+            human_name="Test",
+            title="Test",
+            voice_traits=("y",),
+            emoji=42,  # type: ignore[arg-type]
+        )
+
+
 def test_default_personas_have_voice_traits():
     for p in DEFAULT_PERSONAS:
         assert len(p.voice_traits) >= 2, f"{p.agent_role} needs >=2 traits"

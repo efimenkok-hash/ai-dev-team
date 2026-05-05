@@ -55,9 +55,11 @@ from core.vision_client import VisionClient, VisionError
 from core.whisper_client import WhisperClient, WhisperError
 
 DEFAULT_DENIAL_MESSAGE = (
-    "Доступ запрещён. Этот бот обслуживает только владельца проекта."
+    "🔒 Доступ ограничен\n"
+    "\n"
+    "Этот бот обслуживает только владельца проекта."
 )
-DEFAULT_GENERIC_ACK = "Принял задачу, сейчас разберём."
+DEFAULT_GENERIC_ACK = "👋 Принял задачу. Сейчас разберём."
 
 
 @dataclass(frozen=True)
@@ -328,7 +330,9 @@ class TelegramBridge:
                     OutgoingMessage(
                         chat_id=msg.chat_id,
                         text=self._sign_manager(
-                            "Голосовые сообщения сейчас не обрабатываются."
+                            "🎙 Голосовые сообщения сейчас не обрабатываются.\n"
+                            "\n"
+                            "Подключите OPENAI_API_KEY в .env, чтобы включить."
                         ),
                     ),
                     ctx,
@@ -346,8 +350,11 @@ class TelegramBridge:
                     OutgoingMessage(
                         chat_id=msg.chat_id,
                         text=self._sign_manager(
-                            f"Не удалось расшифровать голосовое: "
-                            f"{_short_err(exc)}. Попробуйте набрать текстом."
+                            f"🎙 Не удалось расшифровать голосовое\n"
+                            f"\n"
+                            f"Причина: {_short_err(exc)}\n"
+                            f"\n"
+                            f"Попробуйте, пожалуйста, набрать текстом."
                         ),
                     ),
                     ctx,
@@ -361,7 +368,9 @@ class TelegramBridge:
                     OutgoingMessage(
                         chat_id=msg.chat_id,
                         text=self._sign_manager(
-                            "Изображения сейчас не обрабатываются."
+                            "🖼 Изображения сейчас не обрабатываются.\n"
+                            "\n"
+                            "Подключите OPENROUTER_API_KEY в .env, чтобы включить."
                         ),
                     ),
                     ctx,
@@ -377,8 +386,11 @@ class TelegramBridge:
                     OutgoingMessage(
                         chat_id=msg.chat_id,
                         text=self._sign_manager(
-                            f"Не удалось распознать изображение: "
-                            f"{_short_err(exc)}. Опишите проблему текстом."
+                            f"🖼 Не удалось распознать изображение\n"
+                            f"\n"
+                            f"Причина: {_short_err(exc)}\n"
+                            f"\n"
+                            f"Попробуйте описать проблему текстом."
                         ),
                     ),
                     ctx,
@@ -520,11 +532,11 @@ class TelegramBridge:
         reply: BridgeReply,
         batch: BatchDecision,
     ) -> str:
-        lines = [reply.body, "", "Требуется ваше подтверждение:"]
+        lines = [reply.body, "", "⚠️ Требуется ваше подтверждение:", ""]
         for d in batch.asks():
             lines.append(f"  • {d.reason}")
         lines.append("")
-        lines.append("Отвечайте: «да» / «нет» (или нажмите подтверждение).")
+        lines.append("Ответьте «да» / «нет».")
         return "\n".join(lines)
 
     def _sign_manager(self, body: str) -> str:

@@ -66,10 +66,11 @@ class AgentPersona:
     """
 
     agent_role: str
-    human_name: str  # callsign, e.g. "Ядро"
+    human_name: str  # callsign, e.g. "Архитектор"
     title: str       # descriptive role label, e.g. "Архитектор"
     seniority: str = "junior"
     voice_traits: tuple[str, ...] = ()
+    emoji: str = ""  # thematic icon (optional, used by chat formatting)
 
     def __post_init__(self) -> None:
         if self.agent_role not in _KNOWN_ROLES:
@@ -100,9 +101,13 @@ class AgentPersona:
             if not isinstance(trait, str) or not trait.strip():
                 raise ValueError("empty_voice_trait")
 
+        if not isinstance(self.emoji, str):
+            raise ValueError("non_string_emoji")
+
         # Persist normalised forms (frozen requires __setattr__ via object).
         object.__setattr__(self, "human_name", stripped_name)
         object.__setattr__(self, "title", stripped_title)
+        object.__setattr__(self, "emoji", self.emoji.strip())
 
     @property
     def callsign(self) -> str:
@@ -155,6 +160,7 @@ DEFAULT_PERSONAS: tuple[AgentPersona, ...] = (
         title="Планировщик",
         seniority="middle",
         voice_traits=("структурный", "методичный", "разбивает на этапы"),
+        emoji="🗺",
     ),
     AgentPersona(
         agent_role="pm_agent",
@@ -162,6 +168,7 @@ DEFAULT_PERSONAS: tuple[AgentPersona, ...] = (
         title="Менеджер",
         seniority="senior",
         voice_traits=("организованный", "коротко", "ставит сроки"),
+        emoji="📊",
     ),
     AgentPersona(
         agent_role="architect_agent",
@@ -169,6 +176,7 @@ DEFAULT_PERSONAS: tuple[AgentPersona, ...] = (
         title="Архитектор",
         seniority="senior",
         voice_traits=("системный", "видит большую картину", "ссылается на принципы"),
+        emoji="🧠",
     ),
     AgentPersona(
         agent_role="writer_agent",
@@ -176,6 +184,7 @@ DEFAULT_PERSONAS: tuple[AgentPersona, ...] = (
         title="Программист",
         seniority="middle",
         voice_traits=("прагматичный", "пишет чисто", "комментирует только сложное"),
+        emoji="⚒",
     ),
     AgentPersona(
         agent_role="reviewer_agent",
@@ -183,6 +192,7 @@ DEFAULT_PERSONAS: tuple[AgentPersona, ...] = (
         title="Ревьюер",
         seniority="senior",
         voice_traits=("дотошный", "ищет крайние случаи", "уважительный"),
+        emoji="🔍",
     ),
     AgentPersona(
         agent_role="tester_agent",
@@ -190,6 +200,7 @@ DEFAULT_PERSONAS: tuple[AgentPersona, ...] = (
         title="Тестировщик",
         seniority="middle",
         voice_traits=("параноидальный", "покрывает edge cases", "пишет читаемо"),
+        emoji="🧪",
     ),
     AgentPersona(
         agent_role="qa_agent",
@@ -197,6 +208,7 @@ DEFAULT_PERSONAS: tuple[AgentPersona, ...] = (
         title="QA-инженер",
         seniority="senior",
         voice_traits=("строгий", "финальное слово", "беспристрастный"),
+        emoji="✅",
     ),
     AgentPersona(
         agent_role="fixer_agent",
@@ -204,6 +216,7 @@ DEFAULT_PERSONAS: tuple[AgentPersona, ...] = (
         title="Фиксер",
         seniority="middle",
         voice_traits=("быстрый", "хирургический", "минимум изменений"),
+        emoji="🩹",
     ),
 )
 

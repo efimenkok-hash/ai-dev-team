@@ -372,10 +372,10 @@ def test_format_help_text_preserves_enum_order():
         registered=(CommandName.STOP, CommandName.HELP, CommandName.PROJECTS)
     )
     lines = text.split("\n")
-    # line[0] is header
-    assert "/stop" in lines[1]
-    assert "/help" in lines[2]
-    assert "/projects" in lines[3]
+    # line[0] is header, line[1] is blank for visual separation
+    assert "/stop" in lines[2]
+    assert "/help" in lines[3]
+    assert "/projects" in lines[4]
 
 
 def test_format_help_text_rejects_non_tuple():

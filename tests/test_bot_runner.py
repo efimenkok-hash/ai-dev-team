@@ -184,7 +184,7 @@ def test_projects_handler_returns_active_project():
     handler = make_projects_handler(active_project="hedgekeeper")
     text = handler(parse_command("/projects"), None)
     assert "hedgekeeper" in text
-    assert "Активный проект" in text
+    assert "Активный" in text
 
 
 def test_projects_handler_rejects_empty_project():
@@ -242,6 +242,38 @@ def test_agents_handler_lists_all_eight():
     assert "Состав команды" in text
 
 
+def test_agents_handler_uses_qualified_name_no_redundancy():
+    """Default personas have callsign == title; output must NOT show
+    'Архитектор (Архитектор)' redundancy."""
+    personas = default_registry()
+    handler = make_agents_handler(personas)
+    text = handler(parse_command("/agents"), None)
+    assert "Архитектор (Архитектор)" not in text
+    assert "Программист (Программист)" not in text
+
+
+def test_agents_handler_uses_emojis():
+    """Each agent line should be prefixed by its persona emoji."""
+    personas = default_registry()
+    handler = make_agents_handler(personas)
+    text = handler(parse_command("/agents"), None)
+    for p in personas.all():
+        if p.emoji:
+            assert p.emoji in text
+
+
+def test_agents_handler_orders_by_pipeline_flow():
+    """Agents listed in FSM execution order, not alphabetically."""
+    personas = default_registry()
+    handler = make_agents_handler(personas)
+    text = handler(parse_command("/agents"), None)
+    # Planner must appear before Architect, which must appear before Fixer
+    assert text.index("Планировщик") < text.index("Архитектор")
+    assert text.index("Архитектор") < text.index("Программист")
+    assert text.index("Программист") < text.index("Ревьюер")
+    assert text.index("Ревьюер") < text.index("Фиксер")
+
+
 def test_agents_handler_rejects_non_personas():
     with pytest.raises(ValueError, match="invalid_personas"):
         make_agents_handler("not personas")  # type: ignore[arg-type]
@@ -258,7 +290,7 @@ def test_stop_handler_returns_string():
     handler = make_stop_handler()
     text = handler(parse_command("/stop"), None)
     assert isinstance(text, str)
-    assert "/stop" in text or "Остановка" in text
+    assert "остановк" in text.lower()
 
 
 def test_retry_handler_default():
@@ -419,4 +451,5 @@ def test_build_bridge_from_env_intruder_denied():
     msg = IncomingMessage(chat_id=999, user_id=999, message_id=1, text="привет")
     bridge.handle(msg)
     assert len(captured) == 1
-    assert "Доступ запрещён" in captured[0].text
+    assert "Доступ" in captured[0].text
+    assert "ограничен" in captured[0].text

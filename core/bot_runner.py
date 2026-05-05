@@ -150,9 +150,11 @@ def make_projects_handler(active_project: str = "ai-dev-team") -> CommandHandler
 
     def _handle(_cmd: BotCommand, _ctx: Any) -> str:
         return (
-            f"Активный проект: {active_project}.\n"
-            f"Подключение AdapterRegistry с несколькими проектами — "
-            f"в Модуле 7b."
+            f"📋 Проекты\n"
+            f"\n"
+            f"▸ Активный: {active_project}\n"
+            f"\n"
+            f"🔜 Несколько проектов одновременно — в Модуле 7b."
         )
 
     return _handle
@@ -162,12 +164,18 @@ def make_switch_handler() -> CommandHandler:
     def _handle(cmd: BotCommand, _ctx: Any) -> str:
         positional = cmd.positional_args()
         if not positional:
-            return "Используйте: /switch <имя_проекта>"
+            return (
+                "🔄 Переключение проекта\n"
+                "\n"
+                "Использование:  /switch <имя_проекта>\n"
+                "Пример:         /switch hedgekeeper-v2"
+            )
         target = positional[0]
         return (
-            f"Переключение на проект «{target}» будет реализовано "
-            f"в Модуле 7b (нужен AdapterRegistry с зарегистрированными "
-            f"проектами)."
+            f"🔄 Принял запрос на переключение → «{target}»\n"
+            f"\n"
+            f"🔜 Реальное переключение появится в Модуле 7b "
+            f"(подключение AdapterRegistry)."
         )
 
     return _handle
@@ -188,17 +196,31 @@ def make_budget_handler(state: _BudgetState) -> CommandHandler:
         try:
             new_value = parse_budget_amount(cmd.args)
         except ValueError as exc:
-            return f"Не удалось разобрать сумму: {exc}"
+            return (
+                f"⚠️ Не удалось разобрать сумму: {exc}\n"
+                f"\n"
+                f"Примеры:  /budget 5    /budget 5.50    /budget 5$"
+            )
         if new_value is None:
-            return f"Текущий бюджет: ${state.budget_usd:.2f}"
+            return (
+                f"💰 Текущий бюджет\n"
+                f"\n"
+                f"▸ ${state.budget_usd:.2f}\n"
+                f"\n"
+                f"Чтобы изменить:  /budget <сумма>"
+            )
         state.budget_usd = float(new_value)
-        return f"Бюджет установлен: ${state.budget_usd:.2f}"
+        return (
+            f"✅ Бюджет обновлён\n"
+            f"\n"
+            f"▸ ${state.budget_usd:.2f}"
+        )
 
     return _handle
 
 
 def make_agents_handler(personas: PersonaRegistry) -> CommandHandler:
-    """Lists all agents in a Russian-language table.
+    """Lists all agents with thematic emojis and clean visual hierarchy.
 
     Performance metrics will be added in 7b once Observability streams here.
     """
@@ -206,17 +228,33 @@ def make_agents_handler(personas: PersonaRegistry) -> CommandHandler:
         raise ValueError("invalid_personas")
 
     def _handle(_cmd: BotCommand, _ctx: Any) -> str:
-        lines = ["Состав команды:"]
-        for p in personas.all():
-            lines.append(
-                f"  • {p.callsign} ({p.title}) — {p.seniority}, "
-                f"{', '.join(p.voice_traits[:2])}"
-            )
-        lines.append("")
-        lines.append(
-            "Метрики производительности (p50/p95, error rate) — "
-            "в Модуле 7b после интеграции с Observability."
+        lines: list[str] = ["👥 Состав команды", ""]
+        # Stable order matching the FSM pipeline flow:
+        # Planner → PM → Architect → Programmer → Reviewer → Tester → QA → Fixer
+        flow_order = (
+            "planning_agent",
+            "pm_agent",
+            "architect_agent",
+            "writer_agent",
+            "reviewer_agent",
+            "tester_agent",
+            "qa_agent",
+            "fixer_agent",
         )
+        for role in flow_order:
+            if role not in personas:
+                continue
+            p = personas.for_role(role)
+            icon = p.emoji or "•"
+            traits = " · ".join(p.voice_traits[:2])
+            lines.append(f"{icon} {p.qualified_name} · {p.seniority}")
+            lines.append(f"   {traits}")
+            lines.append("")
+        # Trim trailing blank line
+        while lines and lines[-1] == "":
+            lines.pop()
+        lines.append("")
+        lines.append("📈 Метрики p50/p95/error rate — в Модуле 7b.")
         return "\n".join(lines)
 
     return _handle
@@ -225,9 +263,11 @@ def make_agents_handler(personas: PersonaRegistry) -> CommandHandler:
 def make_log_handler() -> CommandHandler:
     def _handle(_cmd: BotCommand, _ctx: Any) -> str:
         return (
-            "Логи последней задачи: смотрите файл .pipeline_log.jsonl "
-            "в корне проекта.\n"
-            "Стриминг в чат и /log <task_id> — в Модуле 7b."
+            "📜 Лог последней задачи\n"
+            "\n"
+            "▸ Файл: .pipeline_log.jsonl (корень проекта)\n"
+            "\n"
+            "🔜 Стриминг в чат и /log <task_id> — в Модуле 7b."
         )
 
     return _handle
@@ -236,8 +276,10 @@ def make_log_handler() -> CommandHandler:
 def make_stop_handler() -> CommandHandler:
     def _handle(_cmd: BotCommand, _ctx: Any) -> str:
         return (
-            "Команда /stop принята. Остановка in-flight задач "
-            "будет реализована в Модуле 7b (нужен флаг в orchestrator)."
+            "⏹ Запрос на остановку принят\n"
+            "\n"
+            "🔜 Реальная остановка in-flight задач — в Модуле 7b "
+            "(нужен флаг отмены в orchestrator)."
         )
 
     return _handle
@@ -247,10 +289,15 @@ def make_retry_handler() -> CommandHandler:
     def _handle(cmd: BotCommand, _ctx: Any) -> str:
         if cmd.has_flag("different"):
             return (
-                "Повтор последней задачи с другой моделью/стратегией — "
-                "в Модуле 7b."
+                "🔁 Повтор с другой моделью/стратегией\n"
+                "\n"
+                "🔜 Появится в Модуле 7b."
             )
-        return "Повтор последней задачи — в Модуле 7b."
+        return (
+            "🔁 Повтор последней задачи\n"
+            "\n"
+            "🔜 Появится в Модуле 7b."
+        )
 
     return _handle
 
@@ -300,13 +347,17 @@ def make_simple_task_handler(_personas: PersonaRegistry) -> TaskHandler:
     """
 
     def _handle(text: str, _msg: IncomingMessage) -> BridgeReply:
-        excerpt = text if len(text) <= 200 else text[:200] + "...[обрезано]"
+        excerpt = text if len(text) <= 200 else text[:200] + " …[обрезано]"
         return BridgeReply(
             persona_role="pm_agent",
             body=(
-                f"Получил задачу: «{excerpt}».\n"
-                f"Команда зарегистрирована в системе. Реальное выполнение "
-                f"через orchestrator подключим в Модуле 7b."
+                f"👋 Принял задачу\n"
+                f"\n"
+                f"«{excerpt}»\n"
+                f"\n"
+                f"🔜 Реальное выполнение через orchestrator — в Модуле 7b. "
+                f"Сейчас это MVP-каркас: проверяем транспорт, "
+                f"распознавание и подписи персон."
             ),
         )
 

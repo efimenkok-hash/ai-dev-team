@@ -43,14 +43,27 @@ class CommandName(str, Enum):
 # Russian-language descriptions; these match what we registered in BotFather
 # and what /help renders.
 COMMAND_DESCRIPTIONS: dict[CommandName, str] = {
-    CommandName.PROJECTS: "Список проектов",
-    CommandName.SWITCH: "Переключить активный проект (/switch <имя>)",
-    CommandName.BUDGET: "Установить или показать бюджет (/budget [<сумма>])",
-    CommandName.AGENTS: "Перфоманс агентов",
-    CommandName.LOG: "Лог последней задачи",
-    CommandName.STOP: "Остановить текущую задачу",
-    CommandName.RETRY: "Повторить последнюю задачу (/retry [--different])",
-    CommandName.HELP: "Помощь",
+    CommandName.PROJECTS: "список проектов",
+    CommandName.SWITCH: "переключить проект (/switch <имя>)",
+    CommandName.BUDGET: "бюджет (/budget [сумма])",
+    CommandName.AGENTS: "состав и перфоманс команды",
+    CommandName.LOG: "лог последней задачи",
+    CommandName.STOP: "остановить текущую задачу",
+    CommandName.RETRY: "повторить (/retry [--different])",
+    CommandName.HELP: "эта справка",
+}
+
+# Thematic emojis for /help rendering. Decoupled from descriptions so
+# BotFather command list (which doesn't allow emoji prefixes) stays clean.
+COMMAND_EMOJIS: dict[CommandName, str] = {
+    CommandName.PROJECTS: "📋",
+    CommandName.SWITCH: "🔄",
+    CommandName.BUDGET: "💰",
+    CommandName.AGENTS: "👥",
+    CommandName.LOG: "📜",
+    CommandName.STOP: "⏹",
+    CommandName.RETRY: "🔁",
+    CommandName.HELP: "❓",
 }
 
 
@@ -166,26 +179,28 @@ class CommandRegistry:
 def format_help_text(
     registered: tuple[CommandName, ...] = tuple(CommandName),
     *,
-    header: str = "Доступные команды:",
+    header: str = "🛠 Доступные команды",
 ) -> str:
     """Renders a Russian help block listing the registered commands.
 
     Output:
-        Доступные команды:
-        /projects — Список проектов
-        /switch — Переключить активный проект (/switch <имя>)
+        🛠 Доступные команды
+
+        📋 /projects — список проектов
+        🔄 /switch — переключить проект (/switch <имя>)
         ...
     """
     if not isinstance(registered, tuple):
         raise ValueError("registered_must_be_tuple")
     if not isinstance(header, str) or not header.strip():
         raise ValueError("empty_header")
-    lines = [header]
+    lines: list[str] = [header, ""]
     for cmd in registered:
         if not isinstance(cmd, CommandName):
             raise ValueError(f"invalid_command_in_list:{cmd!r}")
+        emoji = COMMAND_EMOJIS.get(cmd, "•")
         desc = COMMAND_DESCRIPTIONS.get(cmd, "")
-        lines.append(f"/{cmd.value} — {desc}")
+        lines.append(f"{emoji} /{cmd.value} — {desc}")
     return "\n".join(lines)
 
 
