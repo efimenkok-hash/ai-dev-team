@@ -509,7 +509,10 @@ def test_full_run_happy_path_streams_progress_and_releases_worktree(
     mock_hook_fn = MagicMock(return_value=mock_report)
     mock_make_sandbox_hook = MagicMock(return_value=mock_hook_fn)
 
-    with patch("core.real_task_handler.make_sandbox_hook", mock_make_sandbox_hook):
+    with (
+        patch("core.real_task_handler.make_sandbox_hook", mock_make_sandbox_hook),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
         handler = make_real_task_handler(
             runner=runner,
             sandbox=sandbox,
@@ -644,7 +647,10 @@ def test_on_complete_emits_success_summary_for_happy_path(
     mock_hook_fn = MagicMock(return_value=mock_report)
     mock_make_sandbox_hook = MagicMock(return_value=mock_hook_fn)
 
-    with patch("core.real_task_handler.make_sandbox_hook", mock_make_sandbox_hook):
+    with (
+        patch("core.real_task_handler.make_sandbox_hook", mock_make_sandbox_hook),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
         handler = make_real_task_handler(
             runner=runner,
             sandbox=sandbox,
@@ -846,8 +852,12 @@ def test_commit_sha_appears_in_success_message(runner, sandbox, tier_store):
     )
 
 
-def test_commit_error_does_not_crash_worker(runner, sandbox, tier_store):
-    """If commit_in_worktree raises, the worker must still complete (sha=None)."""
+def test_commit_error_surfaces_as_task_failed_not_success(runner, sandbox, tier_store):
+    """If commit_in_worktree raises after pipeline SUCCESS, the worker must:
+      - NOT emit ✅ Готово (that would be a lie — branch has no commit)
+      - emit ❌ Не получилось with commit_failed reason
+      - not crash (on_complete still runs)
+    """
     from unittest.mock import MagicMock, patch
 
     from core.sandbox_workspace import SandboxError
@@ -878,6 +888,15 @@ def test_commit_error_does_not_crash_worker(runner, sandbox, tier_store):
         handler("build x", _msg(chat_id=42))
         _wait_until_idle(runner)
 
-    # Worker completed — success message still sent (no sha in it, but no crash)
-    _wait_for_count(captured, lambda c: any("Готово" in t for _, t in c))
-    assert any("Готово" in t for _, t in captured)
+    # commit_failed must be reported honestly — NOT as Готово
+    _wait_for_count(
+        captured,
+        lambda c: any("Не получилось" in t or "commit_failed" in t for _, t in c),
+    )
+    all_texts = [t for _, t in captured]
+    assert any("commit_failed" in t or "Не получилось" in t for t in all_texts), (
+        f"expected commit_failed/Не получилось in messages, got: {all_texts}"
+    )
+    assert not any("Готово" in t for t in all_texts), (
+        "worker must NOT emit Готово when commit failed"
+    )

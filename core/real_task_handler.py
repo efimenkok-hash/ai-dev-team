@@ -339,25 +339,35 @@ def make_real_task_handler(
                 }
 
                 if final_state == State.SUCCESS:
-                    # Commit all files written by the hook into the worktree.
-                    with contextlib.suppress(Exception) as _commit_ctx:
-                        sha = sandbox.commit_in_worktree(
+                    try:
+                        summary["commit_sha"] = sandbox.commit_in_worktree(
                             handle,
                             message=f"AI Dev Team: {text[:60]}",
                             author_name=config.author_name,
                             author_email=config.author_email,
                         )
-                        summary["commit_sha"] = sha
-                    emitter.emit_task_completed(
-                        summary=(
-                            f"branch={handle.branch}"
-                            + (
+                    except Exception as commit_exc:
+                        # Pipeline produced SUCCESS but commit failed → честно
+                        # репортим. Чаще всего: nothing_to_commit (файлы не
+                        # изменились относительно base) или git config issue.
+                        summary["final_state"] = "FAIL"
+                        summary["failure_reason"] = (
+                            f"commit_failed:{type(commit_exc).__name__}:"
+                            f"{str(commit_exc)[:160]}"
+                        )
+                        emitter.emit_task_failed(
+                            reason=(
+                                f"commit_failed · {type(commit_exc).__name__}: "
+                                f"{str(commit_exc)[:120]}"
+                            ),
+                        )
+                    else:
+                        emitter.emit_task_completed(
+                            summary=(
+                                f"branch={handle.branch}"
                                 f" · commit={summary['commit_sha'][:8]}"
-                                if summary["commit_sha"]
-                                else ""
                             )
                         )
-                    )
                 else:
                     emitter.emit_task_failed(
                         reason=(
