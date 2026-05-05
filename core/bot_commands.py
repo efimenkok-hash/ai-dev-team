@@ -34,6 +34,7 @@ class CommandName(str, Enum):
     SWITCH = "switch"
     BUDGET = "budget"
     AGENTS = "agents"
+    TIER = "tier"
     LOG = "log"
     STOP = "stop"
     RETRY = "retry"
@@ -47,6 +48,7 @@ COMMAND_DESCRIPTIONS: dict[CommandName, str] = {
     CommandName.SWITCH: "переключить проект (/switch <имя>)",
     CommandName.BUDGET: "бюджет (/budget [сумма])",
     CommandName.AGENTS: "состав и перфоманс команды",
+    CommandName.TIER: "тариф моделей (/tier [set <имя>|reset])",
     CommandName.LOG: "лог последней задачи",
     CommandName.STOP: "остановить текущую задачу",
     CommandName.RETRY: "повторить (/retry [--different])",
@@ -60,6 +62,7 @@ COMMAND_EMOJIS: dict[CommandName, str] = {
     CommandName.SWITCH: "🔄",
     CommandName.BUDGET: "💰",
     CommandName.AGENTS: "👥",
+    CommandName.TIER: "💼",
     CommandName.LOG: "📜",
     CommandName.STOP: "⏹",
     CommandName.RETRY: "🔁",

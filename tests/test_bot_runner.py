@@ -24,14 +24,17 @@ from core.bot_runner import (
     make_simple_task_handler,
     make_stop_handler,
     make_switch_handler,
+    make_tier_handler,
     parse_owner_chat_ids,
 )
 from core.confirmation_gate import ConfirmationGate
+from core.model_tier import default_registry as default_tier_registry
 from core.telegram_bridge import (
     BridgeReply,
     IncomingMessage,
     TelegramBridge,
 )
+from core.tier_session import TierSessionStore
 from core.vision_client import VisionClient
 from core.whisper_client import WhisperClient
 
@@ -306,14 +309,113 @@ def test_retry_handler_with_different_flag():
 
 
 # ---------------------------------------------------------------------------
+# make_tier_handler
+# ---------------------------------------------------------------------------
+
+
+def _msg(chat_id: int = 100) -> IncomingMessage:
+    return IncomingMessage(
+        chat_id=chat_id,
+        user_id=chat_id,
+        message_id=1,
+        text="/tier",
+    )
+
+
+def test_tier_handler_rejects_non_store():
+    with pytest.raises(ValueError, match="invalid_tier_store"):
+        make_tier_handler("not a store")  # type: ignore[arg-type]
+
+
+def test_tier_handler_no_args_shows_summary():
+    store = TierSessionStore(default_tier_registry())
+    handler = make_tier_handler(store)
+    text = handler(parse_command("/tier"), _msg())
+    # Default registry has STANDARD active globally; chat hasn't picked yet.
+    assert "ECONOMY" in text
+    assert "STANDARD" in text
+    assert "PREMIUM" in text
+    assert "/tier set" in text
+
+
+def test_tier_handler_set_records_choice():
+    store = TierSessionStore(default_tier_registry())
+    handler = make_tier_handler(store)
+    text = handler(parse_command("/tier set PREMIUM"), _msg(chat_id=42))
+    assert "PREMIUM" in text
+    assert store.active_tier_name(42) == "PREMIUM"
+
+
+def test_tier_handler_set_unknown_tier():
+    store = TierSessionStore(default_tier_registry())
+    handler = make_tier_handler(store)
+    text = handler(parse_command("/tier set BOGUS"), _msg(chat_id=42))
+    assert "Неизвестный тариф" in text
+    assert store.active_tier_name(42) is None  # nothing recorded
+
+
+def test_tier_handler_set_without_name():
+    store = TierSessionStore(default_tier_registry())
+    handler = make_tier_handler(store)
+    text = handler(parse_command("/tier set"), _msg())
+    assert "Использование" in text
+    assert "<имя_тарифа>" in text
+
+
+def test_tier_handler_reset_clears_choice():
+    store = TierSessionStore(default_tier_registry())
+    store.set_active(42, "PREMIUM")
+    handler = make_tier_handler(store)
+    text = handler(parse_command("/tier reset"), _msg(chat_id=42))
+    assert "сброшен" in text.lower()
+    assert store.active_tier_name(42) is None
+
+
+def test_tier_handler_unknown_subcommand():
+    store = TierSessionStore(default_tier_registry())
+    handler = make_tier_handler(store)
+    text = handler(parse_command("/tier banana"), _msg())
+    assert "banana" in text or "подкоманду" in text
+
+
+def test_tier_handler_invalid_ctx_returns_apology():
+    store = TierSessionStore(default_tier_registry())
+    handler = make_tier_handler(store)
+    text = handler(parse_command("/tier"), None)
+    assert "Не удалось определить чат" in text
+
+
+def test_tier_handler_ctx_without_chat_id():
+    store = TierSessionStore(default_tier_registry())
+    handler = make_tier_handler(store)
+
+    class FakeCtx:
+        pass
+
+    text = handler(parse_command("/tier"), FakeCtx())
+    assert "Не удалось определить чат" in text
+
+
+def test_tier_handler_marks_active_in_summary():
+    store = TierSessionStore(default_tier_registry())
+    store.set_active(42, "ECONOMY")
+    handler = make_tier_handler(store)
+    text = handler(parse_command("/tier"), _msg(chat_id=42))
+    # Active tier line is prefixed with arrow marker
+    lines = text.split("\n")
+    economy_line = next(line for line in lines if "ECONOMY" in line and "$" in line)
+    assert economy_line.startswith("▸")
+
+
+# ---------------------------------------------------------------------------
 # build_command_registry
 # ---------------------------------------------------------------------------
 
 
-def test_build_command_registry_has_all_eight():
+def test_build_command_registry_has_all_nine():
     personas = default_registry()
     reg = build_command_registry(personas)
-    assert len(reg) == 8
+    assert len(reg) == 9
     for cmd_name in CommandName:
         assert cmd_name in reg
 
@@ -335,6 +437,22 @@ def test_build_command_registry_rejects_negative_budget():
     personas = default_registry()
     with pytest.raises(ValueError, match="invalid_initial_budget"):
         build_command_registry(personas, initial_budget_usd=-1.0)
+
+
+def test_build_command_registry_accepts_explicit_tier_store():
+    personas = default_registry()
+    store = TierSessionStore(default_tier_registry())
+    reg = build_command_registry(personas, tier_store=store)
+    # Dispatch /tier with our chat_id; choice should land in the SAME store
+    msg = IncomingMessage(chat_id=555, user_id=555, message_id=1, text="/tier set PREMIUM")
+    reg.dispatch(parse_command("/tier set PREMIUM"), ctx=msg)
+    assert store.active_tier_name(555) == "PREMIUM"
+
+
+def test_build_command_registry_rejects_invalid_tier_store():
+    personas = default_registry()
+    with pytest.raises(ValueError, match="invalid_tier_store"):
+        build_command_registry(personas, tier_store="not a store")  # type: ignore[arg-type]
 
 
 def test_build_command_registry_dispatches_each_command():

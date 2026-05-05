@@ -38,12 +38,14 @@ from core.bot_commands import (
     parse_budget_amount,
 )
 from core.confirmation_gate import DEFAULT_COST_THRESHOLD_USD, ConfirmationGate
+from core.model_tier import default_registry as default_tier_registry
 from core.telegram_bridge import (
     BridgeReply,
     IncomingMessage,
     TaskHandler,
     TelegramBridge,
 )
+from core.tier_session import TierSessionStore, format_tier_summary
 from core.vision_client import VisionClient
 from core.whisper_client import WhisperClient
 
@@ -302,17 +304,116 @@ def make_retry_handler() -> CommandHandler:
     return _handle
 
 
+def make_tier_handler(store: TierSessionStore) -> CommandHandler:
+    """Returns a /tier handler.
+
+    Subcommands:
+      - /tier                → show current tier + summary of available tiers
+      - /tier set <name>     → make <name> the active tier for this chat
+      - /tier reset          → forget chat's choice (next task will ask again)
+
+    `ctx` is expected to be the IncomingMessage (the bridge passes msg as ctx
+    on dispatch). We need ctx.chat_id to scope tier state per chat.
+    """
+    if not isinstance(store, TierSessionStore):
+        raise ValueError("invalid_tier_store")
+
+    available = ", ".join(store.registry.list_names())
+    no_chat_hint = (
+        "⚠️ Не удалось определить чат для /tier.\n"
+        "\n"
+        "Попробуйте ещё раз — это внутренняя ошибка моста."
+    )
+
+    def _handle(cmd: BotCommand, ctx: Any) -> str:
+        chat_id = getattr(ctx, "chat_id", None)
+        if (
+            chat_id is None
+            or isinstance(chat_id, bool)
+            or not isinstance(chat_id, int)
+            or chat_id <= 0
+        ):
+            return no_chat_hint
+
+        positional = cmd.positional_args()
+
+        # /tier with no args → show summary
+        if not positional:
+            active = store.active_tier_name(chat_id)
+            return format_tier_summary(store.registry, active_name=active)
+
+        action = positional[0].lower()
+
+        if action == "set":
+            if len(positional) < 2:
+                return (
+                    f"💼 Использование:\n"
+                    f"\n"
+                    f"  /tier set <имя_тарифа>\n"
+                    f"\n"
+                    f"Доступно: {available}"
+                )
+            target = positional[1]
+            try:
+                store.set_active(chat_id, target)
+            except KeyError:
+                return (
+                    f"⚠️ Неизвестный тариф: «{target}»\n"
+                    f"\n"
+                    f"Доступно: {available}\n"
+                    f"\n"
+                    f"Подробнее:  /tier"
+                )
+            return (
+                f"✅ Тариф для этого чата: {target}\n"
+                f"\n"
+                f"Сменить:  /tier set <имя>\n"
+                f"Сбросить: /tier reset"
+            )
+
+        if action == "reset":
+            store.reset(chat_id)
+            return (
+                "🔁 Тариф сброшен.\n"
+                "\n"
+                "Перед следующей задачей бот спросит, какой использовать."
+            )
+
+        return (
+            f"⚠️ Не понял подкоманду: «{action}»\n"
+            f"\n"
+            f"Использование:\n"
+            f"  /tier              — показать текущий тариф\n"
+            f"  /tier set <имя>    — выбрать тариф\n"
+            f"  /tier reset        — сбросить выбор\n"
+            f"\n"
+            f"Доступно: {available}"
+        )
+
+    return _handle
+
+
 def build_command_registry(
     personas: PersonaRegistry,
     *,
     initial_budget_usd: float = 10.0,
     active_project: str = "ai-dev-team",
+    tier_store: TierSessionStore | None = None,
 ) -> CommandRegistry:
-    """Build a CommandRegistry pre-populated with all 8 default handlers."""
+    """Build a CommandRegistry pre-populated with all 9 default handlers.
+
+    If tier_store is None, a fresh store backed by default_tier_registry()
+    is created. Pass an explicit store when the bridge wants to share tier
+    state with other components (e.g. real_task_handler).
+    """
     if not isinstance(personas, PersonaRegistry):
         raise ValueError("invalid_personas")
     if not isinstance(initial_budget_usd, (int, float)) or initial_budget_usd < 0:
         raise ValueError("invalid_initial_budget")
+    if tier_store is None:
+        tier_store = TierSessionStore(default_tier_registry())
+    elif not isinstance(tier_store, TierSessionStore):
+        raise ValueError("invalid_tier_store")
 
     reg = CommandRegistry()
     budget_state = _BudgetState(initial_usd=initial_budget_usd)
@@ -322,6 +423,7 @@ def build_command_registry(
     reg.register(CommandName.SWITCH, make_switch_handler())
     reg.register(CommandName.BUDGET, make_budget_handler(budget_state))
     reg.register(CommandName.AGENTS, make_agents_handler(personas))
+    reg.register(CommandName.TIER, make_tier_handler(tier_store))
     reg.register(CommandName.LOG, make_log_handler())
     reg.register(CommandName.STOP, make_stop_handler())
     reg.register(CommandName.RETRY, make_retry_handler())
@@ -394,7 +496,8 @@ def build_bridge_from_env(
     gate = build_confirmation_gate(env)
     whisper = build_whisper_client(env)
     vision = build_vision_client(env)
-    commands = build_command_registry(personas)
+    tier_store = TierSessionStore(default_tier_registry())
+    commands = build_command_registry(personas, tier_store=tier_store)
     task_handler = make_simple_task_handler(personas)
 
     return TelegramBridge(
