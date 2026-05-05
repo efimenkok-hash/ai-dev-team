@@ -379,14 +379,23 @@ arch_plan: dict
   }
 }
 
+## VERDICT RULES (строго соблюдать)
+- verdict=APPROVED  если summary.critical == 0 И summary.major == 0.
+  MINOR issues НЕ блокируют APPROVED — код принят с замечаниями.
+- verdict=REJECTED  если summary.critical > 0 ИЛИ summary.major > 0.
+- for_fixer[] заполняется ТОЛЬКО для CRITICAL и MAJOR issues.
+  MINOR issues в for_fixer[] НЕ включаются.
+- verdict каждого файла: "APPROVED" если у него нет CRITICAL/MAJOR issues.
+
 ## POLICY
 1. Никакого markdown.
 2. Не исправлять код — только фиксировать issues.
-3. Не выдумывать issues.
+3. Не выдумывать issues. Не придираться к стилю без нарушения arch_plan.
 4. verdict=APPROVED при наличии CRITICAL или MAJOR — недопустимо.
-5. for_fixer[] заполняется для каждого issue с fix_required=true.
-6. instruction конкретная и однозначная.
-7. Если writer_output пустой или не парсится → verdict=REJECTED.\
+5. for_fixer[] только CRITICAL/MAJOR; instruction конкретная и однозначная.
+6. Если writer_output пустой или не парсится → verdict=REJECTED.
+7. self_check.verdict_matches_issues: true только если verdict соответствует
+   правилам выше. Если нет — исправить verdict перед выводом.\
 """
 
 _TESTER_SYSTEM = _JSON_CRITICAL + """\
