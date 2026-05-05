@@ -846,3 +846,44 @@ def test_build_bridge_from_env_no_send_progress_ok_without_real_pipeline():
     # Must not raise — real pipeline won't activate without REPO_PATH
     bridge = build_bridge_from_env(env, send_callable=send)
     assert isinstance(bridge, TelegramBridge)
+
+
+def test_build_bridge_from_env_no_send_progress_ok_when_repo_path_invalid(tmp_path):
+    """REPO_PATH is set but points at a non-git directory → real pipeline won't
+    activate → send_progress_callable not required → no ValueError.
+
+    Without the precise eligibility check (only env-var presence), this case
+    would falsely raise 'send_progress_required_for_real_pipeline' even though
+    the bridge falls back to the simple handler.
+    """
+    not_a_repo = tmp_path / "not_a_git_repo"
+    not_a_repo.mkdir()
+    # Note: NO .git subdir → SandboxConfig will reject this path
+    env = {
+        "TELEGRAM_OWNER_CHAT_ID": "777",
+        "OPENROUTER_API_KEY": "sk-or-test",
+        "REPO_PATH": str(not_a_repo),
+    }
+    send, captured = _captured_send()
+    # Must not raise — real pipeline cannot activate, so send_progress is optional
+    bridge = build_bridge_from_env(env, send_callable=send)
+    assert isinstance(bridge, TelegramBridge)
+    # Confirm fallback: simple handler is what answers free-text tasks
+    msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="hi there")
+    bridge.handle(msg)
+    assert len(captured) == 1
+    assert "hi there" in captured[0].text  # simple handler echoes the task
+
+
+def test_build_bridge_from_env_no_send_progress_ok_when_repo_path_missing(tmp_path):
+    """REPO_PATH points at a non-existent directory → falls back to simple handler
+    even with API key present. send_progress_callable not required.
+    """
+    env = {
+        "TELEGRAM_OWNER_CHAT_ID": "777",
+        "OPENROUTER_API_KEY": "sk-or-test",
+        "REPO_PATH": str(tmp_path / "does_not_exist"),
+    }
+    send, _ = _captured_send()
+    bridge = build_bridge_from_env(env, send_callable=send)
+    assert isinstance(bridge, TelegramBridge)

@@ -144,6 +144,45 @@ def build_dispatcher_from_env(env: Mapping[str, str]) -> LLMDispatcher | None:
     return LLMDispatcher(api_key=key.strip())
 
 
+def _try_build_sandbox(env: Mapping[str, str]) -> SandboxWorkspace | None:
+    """Build SandboxWorkspace from env-vars, or return None on any failure.
+
+    Reads REPO_PATH (required) and WORKTREE_ROOT (optional). Returns None
+    when REPO_PATH is missing/empty, the path doesn't exist, isn't a git
+    repo, or any subsystem raises ValueError/TypeError/OSError. No threads
+    or background resources are created — safe to call as a probe.
+    """
+    repo_path_raw = env.get("REPO_PATH", "").strip()
+    if not repo_path_raw:
+        return None
+    try:
+        repo_path = Path(repo_path_raw)
+        worktree_raw = env.get("WORKTREE_ROOT", "").strip()
+        worktree_root = Path(worktree_raw) if worktree_raw else None
+
+        sandbox_cfg_kwargs: dict = {"main_repo_path": repo_path}
+        if worktree_root is not None:
+            sandbox_cfg_kwargs["worktree_root"] = worktree_root
+
+        return SandboxWorkspace(SandboxConfig(**sandbox_cfg_kwargs))
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def _real_pipeline_eligible(env: Mapping[str, str]) -> bool:
+    """True iff `build_real_task_handler_from_env` would return a real handler.
+
+    Validates everything except runner/factory creation: API key present
+    AND sandbox would be successfully built. Used by build_bridge_from_env
+    to decide whether to require send_progress_callable.
+    """
+    if not isinstance(env, Mapping):
+        return False
+    if not env.get("OPENROUTER_API_KEY", "").strip():
+        return False
+    return _try_build_sandbox(env) is not None
+
+
 def build_real_task_handler_from_env(
     env: Mapping[str, str],
     *,
@@ -160,8 +199,8 @@ def build_real_task_handler_from_env(
       WORKTREE_ROOT      — where worktrees are placed (default: tmp dir)
 
     Returns None (silently) if OPENROUTER_API_KEY or REPO_PATH are absent,
-    or if the repo path does not exist / is not a git repository.
-    Callers fall back to make_simple_task_handler in that case.
+    or if any setup error occurs (invalid path, OSError, TypeError, ValueError
+    from subsystems). Callers fall back to make_simple_task_handler in that case.
 
     Raises ValueError for non-Mapping env or non-TierSessionStore tier_store.
     """
@@ -176,21 +215,8 @@ def build_real_task_handler_from_env(
     if dispatcher is None:
         return None
 
-    repo_path_raw = env.get("REPO_PATH", "").strip()
-    if not repo_path_raw:
-        return None
-
-    try:
-        repo_path = Path(repo_path_raw)
-        worktree_raw = env.get("WORKTREE_ROOT", "").strip()
-        worktree_root = Path(worktree_raw) if worktree_raw else None
-
-        sandbox_cfg_kwargs: dict = {"main_repo_path": repo_path}
-        if worktree_root is not None:
-            sandbox_cfg_kwargs["worktree_root"] = worktree_root
-
-        sandbox = SandboxWorkspace(SandboxConfig(**sandbox_cfg_kwargs))
-    except (ValueError, TypeError, OSError):
+    sandbox = _try_build_sandbox(env)
+    if sandbox is None:
         return None
 
     runner = BackgroundTaskRunner()
@@ -607,14 +633,12 @@ def build_bridge_from_env(
     commands = build_command_registry(personas, tier_store=tier_store)
 
     # Attempt to build the full dispatcher-backed pipeline; fall back to stub.
-    # Guard: if the real pipeline would be active but no progress callback was
-    # provided, we must raise rather than silently swallow all progress events
-    # for 30+ seconds (UX bug).
-    _real_possible = bool(
-        env.get("OPENROUTER_API_KEY", "").strip()
-        and env.get("REPO_PATH", "").strip()
-    )
-    if _real_possible and send_progress_callable is None:
+    # Guard: if the real pipeline would actually activate (API key present AND
+    # repo path is a valid git repo) but no progress callback was provided, we
+    # must raise rather than silently swallow 30+ seconds of events. We use a
+    # full eligibility check (not just env-var presence) so misconfigured paths
+    # don't trigger this guard — they'll fall back to the simple handler.
+    if _real_pipeline_eligible(env) and send_progress_callable is None:
         raise ValueError("send_progress_required_for_real_pipeline")
 
     _send_progress: Callable[[int, str], None] = (
