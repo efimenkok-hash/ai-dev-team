@@ -112,6 +112,19 @@ States: `IDLE → PLANNING → PM → ARCHITECT → WRITER → REVIEW → TEST �
 
 `scripts/quality_check.sh` and `core.quality_gates.QualityGates` run ruff + pytest + coverage with a configurable minimum coverage threshold. The same `QualityGates` class can be wired into a CI workflow.
 
+## Running the e2e test
+
+The full pipeline e2e test exercises real OpenRouter API calls, a real git worktree,
+and real ruff/pytest validation. It uses the ECONOMY tier and costs up to ~$0.20 per run.
+
+```bash
+AI_DEV_TEAM_REAL_LLM=1 OPENROUTER_API_KEY=sk-or-v1-... \
+    pytest tests/integration/test_real_pipeline_e2e.py -v -s
+```
+
+The test creates an isolated tmp git repo — it does **not** touch your project.
+It skips automatically in CI when `OPENROUTER_API_KEY` or `AI_DEV_TEAM_REAL_LLM=1` are absent.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
