@@ -35,6 +35,7 @@ from pathlib import Path
 
 from core.adapter import ProjectAdapter
 from core.runtime_validator import RuntimeValidator, ValidationReport
+from core.sandbox_autofix import run_ruff_autofix
 from core.sandbox_workspace import WorktreeHandle
 from core.writer_to_worktree import write_artifact_to_worktree
 
@@ -47,6 +48,8 @@ def make_sandbox_hook(
     handle: WorktreeHandle,
     adapter_factory: Callable[[Path], ProjectAdapter],
     validator: RuntimeValidator,
+    *,
+    autofix: bool = True,
 ) -> _Hook:
     """Build a RuntimeValidationHook for the given worktree.
 
@@ -57,6 +60,13 @@ def make_sandbox_hook(
                          invocation so the adapter always sees the post-write state.
         validator:       Configured RuntimeValidator (INPLACE strategy recommended
                          for worktree use — the worktree IS the sandbox).
+        autofix:         If True (default), run `ruff format` + `ruff check --fix`
+                         on the worktree BEFORE the validator's lint check. This
+                         eliminates ~80% of trivial lint issues (whitespace, line
+                         length, unused imports, import order) without an LLM
+                         round-trip — the fixer_agent only sees real semantic
+                         issues. Set False to disable for tests or when the
+                         project itself has incompatible ruff config.
 
     Returns:
         A callable compatible with Orchestrator(runtime_validator=...) that:
@@ -71,6 +81,8 @@ def make_sandbox_hook(
         raise ValueError("adapter_factory_not_callable")
     if not isinstance(validator, RuntimeValidator):
         raise ValueError(f"invalid_validator_type:{type(validator).__name__}")
+    if not isinstance(autofix, bool):
+        raise ValueError(f"autofix_must_be_bool:{type(autofix).__name__}")
 
     def _hook(task_id: str, snapshot: object) -> ValidationReport:
         # Pull writer artifact from snapshot.
@@ -99,6 +111,14 @@ def make_sandbox_hook(
         if isinstance(fix_artifact, str) and fix_artifact.strip():
             with contextlib.suppress(ValueError, OSError):
                 write_artifact_to_worktree(fix_artifact, handle.path)
+
+        # Auto-fix step: deterministic, free, eliminates ~80% of trivial lint
+        # issues (whitespace, line length, unused imports). Runs BEFORE the
+        # validator's strict lint check so the fixer_agent only ever sees
+        # genuinely-broken code, not cosmetic violations.
+        if autofix:
+            with contextlib.suppress(Exception):
+                run_ruff_autofix(handle.path)
 
         # Build an adapter targeting the worktree directory.
         adapter = adapter_factory(handle.path)

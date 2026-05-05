@@ -323,3 +323,119 @@ def test_hook_silently_ignores_malformed_fix_artifact(tmp_path):
     assert report.ok is True
     result = (tmp_path / "base.py").read_text(encoding="utf-8")
     assert "x = 1" in result
+
+
+# ---------------------------------------------------------------------------
+# Autofix integration (Step A2-followup)
+# ---------------------------------------------------------------------------
+
+
+def test_make_sandbox_hook_rejects_non_bool_autofix(tmp_path):
+    handle = _make_handle(tmp_path)
+    validator = MagicMock(spec=RuntimeValidator)
+    with pytest.raises(ValueError, match="autofix_must_be_bool"):
+        make_sandbox_hook(handle, _adapter_factory, validator, autofix="yes")  # type: ignore[arg-type]
+
+
+def test_hook_calls_autofix_by_default(tmp_path):
+    """When autofix is not specified (default True), run_ruff_autofix is called
+    between writing files and running the validator."""
+    from unittest.mock import patch
+
+    handle = _make_handle(tmp_path)
+    mock_validator = MagicMock(spec=RuntimeValidator)
+    mock_validator.validate.return_value = _ok_report()
+
+    hook = make_sandbox_hook(handle, _adapter_factory, mock_validator)
+    snapshot = _make_snapshot(_simple_artifact())
+
+    with patch("core.sandbox_runtime_hook.run_ruff_autofix") as mock_autofix:
+        hook("task-autofix-default", snapshot)
+
+    mock_autofix.assert_called_once()
+    # Ensure path is the worktree path
+    call_args = mock_autofix.call_args
+    if call_args.args:
+        assert call_args.args[0] == handle.path
+
+
+def test_hook_skips_autofix_when_disabled(tmp_path):
+    """autofix=False → run_ruff_autofix is never called."""
+    from unittest.mock import patch
+
+    handle = _make_handle(tmp_path)
+    mock_validator = MagicMock(spec=RuntimeValidator)
+    mock_validator.validate.return_value = _ok_report()
+
+    hook = make_sandbox_hook(handle, _adapter_factory, mock_validator, autofix=False)
+    snapshot = _make_snapshot(_simple_artifact())
+
+    with patch("core.sandbox_runtime_hook.run_ruff_autofix") as mock_autofix:
+        hook("task-no-autofix", snapshot)
+
+    mock_autofix.assert_not_called()
+
+
+def test_hook_autofix_exception_is_swallowed(tmp_path):
+    """If run_ruff_autofix raises, the hook still calls the validator and
+    returns its report — autofix is best-effort, never blocks pipeline."""
+    from unittest.mock import patch
+
+    handle = _make_handle(tmp_path)
+    mock_validator = MagicMock(spec=RuntimeValidator)
+    mock_validator.validate.return_value = _ok_report()
+
+    hook = make_sandbox_hook(handle, _adapter_factory, mock_validator)
+    snapshot = _make_snapshot(_simple_artifact())
+
+    with patch(
+        "core.sandbox_runtime_hook.run_ruff_autofix",
+        side_effect=RuntimeError("autofix died"),
+    ):
+        report = hook("task-autofix-crash", snapshot)
+
+    assert report.ok is True  # validator still ran
+    mock_validator.validate.assert_called_once()
+
+
+def test_hook_autofix_runs_after_writer_and_fix_overlay(tmp_path):
+    """autofix is called AFTER both writer and fix files are written, but
+    BEFORE validator. Verify the order via mocks."""
+    import json as _json
+    from unittest.mock import MagicMock, patch
+
+    handle = _make_handle(tmp_path)
+    mock_validator = MagicMock(spec=RuntimeValidator)
+    mock_validator.validate.return_value = _ok_report()
+
+    call_order: list[str] = []
+
+    def _track_validate(*_a, **_k):
+        call_order.append("validate")
+        return _ok_report()
+
+    mock_validator.validate.side_effect = _track_validate
+
+    hook = make_sandbox_hook(handle, _adapter_factory, mock_validator)
+
+    writer_artifact = _json.dumps(
+        {"files": [{"path": "module.py", "content": "x = 1\n"}]}
+    )
+    fix_artifact = _json.dumps(
+        {"files": [{"path": "module.py", "content": "x = 2\n"}]}
+    )
+
+    class _Snap:
+        pass
+    snap = _Snap()
+    snap.artifacts = {"writer": writer_artifact, "fix": fix_artifact}  # type: ignore[attr-defined]
+
+    autofix_mock = MagicMock(side_effect=lambda *_a, **_k: call_order.append("autofix"))
+
+    with patch("core.sandbox_runtime_hook.run_ruff_autofix", autofix_mock):
+        hook("task-order", snap)
+
+    # autofix must be called BEFORE validate.
+    assert call_order == ["autofix", "validate"]
+    # And the file on disk should reflect the FIX (overlay applied).
+    assert (tmp_path / "module.py").read_text(encoding="utf-8") == "x = 2\n"
