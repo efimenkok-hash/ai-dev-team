@@ -53,7 +53,9 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
+from core.adapter import ProjectAdapter
 from core.background_runner import (
     BackgroundTaskRunner,
     CancellationToken,
@@ -77,6 +79,8 @@ from core.progress_emitter import (
     ProgressEvent,
     wrap_registry_with_progress,
 )
+from core.runtime_validator import RuntimeValidator, ValidationStrategy
+from core.sandbox_runtime_hook import make_sandbox_hook
 from core.sandbox_workspace import (
     SandboxError,
     SandboxWorkspace,
@@ -289,6 +293,26 @@ def make_real_task_handler(
                 base_registry = agent_registry_factory(tier)
                 wrapped = wrap_registry_with_progress(base_registry, emitter)
 
+                # Build the runtime-validation hook: writes writer artifact into
+                # the worktree then runs ruff/pytest against it.
+                def _adapter_factory(p: Path) -> ProjectAdapter:
+                    return ProjectAdapter(
+                        name="sandbox",
+                        project_path=p,
+                        language="python",
+                    )
+
+                runtime_validator = RuntimeValidator(
+                    strategy=ValidationStrategy.INPLACE,
+                    run_lint=True,
+                    run_tests=True,
+                )
+                runtime_hook = make_sandbox_hook(
+                    handle=handle,
+                    adapter_factory=_adapter_factory,
+                    validator=runtime_validator,
+                )
+
                 orch = Orchestrator(
                     memory=memory,
                     agents=wrapped,
@@ -298,22 +322,42 @@ def make_real_task_handler(
                         reject_injection_markers(),
                     ),
                     cost_budget_usd=config.cost_budget_usd,
+                    runtime_validator=runtime_hook,
                 )
 
                 result: RunResult = orch.run(task_id, text)
 
                 final_state = result.final_state
-                summary = {
+                summary: dict = {
                     "task_id": task_id,
                     "final_state": final_state.value,
                     "branch": handle.branch,
                     "worktree": str(handle.path),
                     "failure_reason": result.failure_reason,
                     "tier_name": tier_name,
+                    "commit_sha": None,
                 }
 
                 if final_state == State.SUCCESS:
-                    emitter.emit_task_completed(summary=f"branch={handle.branch}")
+                    # Commit all files written by the hook into the worktree.
+                    with contextlib.suppress(Exception) as _commit_ctx:
+                        sha = sandbox.commit_in_worktree(
+                            handle,
+                            message=f"AI Dev Team: {text[:60]}",
+                            author_name=config.author_name,
+                            author_email=config.author_email,
+                        )
+                        summary["commit_sha"] = sha
+                    emitter.emit_task_completed(
+                        summary=(
+                            f"branch={handle.branch}"
+                            + (
+                                f" · commit={summary['commit_sha'][:8]}"
+                                if summary["commit_sha"]
+                                else ""
+                            )
+                        )
+                    )
                 else:
                     emitter.emit_task_failed(
                         reason=(
@@ -354,6 +398,8 @@ def make_real_task_handler(
             final_state = result.get("final_state", "?")
             branch = result.get("branch", "?")
             tier_name = result.get("tier_name", "?")
+            commit_sha = result.get("commit_sha") or ""
+            sha_short = commit_sha[:8] if commit_sha else ""
             if final_state == State.SUCCESS.value:
                 _safe_send(
                     chat_id,
@@ -363,7 +409,8 @@ def make_real_task_handler(
                         f"  task-id `{handle.task_id}`\n"
                         f"  тариф   `{tier_name}`\n"
                         f"  branch  `{branch}`\n"
-                        f"\n"
+                        + (f"  commit  `{sha_short}`\n" if sha_short else "")
+                        + f"\n"
                         f"Запуш в GitHub:  /push {handle.task_id}"
                     ),
                 )

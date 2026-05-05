@@ -498,22 +498,31 @@ def test_handle_returns_ack_when_submitted(runner, sandbox, tier_store):
 def test_full_run_happy_path_streams_progress_and_releases_worktree(
     runner, sandbox, tier_store, fake_repo, tmp_path,
 ):
+    from unittest.mock import MagicMock, patch
+
     tier_store.set_active(42, "STANDARD")
     send, captured = _make_progress_capture()
 
-    handler = make_real_task_handler(
-        runner=runner,
-        sandbox=sandbox,
-        tier_store=tier_store,
-        send_progress=send,
-        agent_registry_factory=happy_agents,
-        task_id_factory=lambda: "task-happy-001",
-    )
+    # mock make_sandbox_hook so the pipeline reaches SUCCESS despite
+    # happy_agents writer returning non-JSON (no real ruff/pytest run).
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+    mock_make_sandbox_hook = MagicMock(return_value=mock_hook_fn)
 
-    handler("build a counter function", _msg(chat_id=42))
-    _wait_until_idle(runner)
-    # Wait briefly for on_complete after worker finishes
-    _wait_for_count(captured, lambda c: any("Готово" in t for _, t in c))
+    with patch("core.real_task_handler.make_sandbox_hook", mock_make_sandbox_hook):
+        handler = make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=happy_agents,
+            task_id_factory=lambda: "task-happy-001",
+        )
+
+        handler("build a counter function", _msg(chat_id=42))
+        _wait_until_idle(runner)
+        # Wait briefly for on_complete after worker finishes
+        _wait_for_count(captured, lambda c: any("Готово" in t for _, t in c))
 
     sent_chat_ids = {cid for cid, _ in captured}
     sent_texts = [t for _, t in captured]
@@ -626,18 +635,26 @@ def test_send_progress_failure_does_not_break_worker(
 def test_on_complete_emits_success_summary_for_happy_path(
     runner, sandbox, tier_store,
 ):
+    from unittest.mock import MagicMock, patch
+
     tier_store.set_active(42, "PREMIUM")
     send, captured = _make_progress_capture()
-    handler = make_real_task_handler(
-        runner=runner,
-        sandbox=sandbox,
-        tier_store=tier_store,
-        send_progress=send,
-        agent_registry_factory=happy_agents,
-        task_id_factory=lambda: "task-final-001",
-    )
-    handler("ok", _msg(chat_id=42))
-    _wait_until_idle(runner)
+
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+    mock_make_sandbox_hook = MagicMock(return_value=mock_hook_fn)
+
+    with patch("core.real_task_handler.make_sandbox_hook", mock_make_sandbox_hook):
+        handler = make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=happy_agents,
+            task_id_factory=lambda: "task-final-001",
+        )
+        handler("ok", _msg(chat_id=42))
+        _wait_until_idle(runner)
     _wait_for_count(captured, lambda c: any("Готово" in t for _, t in c))
 
     final_msgs = [t for _, t in captured if "Готово" in t]
@@ -715,3 +732,152 @@ def test_observability_injected_succeeds(runner, sandbox, tier_store):
     reply = handler("hi", _msg(chat_id=42))
     assert isinstance(reply, BridgeReply)
     _wait_until_idle(runner)
+
+
+# ---------------------------------------------------------------------------
+# 14b-9: commit_in_worktree wired on SUCCESS / not called on FAIL
+# ---------------------------------------------------------------------------
+
+
+def _ok_validation_report():
+    from core.quality_gates import CheckResult
+    from core.runtime_validator import ValidationReport, ValidationStrategy
+
+    return ValidationReport(
+        ok=True,
+        strategy=ValidationStrategy.INPLACE,
+        checks=(
+            CheckResult(
+                name="lint", ok=True, summary="ok", raw_output="", duration_ms=0
+            ),
+        ),
+        duration_ms=1,
+    )
+
+
+def test_commit_in_worktree_called_on_success(runner, sandbox, tier_store, tmp_path):
+    """When pipeline reaches SUCCESS, commit_in_worktree must be called once."""
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(42, "PREMIUM")
+    send, _captured = _make_progress_capture()
+
+    fake_sha = "abc123def456789"
+    mock_report = _ok_validation_report()
+    # hook builder: returns a callable that returns mock_report
+    mock_hook_fn = MagicMock(return_value=mock_report)
+    mock_make_sandbox_hook = MagicMock(return_value=mock_hook_fn)
+
+    with (
+        patch("core.real_task_handler.make_sandbox_hook", mock_make_sandbox_hook),
+        patch.object(sandbox, "commit_in_worktree", return_value=fake_sha) as mock_commit,
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=happy_agents,
+            task_id_factory=lambda: "task-commit-001",
+        )
+        handler("build a CLI tool", _msg(chat_id=42))
+        _wait_until_idle(runner)
+
+    mock_commit.assert_called_once()
+    # Commit message should contain first 60 chars of task text
+    commit_msg = mock_commit.call_args.kwargs["message"]
+    assert "build a CLI tool" in commit_msg
+
+
+def test_commit_in_worktree_not_called_on_fail(runner, sandbox, tier_store):
+    """When pipeline does NOT reach SUCCESS, commit_in_worktree must not be called."""
+    from unittest.mock import patch
+
+    tier_store.set_active(42, "ECONOMY")
+    send, _ = _make_progress_capture()
+
+    with patch.object(sandbox, "commit_in_worktree") as mock_commit:
+        handler = make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=noop_agents,
+            task_id_factory=lambda: "task-noop-001",
+        )
+        handler("build something", _msg(chat_id=42))
+        _wait_until_idle(runner)
+
+    mock_commit.assert_not_called()
+
+
+def test_commit_sha_appears_in_success_message(runner, sandbox, tier_store):
+    """commit_sha[:8] must appear in the final ✅ Готово message."""
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(42, "PREMIUM")
+    send, captured = _make_progress_capture()
+
+    fake_sha = "deadbeef12345678"
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+    mock_make_sandbox_hook = MagicMock(return_value=mock_hook_fn)
+
+    with (
+        patch("core.real_task_handler.make_sandbox_hook", mock_make_sandbox_hook),
+        patch.object(sandbox, "commit_in_worktree", return_value=fake_sha),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=happy_agents,
+            task_id_factory=lambda: "task-sha-001",
+        )
+        handler("make something", _msg(chat_id=42))
+        _wait_until_idle(runner)
+        _wait_for_count(captured, lambda c: any("Готово" in t for _, t in c))
+
+    success_msgs = [t for _, t in captured if "Готово" in t]
+    assert success_msgs, "no success message received"
+    assert any(fake_sha[:8] in t for t in success_msgs), (
+        f"commit sha {fake_sha[:8]!r} not found in: {success_msgs}"
+    )
+
+
+def test_commit_error_does_not_crash_worker(runner, sandbox, tier_store):
+    """If commit_in_worktree raises, the worker must still complete (sha=None)."""
+    from unittest.mock import MagicMock, patch
+
+    from core.sandbox_workspace import SandboxError
+
+    tier_store.set_active(42, "PREMIUM")
+    send, captured = _make_progress_capture()
+
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+    mock_make_sandbox_hook = MagicMock(return_value=mock_hook_fn)
+
+    with (
+        patch("core.real_task_handler.make_sandbox_hook", mock_make_sandbox_hook),
+        patch.object(
+            sandbox,
+            "commit_in_worktree",
+            side_effect=SandboxError("nothing_to_commit"),
+        ),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=happy_agents,
+            task_id_factory=lambda: "task-err-commit-001",
+        )
+        handler("build x", _msg(chat_id=42))
+        _wait_until_idle(runner)
+
+    # Worker completed — success message still sent (no sha in it, but no crash)
+    _wait_for_count(captured, lambda c: any("Готово" in t for _, t in c))
+    assert any("Готово" in t for _, t in captured)
