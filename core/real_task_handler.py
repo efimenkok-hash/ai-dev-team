@@ -257,11 +257,18 @@ def make_real_task_handler(
         wrapped so that the worktree is always released.
         """
 
+        # Terminal events must reach the user even after /stop — they carry
+        # the final verdict (task_completed / task_failed).  Only intermediate
+        # progress events are silenced so the chat isn't flooded after cancel.
+        _TERMINAL_EVENTS: frozenset[str] = frozenset(
+            {"task_completed", "task_failed"}
+        )
+
         def _run(token: CancellationToken) -> dict:
             handle: WorktreeHandle | None = None
 
             def _on_event(evt: ProgressEvent) -> None:
-                if token.is_set():
+                if token.is_set() and evt.kind not in _TERMINAL_EVENTS:
                     return
                 _safe_send(chat_id, _format_event(evt))
 
@@ -331,18 +338,31 @@ def make_real_task_handler(
 
                 result: RunResult = orch.run(task_id, text)
 
+                # /stop pressed while pipeline was running?  Orchestrator
+                # cannot be interrupted mid-flight (it runs all agents to
+                # completion), but we must NOT lie to the user: override
+                # final_state to CANCELLED, skip commit, and let
+                # _build_on_complete send the ⏹ message.
+                cancelled = token.is_set()
                 final_state = result.final_state
+
                 summary: dict = {
                     "task_id": task_id,
-                    "final_state": final_state.value,
+                    "final_state": "CANCELLED" if cancelled else final_state.value,
                     "branch": handle.branch,
                     "worktree": str(handle.path),
-                    "failure_reason": result.failure_reason,
+                    "failure_reason": (
+                        "cancelled_by_user" if cancelled else result.failure_reason
+                    ),
                     "tier_name": tier_name,
                     "commit_sha": None,
                 }
 
-                if final_state == State.SUCCESS:
+                if cancelled:
+                    # Do NOT commit — user explicitly stopped the task.
+                    # _build_on_complete will send the ⏹ Отменено message.
+                    pass
+                elif final_state == State.SUCCESS:
                     try:
                         summary["commit_sha"] = sandbox.commit_in_worktree(
                             handle,
@@ -430,7 +450,18 @@ def make_real_task_handler(
                         )
                     )
 
-            if final_state == State.SUCCESS.value:
+            if final_state == "CANCELLED":
+                _safe_send(
+                    chat_id,
+                    (
+                        f"⏹ Отменено пользователем\n"
+                        f"\n"
+                        f"  task-id `{handle.task_id}`\n"
+                        f"  тариф   `{tier_name}`\n"
+                        f"  Коммит не сделан."
+                    ),
+                )
+            elif final_state == State.SUCCESS.value:
                 _safe_send(
                     chat_id,
                     (

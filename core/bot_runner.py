@@ -402,28 +402,34 @@ def make_agents_handler(personas: PersonaRegistry) -> CommandHandler:
 
 def make_push_handler(
     sandbox: SandboxWorkspace | None = None,
+    task_history: TaskHistory | None = None,
 ) -> CommandHandler:
     """Returns a /push <task_id> handler.
 
-    When *sandbox* is provided (real pipeline active):
+    When *sandbox* AND *task_history* are provided (real pipeline active):
       - Validates task_id against _TASK_ID_RE (rejects shell-meta, path traversal).
-      - Derives branch = f"feature/{task_id}" (mirrors real_task_handler convention).
-      - Calls sandbox.push_named_branch(branch) — works after worktree release
-        because it runs `git push` from the main repo.
-      - Returns ✅ on success, ❌ with reason on git failure.
+      - Looks up task_id in TaskHistory — refuses if not found or commit_sha is None
+        (task never reached SUCCESS, nothing meaningful to push).
+      - Calls sandbox.push_named_branch(summary.branch) — works after worktree
+        release because it runs `git push` from the main repo.
+      - Returns ✅ on success with branch + short SHA, ❌ with reason on failure.
 
-    When *sandbox* is None (pipeline not configured):
+    When either is None (pipeline not configured):
       - Returns an informative stub explaining how to enable the feature.
+
+    The TaskHistory guard prevents pushing branches of failed tasks that exist
+    in main_repo but contain no new commits (they were created by acquire() and
+    point to the same SHA as main).
     """
     if sandbox is not None and not isinstance(sandbox, SandboxWorkspace):
         raise ValueError(f"invalid_sandbox:{type(sandbox).__name__}")
+    if task_history is not None and not isinstance(task_history, TaskHistory):
+        raise ValueError(f"invalid_task_history:{type(task_history).__name__}")
 
     from core.sandbox_workspace import _TASK_ID_RE as _TID_RE
 
-    _sandbox = sandbox
-
     def _handle(cmd: BotCommand, _ctx: Any) -> str:
-        if _sandbox is None:
+        if sandbox is None or task_history is None:
             return (
                 "🚀 /push <task_id>\n"
                 "\n"
@@ -446,17 +452,39 @@ def make_push_handler(
                 "task_id должен содержать только строчные буквы, цифры, "
                 "дефис и подчёркивание."
             )
-        branch = f"feature/{task_id}"
+        # Guard: only push tasks that actually reached SUCCESS (have a commit).
+        # Failed tasks still have a branch in main_repo (created by acquire()),
+        # but it points to the same SHA as main — nothing meaningful to push.
+        summary = task_history.get(task_id)
+        if summary is None:
+            return (
+                f"⚠️ task_id `{task_id}` не найден в истории.\n"
+                "\n"
+                "Задача ещё выполняется или id указан неверно."
+            )
+        if summary.commit_sha is None:
+            return (
+                f"⚠️ Задача `{task_id}` не достигла SUCCESS — нечего пушить.\n"
+                "\n"
+                f"  state   `{summary.final_state}`\n"
+                f"  reason  `{summary.failure_reason or '?'}`"
+            )
         try:
-            _sandbox.push_named_branch(branch)
+            sandbox.push_named_branch(summary.branch)
         except Exception as exc:
             return (
                 f"❌ Не удалось запушить\n"
                 "\n"
-                f"  branch  `{branch}`\n"
+                f"  branch  `{summary.branch}`\n"
                 f"  ошибка  {type(exc).__name__}: {str(exc)[:200]}"
             )
-        return f"✅ Запушено в GitHub: `{branch}`"
+        return (
+            f"✅ Запушено в GitHub\n"
+            "\n"
+            f"  task-id `{task_id}`\n"
+            f"  branch  `{summary.branch}`\n"
+            f"  commit  `{summary.commit_sha[:8]}`"
+        )
 
     return _handle
 
@@ -730,7 +758,7 @@ def build_command_registry(
     reg.register(CommandName.LOG, make_log_handler(task_history))
     reg.register(CommandName.STOP, make_stop_handler(runner))
     reg.register(CommandName.RETRY, make_retry_handler())
-    reg.register(CommandName.PUSH, make_push_handler(sandbox))
+    reg.register(CommandName.PUSH, make_push_handler(sandbox, task_history))
     # /help is registered LAST so it can list everything else.
     reg.register(
         CommandName.HELP,
@@ -819,12 +847,13 @@ def build_bridge_from_env(
     sandbox = _try_build_sandbox(env)
     task_history = TaskHistory() if sandbox is not None else None
 
-    # Build a single BackgroundTaskRunner so /stop can cancel the active task.
-    # The runner is passed to both build_command_registry (for /stop) and
-    # build_real_task_handler_from_env (for task execution).  When the real
-    # pipeline is not configured the runner is still created but remains idle;
-    # it's lightweight and runner.cancel() safely returns False when idle.
-    runner = BackgroundTaskRunner()
+    # Build a BackgroundTaskRunner ONLY when the real pipeline is eligible.
+    # In simple-stub mode there is nothing to cancel, so spawning an idle
+    # worker thread is wasteful.  make_stop_handler(None) correctly returns
+    # a "pipeline not configured" stub when runner is None.
+    runner: BackgroundTaskRunner | None = (
+        BackgroundTaskRunner() if _real_pipeline_eligible(env) else None
+    )
 
     commands = build_command_registry(
         personas,

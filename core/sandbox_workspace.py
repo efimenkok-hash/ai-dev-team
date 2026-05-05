@@ -354,7 +354,11 @@ class SandboxWorkspace:
         *,
         remote: str = "origin",
     ) -> None:
-        """Alias for push_named_branch — kept for backward compatibility."""
+        """DEPRECATED: use push_named_branch instead.
+
+        Kept for backward compatibility with tests written against the 14c-1
+        interface.  Will be removed in a future cleanup pass.
+        """
         return self.push_named_branch(branch, remote=remote)
 
     def push_branch(

@@ -900,3 +900,67 @@ def test_commit_error_surfaces_as_task_failed_not_success(runner, sandbox, tier_
     assert not any("Готово" in t for t in all_texts), (
         "worker must NOT emit Готово when commit failed"
     )
+
+
+def test_cancellation_overrides_success_to_cancelled(
+    runner, sandbox, tier_store, fake_repo, tmp_path,
+):
+    """14c-fix critical bug: if /stop pressed while pipeline runs, the handler
+    must NOT commit and must send ⏹ Отменено — not ✅ Готово."""
+    from unittest.mock import MagicMock, patch
+
+    from core.task_history import TaskHistory
+
+    tier_store.set_active(42, "STANDARD")
+    send, captured = _make_progress_capture()
+    history = TaskHistory()
+
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+    mock_make_sandbox_hook = MagicMock(return_value=mock_hook_fn)
+    mock_commit = MagicMock(return_value="deadbeef12345678")
+
+    with (
+        patch("core.real_task_handler.make_sandbox_hook", mock_make_sandbox_hook),
+        patch.object(sandbox, "commit_in_worktree", mock_commit),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=happy_agents,
+            task_id_factory=lambda: "task-cancel-001",
+            task_history=history,
+        )
+
+        handler("build something", _msg(chat_id=42))
+        # Cancel before worker finishes (race is acceptable — we just
+        # need the token set before _run reads it after orch.run()).
+        runner.cancel()
+        _wait_until_idle(runner)
+
+    _wait_for_count(
+        captured,
+        lambda c: any("Отменено" in t for _, t in c),
+        timeout=5.0,
+    )
+
+    all_texts = [t for _, t in captured]
+
+    # Must send cancellation notice
+    assert any("Отменено" in t for t in all_texts), (
+        f"expected ⏹ Отменено in messages, got: {all_texts}"
+    )
+    # Must NOT claim success
+    assert not any("Готово" in t for t in all_texts), (
+        "must NOT send ✅ Готово after cancellation"
+    )
+    # commit_in_worktree must NOT be called after cancellation
+    mock_commit.assert_not_called()
+
+    # TaskHistory must record CANCELLED with no commit_sha
+    summary = history.get("task-cancel-001")
+    if summary is not None:  # history may be None if cancel raced ahead of pipeline
+        assert summary.final_state == "CANCELLED"
+        assert summary.commit_sha is None

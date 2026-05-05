@@ -1105,6 +1105,24 @@ def test_build_bridge_from_env_no_send_progress_ok_when_repo_path_missing(tmp_pa
     assert isinstance(bridge, TelegramBridge)
 
 
+def test_build_bridge_stub_mode_does_not_spawn_runner():
+    """Minorka #1: In simple-stub mode (no real pipeline) no BackgroundTaskRunner
+    thread should be created — it would be an idle resource waste."""
+    from unittest.mock import MagicMock, patch
+
+    from core.background_runner import BackgroundTaskRunner
+
+    mock_runner_cls = MagicMock(spec=type(BackgroundTaskRunner))
+    env = {"TELEGRAM_OWNER_CHAT_ID": "777"}  # no OPENROUTER_API_KEY, no REPO_PATH
+    send, _ = _captured_send()
+
+    with patch("core.bot_runner.BackgroundTaskRunner", mock_runner_cls):
+        bridge = build_bridge_from_env(env, send_callable=send)
+
+    mock_runner_cls.assert_not_called()
+    assert isinstance(bridge, TelegramBridge)
+
+
 # ---------------------------------------------------------------------------
 # make_push_handler (Step 16)
 # ---------------------------------------------------------------------------
@@ -1137,6 +1155,24 @@ def _make_sandbox_for_push(tmp_path):
     return SandboxWorkspace(cfg, runner=runner), runner
 
 
+def _make_push_summary(task_id="task-push-001", commit_sha="deadbeef12345678"):
+    import time
+
+    from core.task_history import TaskHistory, TaskSummary
+
+    h = TaskHistory()
+    h.record(TaskSummary(
+        task_id=task_id,
+        branch=f"feature/{task_id}",
+        commit_sha=commit_sha,
+        final_state="SUCCESS",
+        failure_reason=None,
+        tier_name="ECONOMY",
+        finished_at=time.time(),
+    ))
+    return h
+
+
 def test_make_push_handler_returns_callable():
     handler = make_push_handler()
     assert callable(handler)
@@ -1144,9 +1180,17 @@ def test_make_push_handler_returns_callable():
 
 def test_push_handler_stub_when_no_sandbox():
     """Without sandbox /push returns a helpful stub."""
-    handler = make_push_handler(sandbox=None)
+    handler = make_push_handler(sandbox=None, task_history=None)
     result = handler(parse_command("/push task-001"), None)
     assert "REPO_PATH" in result or "недоступен" in result
+
+
+def test_push_handler_stub_when_no_task_history(tmp_path):
+    """Without task_history /push returns a stub (can't guard against failed tasks)."""
+    sandbox, _ = _make_sandbox_for_push(tmp_path)
+    handler = make_push_handler(sandbox=sandbox, task_history=None)
+    result = handler(parse_command("/push task-001"), None)
+    assert "недоступен" in result or "REPO_PATH" in result
 
 
 def test_push_handler_rejects_invalid_sandbox():
@@ -1154,22 +1198,29 @@ def test_push_handler_rejects_invalid_sandbox():
         make_push_handler(sandbox="not a sandbox")  # type: ignore[arg-type]
 
 
+def test_push_handler_rejects_invalid_task_history(tmp_path):
+    sandbox, _ = _make_sandbox_for_push(tmp_path)
+    with pytest.raises(ValueError, match="invalid_task_history"):
+        make_push_handler(sandbox=sandbox, task_history="not history")  # type: ignore[arg-type]
+
+
 def test_push_handler_missing_task_id_arg(tmp_path):
     """'/push' with no args returns usage hint."""
     sandbox, _ = _make_sandbox_for_push(tmp_path)
-    handler = make_push_handler(sandbox=sandbox)
+    history = TaskHistory()
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
     result = handler(parse_command("/push"), None)
     assert "task_id" in result.lower() or "укажи" in result.lower()
 
 
 def test_push_handler_malicious_task_id_rejected(tmp_path):
-    """Shell-meta and path-traversal in task_id must be rejected."""
+    """Shell-meta and path-traversal in task_id must be rejected before TaskHistory lookup."""
     from core.bot_commands import BotCommand, CommandName
 
     sandbox, runner = _make_sandbox_for_push(tmp_path)
-    handler = make_push_handler(sandbox=sandbox)
+    history = TaskHistory()
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
 
-    # Craft BotCommands directly to bypass parse_command tokenisation.
     bad_ids = ["../evil", "UPPER_CASE", "task;rm", "task&ls", "task|cat"]
     for bad in bad_ids:
         cmd = BotCommand(
@@ -1182,15 +1233,57 @@ def test_push_handler_malicious_task_id_rejected(tmp_path):
     assert len(runner.calls) == 0, "no git calls on malicious input"
 
 
-def test_push_handler_success_calls_push_named_branch(tmp_path):
-    """Happy path: valid task_id → branch derived, push_named_branch called."""
+def test_push_handler_refuses_task_not_in_history(tmp_path):
+    """task_id valid regex but not in TaskHistory → 'не найден'."""
     sandbox, runner = _make_sandbox_for_push(tmp_path)
-    handler = make_push_handler(sandbox=sandbox)
+    history = TaskHistory()  # empty
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
+    result = handler(parse_command("/push task-unknown"), None)
+    assert "не найден" in result
+    assert len(runner.calls) == 0
+
+
+def test_push_handler_refuses_failed_task(tmp_path):
+    """Task in history with commit_sha=None → refused, no git push."""
+    import time
+
+    from core.task_history import TaskHistory, TaskSummary
+
+    sandbox, runner = _make_sandbox_for_push(tmp_path)
+    history = TaskHistory()
+    history.record(TaskSummary(
+        task_id="task-fail",
+        branch="feature/task-fail",
+        commit_sha=None,  # no commit → FAIL or CANCELLED
+        final_state="FAIL",
+        failure_reason="ruff_error",
+        tier_name="ECONOMY",
+        finished_at=time.time(),
+    ))
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
+    result = handler(parse_command("/push task-fail"), None)
+    assert "нечего пушить" in result or "SUCCESS" in result
+    assert len(runner.calls) == 0
+
+
+def test_push_handler_success_calls_push_named_branch(tmp_path):
+    """Happy path: SUCCESS task in history → push_named_branch called."""
+    sandbox, runner = _make_sandbox_for_push(tmp_path)
+    history = _make_push_summary()
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
     result = handler(parse_command("/push task-push-001"), None)
     assert "✅" in result
     assert "feature/task-push-001" in result
     assert len(runner.calls) == 1
     assert runner.calls[0]["cmd"] == ("git", "push", "origin", "feature/task-push-001")
+
+
+def test_push_handler_shows_commit_sha_short_on_success(tmp_path):
+    sandbox, _ = _make_sandbox_for_push(tmp_path)
+    history = _make_push_summary(commit_sha="cafebabe12345678")
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
+    result = handler(parse_command("/push task-push-001"), None)
+    assert "cafebabe" in result  # first 8 chars
 
 
 def test_push_handler_git_failure_returns_error_message(tmp_path):
@@ -1210,26 +1303,19 @@ def test_push_handler_git_failure_returns_error_message(tmp_path):
     (repo / ".git").mkdir()
     cfg = SandboxConfig(main_repo_path=repo, worktree_root=tmp_path / "wt")
     sandbox = SandboxWorkspace(cfg, runner=_FailRunner())
-
-    handler = make_push_handler(sandbox=sandbox)
+    history = _make_push_summary()
+    handler = make_push_handler(sandbox=sandbox, task_history=history)
     result = handler(parse_command("/push task-push-001"), None)
     assert "❌" in result
     assert "Не удалось запушить" in result or "запушить" in result
 
 
-def test_push_handler_branch_name_in_success_reply(tmp_path):
-    """Success reply must contain the derived branch name."""
-    sandbox, _ = _make_sandbox_for_push(tmp_path)
-    handler = make_push_handler(sandbox=sandbox)
-    result = handler(parse_command("/push my-task-123"), None)
-    assert "feature/my-task-123" in result
-
-
 def test_build_command_registry_with_sandbox_wires_push(tmp_path):
-    """When sandbox is passed to build_command_registry, /push performs real push."""
+    """When sandbox+task_history are passed, /push performs real push for SUCCESS tasks."""
     sandbox, runner = _make_sandbox_for_push(tmp_path)
+    history = _make_push_summary()
     personas = default_registry()
-    reg = build_command_registry(personas, sandbox=sandbox)
+    reg = build_command_registry(personas, sandbox=sandbox, task_history=history)
     result = reg.dispatch(parse_command("/push task-push-001"))
     assert "✅" in result
     assert len(runner.calls) == 1
