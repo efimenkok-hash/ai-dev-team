@@ -49,13 +49,14 @@ CONTRACTS:
 
 import contextlib
 import re
+import sys
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from core.adapter import ProjectAdapter
+from core.adapter import ProjectAdapter, ProjectCommand
 from core.background_runner import (
     BackgroundTaskRunner,
     CancellationToken,
@@ -305,18 +306,30 @@ def make_real_task_handler(
                 wrapped = wrap_registry_with_progress(base_registry, emitter)
 
                 # Build the runtime-validation hook: writes writer artifact into
-                # the worktree then runs ruff/pytest against it.
+                # the worktree then runs ruff against it.
+                # Custom lint command: `ruff check .` targets the whole worktree
+                # rather than the default ["core", "tests"] which don't exist in
+                # generated projects.
+                # run_tests=False: tester output is not written to the worktree
+                # (only writer output is), so pytest would find no tests.
+                _lint_cmd = ProjectCommand(
+                    name="lint",
+                    cmd=(sys.executable, "-m", "ruff", "check", "."),
+                    timeout_seconds=60,
+                )
+
                 def _adapter_factory(p: Path) -> ProjectAdapter:
                     return ProjectAdapter(
                         name="sandbox",
                         project_path=p,
                         language="python",
+                        commands={"lint": _lint_cmd},
                     )
 
                 runtime_validator = RuntimeValidator(
                     strategy=ValidationStrategy.INPLACE,
                     run_lint=True,
-                    run_tests=True,
+                    run_tests=False,
                 )
                 runtime_hook = make_sandbox_hook(
                     handle=handle,

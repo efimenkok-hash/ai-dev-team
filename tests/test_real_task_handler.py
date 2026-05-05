@@ -999,3 +999,98 @@ def test_cancellation_overrides_success_to_cancelled(
     assert summary is not None, "TaskHistory must record cancelled task"
     assert summary.final_state == "CANCELLED"
     assert summary.commit_sha is None
+
+
+# ---------------------------------------------------------------------------
+# A4-fix: runtime validator uses "ruff check ." + run_tests=False
+# ---------------------------------------------------------------------------
+
+
+def test_adapter_factory_uses_dot_lint_target(runner, sandbox, tier_store):
+    """_adapter_factory must supply a custom lint command targeting '.'
+    so that ruff lints the whole worktree instead of the hardcoded
+    ["core", "tests"] paths that don't exist in generated projects."""
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    from core.adapter import ProjectCommand
+
+    captured_adapters: list = []
+    captured_validators: list = []
+
+    def _spy_make_hook(handle, adapter_factory, validator):
+        # Materialise an adapter by calling the factory with a dummy path
+        from pathlib import Path
+        captured_adapters.append(adapter_factory(Path("/tmp")))
+        captured_validators.append(validator)
+        # Return a hook that immediately says ok=True so pipeline completes
+        report = _ok_validation_report()
+        return MagicMock(return_value=report)
+
+    send, _captured = _make_progress_capture()
+    tier_store.set_active(1, "ECONOMY")
+
+    with (
+        patch("core.real_task_handler.make_sandbox_hook", side_effect=_spy_make_hook),
+        patch.object(sandbox, "commit_in_worktree", return_value="sha123"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=happy_agents,
+            task_id_factory=lambda: "task-lint-dot-001",
+        )
+        handler("write a sum function", _msg(chat_id=1))
+        _wait_until_idle(runner)
+
+    assert captured_adapters, "adapter_factory was never called"
+    adapter = captured_adapters[0]
+    assert "lint" in adapter.commands, "adapter must have a 'lint' command"
+    lint_cmd = adapter.commands["lint"]
+    assert isinstance(lint_cmd, ProjectCommand)
+    # Must target "." — NOT ["core", "tests"]
+    assert "." in lint_cmd.cmd, f"lint cmd must include '.', got: {lint_cmd.cmd}"
+    assert sys.executable in lint_cmd.cmd, "lint cmd must use sys.executable"
+
+
+def test_runtime_validator_run_tests_is_false(runner, sandbox, tier_store):
+    """RuntimeValidator must be built with run_tests=False because tester
+    output is not written to the worktree — only writer output is."""
+    from unittest.mock import MagicMock, patch
+
+    from core.runtime_validator import RuntimeValidator
+
+    captured_validators: list = []
+
+    def _spy_make_hook(handle, adapter_factory, validator):
+        captured_validators.append(validator)
+        report = _ok_validation_report()
+        return MagicMock(return_value=report)
+
+    send, _captured = _make_progress_capture()
+    tier_store.set_active(2, "ECONOMY")
+
+    with (
+        patch("core.real_task_handler.make_sandbox_hook", side_effect=_spy_make_hook),
+        patch.object(sandbox, "commit_in_worktree", return_value="sha456"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=happy_agents,
+            task_id_factory=lambda: "task-no-tests-001",
+        )
+        handler("write a sum function", _msg(chat_id=2))
+        _wait_until_idle(runner)
+
+    assert captured_validators, "make_sandbox_hook was never called"
+    validator = captured_validators[0]
+    assert isinstance(validator, RuntimeValidator)
+    assert validator._run_tests is False, (
+        "run_tests must be False — tester files are not in the worktree"
+    )
+    assert validator._run_lint is True, "run_lint must remain True"
