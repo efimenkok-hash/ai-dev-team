@@ -52,6 +52,7 @@ from core.fsm import (
     can_transition,
     is_terminal,
 )
+from core.json_extractor import extract_json_object
 from core.memory import PipelineMemory, Snapshot
 from core.observability import Observability
 
@@ -183,13 +184,8 @@ def _is_empty(payload: str | None) -> bool:
 
 
 def _parse_json_object(payload: str) -> dict | None:
-    try:
-        result = json.loads(payload)
-    except (TypeError, ValueError):
-        return None
-    if isinstance(result, dict):
-        return result
-    return None
+    """Thin wrapper — delegates to the robust extractor in core.json_extractor."""
+    return extract_json_object(payload)
 
 
 class Orchestrator:

@@ -46,7 +46,13 @@ from core.orchestrator import AgentRegistry
 # System prompts — static role/rules blocks from core/agents.py
 # ---------------------------------------------------------------------------
 
-_PLANNING_SYSTEM = """\
+_JSON_CRITICAL = (
+    "CRITICAL: Output ONLY a JSON object. No markdown fences, no prose, no preamble, "
+    "no explanation. The very first character of your response MUST be {. "
+    "The very last character MUST be }.\n\n"
+)
+
+_PLANNING_SYSTEM = _JSON_CRITICAL + """\
 AGENT: PLANNING_AGENT
 VERSION: 1.0
 
@@ -70,7 +76,7 @@ VERSION: 1.0
 }\
 """
 
-_PM_SYSTEM = """\
+_PM_SYSTEM = _JSON_CRITICAL + """\
 AGENT: PM_AGENT
 VERSION: 2.0
 
@@ -152,7 +158,7 @@ RECEIVE → DECOMPOSE → VALIDATE → EMIT
 - вывод содержит только JSON объект\
 """
 
-_ARCHITECT_SYSTEM = """\
+_ARCHITECT_SYSTEM = _JSON_CRITICAL + """\
 AGENT: ARCHITECT_AGENT
 VERSION: 1.2
 
@@ -251,7 +257,7 @@ VERSION: 1.2
 13. Если задача звучит обобщённо, проектируй минимальную безопасную архитектуру, а не домысливай продукт.\
 """
 
-_WRITER_SYSTEM = """\
+_WRITER_SYSTEM = _JSON_CRITICAL + """\
 AGENT: WRITER_AGENT
 VERSION: 2.0
 
@@ -316,7 +322,7 @@ arch_plan: dict — JSON от architect_agent
 6. Код пишется один раз — без итераций с самим собой. Валидация — до вывода.\
 """
 
-_REVIEWER_SYSTEM = """\
+_REVIEWER_SYSTEM = _JSON_CRITICAL + """\
 AGENT: REVIEWER_AGENT
 VERSION: 1.0
 
@@ -383,7 +389,7 @@ arch_plan: dict
 7. Если writer_output пустой или не парсится → verdict=REJECTED.\
 """
 
-_TESTER_SYSTEM = """\
+_TESTER_SYSTEM = _JSON_CRITICAL + """\
 AGENT: TESTER_AGENT
 VERSION: 1.1
 
@@ -429,7 +435,7 @@ BLOCKED: writer_output не парсится
 4. fixture только если один и тот же объект нужен в 3+ тестах одного модуля.\
 """
 
-_QA_SYSTEM = """\
+_QA_SYSTEM = _JSON_CRITICAL + """\
 AGENT: QA_AGENT
 VERSION: 1.1
 
@@ -476,7 +482,7 @@ VERSION: 1.1
 6. Если любой вход пустой или не парсится → verdict=FAIL.\
 """
 
-_FIXER_SYSTEM = """\
+_FIXER_SYSTEM = _JSON_CRITICAL + """\
 AGENT: FIXER_AGENT
 VERSION: 1.1
 
