@@ -183,6 +183,58 @@ def test_hook_returns_fail_report_unchanged(tmp_path):
     assert result.ok is False
 
 
+def test_hook_blocks_deleted_public_defs_for_additive_task(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "example.py").write_text(
+        "def add(a: int, b: int) -> int:\n    return a + b\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_example.py").write_text(
+        "def test_add() -> None:\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    writer = json.dumps({
+        "files": [
+            {
+                "path": "src/example.py",
+                "content": "def square(x: int) -> int:\n    return x * x\n",
+            },
+            {
+                "path": "tests/test_example.py",
+                "content": (
+                    "from src.example import square\n\n\n"
+                    "def test_square() -> None:\n    assert square(3) == 9\n"
+                ),
+            },
+        ]
+    })
+
+    class _Snap:
+        pass
+
+    snap = _Snap()
+    snap.artifacts = {
+        "planning": json.dumps({"original_task": "добавь функцию square"}),
+        "writer": writer,
+    }
+
+    handle = _make_handle(tmp_path)
+    mock_validator = MagicMock(spec=RuntimeValidator)
+    mock_validator.validate.return_value = _ok_report()
+
+    hook = make_sandbox_hook(handle, _adapter_factory, mock_validator, autofix=False)
+    report = hook("task-preservation", snap)
+
+    assert report.ok is False
+    guard = report.checks[-1]
+    assert guard.name == "preservation_guard"
+    assert guard.summary == "deleted_public_defs:2"
+    assert "src/example.py:add" in guard.raw_output
+    assert "tests/test_example.py:test_add" in guard.raw_output
+
+
 def test_hook_validator_called_exactly_once(tmp_path):
     handle = _make_handle(tmp_path)
     mock_validator = MagicMock(spec=RuntimeValidator)
