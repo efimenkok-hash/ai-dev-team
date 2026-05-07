@@ -72,14 +72,16 @@ def _build_send_callable(application, loop):
     """
 
     def _send(out: OutgoingMessage) -> None:
-        future = asyncio.run_coroutine_threadsafe(
-            application.bot.send_message(
-                chat_id=out.chat_id,
-                text=out.text,
-                reply_to_message_id=out.reply_to_message_id,
-            ),
-            loop,
+        coro = application.bot.send_message(
+            chat_id=out.chat_id,
+            text=out.text,
+            reply_to_message_id=out.reply_to_message_id,
         )
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception:
+            coro.close()
+            raise
         # Block until the async send completes; surface errors to the bridge.
         future.result(timeout=30)
 
@@ -106,16 +108,15 @@ def _build_send_progress_callable(application, loop):
             logger.error("send_progress send_message failed: %s", exc)
 
     def _send_progress(chat_id: int, text: str) -> None:
+        coro = application.bot.send_message(chat_id=chat_id, text=text)
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                application.bot.send_message(chat_id=chat_id, text=text),
-                loop,
-            )
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
             future.add_done_callback(_on_send_done)
             # NB: не вызываем future.result() — это сериализовало бы worker
             # на сетевом I/O, превращая 16 событий × 30с в 8-минутный затык
             # под rate-limit'ом Telegram. Ошибки логируются в callback.
         except Exception:
+            coro.close()
             logger.exception(
                 "send_progress submission failed for chat_id=%s; worker continues",
                 chat_id,

@@ -10,7 +10,10 @@ import asyncio
 import contextlib
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 # Make sure the project root is importable (mirrors what the script does).
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,10 +29,19 @@ import scripts.run_telegram_bot as script  # noqa: E402
 
 def _make_app_and_loop():
     """Return a (mock_application, real_event_loop) pair."""
-    mock_app = MagicMock()
-    mock_app.bot = MagicMock()
+    mock_app = SimpleNamespace(bot=SimpleNamespace())
     loop = asyncio.new_event_loop()
     return mock_app, loop
+
+
+def _close_coro_and_return(fake_future):
+    """Mock side-effect for run_coroutine_threadsafe that avoids leaked coroutines."""
+
+    def _submit(coro, _loop):
+        coro.close()
+        return fake_future
+
+    return _submit
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +83,7 @@ def test_send_progress_schedules_run_coroutine_threadsafe():
 
         with patch(
             "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
-            return_value=fake_future,
+            side_effect=_close_coro_and_return(fake_future),
         ) as mock_rctf:
             app.bot.send_message = AsyncMock(return_value=None)
             fn(chat_id=42, text="hello progress")
@@ -93,30 +105,19 @@ def test_send_progress_passes_chat_id_and_text_to_send_message():
     app, loop = _make_app_and_loop()
     try:
         fn = script._build_send_progress_callable(app, loop)
+        fake_future = MagicMock()
+        app.bot.send_message = AsyncMock(return_value=None)
 
-        sent: list = []
-
-        async def _fake_send_message(chat_id, text):
-            sent.append((chat_id, text))
-
-        app.bot.send_message = _fake_send_message
-
-        # Run via a real loop so the coroutine is actually awaited
-        def _run_fn():
+        with patch(
+            "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+            side_effect=_close_coro_and_return(fake_future),
+        ):
             fn(chat_id=99, text="progress update")
 
-        # Schedule fn in a thread while the loop runs briefly
-        import threading
-
-        loop.call_soon_threadsafe(loop.stop)  # stop after one iteration
-        t = threading.Thread(target=_run_fn, daemon=True)
-        loop.run_forever()  # starts loop
-        t.start()
-        t.join(timeout=2)
-
-        # The coroutine was submitted; verify args captured via direct mock check
-        # (integration-level check: bot.send_message was called)
-        assert app.bot.send_message is _fake_send_message
+        app.bot.send_message.assert_called_once_with(
+            chat_id=99,
+            text="progress update",
+        )
     finally:
         loop.close()
 
@@ -131,13 +132,15 @@ def test_send_progress_swallows_run_coroutine_threadsafe_exception():
     app, loop = _make_app_and_loop()
     try:
         fn = script._build_send_progress_callable(app, loop)
+        fake_coro = MagicMock()
+        app.bot.send_message = MagicMock(return_value=fake_coro)
 
         with patch(
             "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
             side_effect=RuntimeError("loop closed"),
         ):
-            app.bot.send_message = AsyncMock(return_value=None)
             fn(chat_id=7, text="another silent fail")
+        fake_coro.close.assert_called_once_with()
     finally:
         loop.close()
 
@@ -158,7 +161,7 @@ def test_send_progress_done_callback_logs_send_message_error(caplog):
         with (
             patch(
                 "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
-                return_value=fake_future,
+                side_effect=_close_coro_and_return(fake_future),
             ),
             caplog.at_level(logging.ERROR, logger="ai_dev_team.bot"),
         ):
@@ -193,7 +196,7 @@ def test_send_progress_done_callback_silent_on_success(caplog):
         with (
             patch(
                 "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
-                return_value=fake_future,
+                side_effect=_close_coro_and_return(fake_future),
             ),
             caplog.at_level(logging.ERROR, logger="ai_dev_team.bot"),
         ):
@@ -225,7 +228,7 @@ def test_send_progress_does_not_block_worker_on_slow_telegram():
 
         with patch(
             "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
-            return_value=fake_future,
+            side_effect=_close_coro_and_return(fake_future),
         ):
             app.bot.send_message = AsyncMock(return_value=None)
             start = time.monotonic()
@@ -265,7 +268,7 @@ def test_build_send_callable_schedules_run_coroutine_threadsafe():
 
         with patch(
             "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
-            return_value=fake_future,
+            side_effect=_close_coro_and_return(fake_future),
         ) as mock_rctf:
             app.bot.send_message = AsyncMock(return_value=None)
             out = OutgoingMessage(chat_id=1, text="hi", reply_to_message_id=None)
@@ -275,6 +278,29 @@ def test_build_send_callable_schedules_run_coroutine_threadsafe():
         _, loop_arg = mock_rctf.call_args.args
         assert loop_arg is loop
         fake_future.result.assert_called_once_with(timeout=30)
+    finally:
+        loop.close()
+
+
+def test_build_send_callable_closes_coro_when_submission_fails():
+    from core.telegram_bridge import OutgoingMessage
+
+    app, loop = _make_app_and_loop()
+    try:
+        fn = script._build_send_callable(app, loop)
+        fake_coro = MagicMock()
+        app.bot.send_message = MagicMock(return_value=fake_coro)
+
+        with (
+            patch(
+                "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+                side_effect=RuntimeError("loop closed"),
+            ),
+            pytest.raises(RuntimeError, match="loop closed"),
+        ):
+            fn(OutgoingMessage(chat_id=1, text="hi", reply_to_message_id=None))
+
+        fake_coro.close.assert_called_once_with()
     finally:
         loop.close()
 
@@ -311,18 +337,17 @@ def test_main_wires_send_progress_callable_into_build_bridge(tmp_path):
         raise SystemExit(0)  # stop main() early
 
     # Build a minimal fake telegram.ext module so the lazy import succeeds.
-    mock_app = MagicMock()
-    mock_app.bot = MagicMock()
-    mock_app.initialize = AsyncMock(return_value=None)
-    mock_app.start = AsyncMock(return_value=None)
-    mock_app.stop = AsyncMock(return_value=None)
-    mock_app.shutdown = AsyncMock(return_value=None)
+    mock_app = SimpleNamespace(bot=SimpleNamespace())
 
-    mock_ab = MagicMock()
-    mock_ab.return_value.token.return_value.build.return_value = mock_app
+    class _Builder:
+        def token(self, _token):
+            return self
+
+        def build(self):
+            return mock_app
 
     fake_telegram_ext = types.ModuleType("telegram.ext")
-    fake_telegram_ext.ApplicationBuilder = mock_ab
+    fake_telegram_ext.ApplicationBuilder = _Builder
     fake_telegram_ext.MessageHandler = MagicMock()
     fake_telegram_ext.filters = MagicMock()
 
