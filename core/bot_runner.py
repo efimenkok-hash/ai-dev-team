@@ -35,6 +35,7 @@ CONTRACTS:
 """
 
 import os
+import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,7 @@ from core.model_tier import default_registry as default_tier_registry
 from core.observability import JsonLinesSink, Observability
 from core.real_task_handler import RealTaskHandlerConfig, make_real_task_handler
 from core.sandbox_workspace import SandboxConfig, SandboxWorkspace
+from core.state_db import StateDB
 from core.task_history import TaskHistory
 from core.telegram_bridge import (
     BridgeReply,
@@ -63,7 +65,11 @@ from core.telegram_bridge import (
     TaskHandler,
     TelegramBridge,
 )
-from core.tier_session import TierSessionStore, format_tier_summary
+from core.tier_session import (
+    TierSessionStore,
+    format_tier_summary,
+    migrate_legacy_tier_sessions_json,
+)
 from core.vision_client import VisionClient
 from core.whisper_client import WhisperClient
 
@@ -132,7 +138,11 @@ def build_vision_client(env: Mapping[str, str]) -> VisionClient | None:
     return VisionClient(api_key=key.strip())
 
 
-def build_dispatcher_from_env(env: Mapping[str, str]) -> LLMDispatcher | None:
+def build_dispatcher_from_env(
+    env: Mapping[str, str],
+    *,
+    observability: Observability | None = None,
+) -> LLMDispatcher | None:
     """Return LLMDispatcher if OPENROUTER_API_KEY is set in env, else None.
 
     Raises ValueError for non-Mapping env (same contract as get_required_env).
@@ -143,7 +153,7 @@ def build_dispatcher_from_env(env: Mapping[str, str]) -> LLMDispatcher | None:
     key = env.get("OPENROUTER_API_KEY")
     if not isinstance(key, str) or not key.strip():
         return None
-    return LLMDispatcher(api_key=key.strip())
+    return LLMDispatcher(api_key=key.strip(), observability=observability)
 
 
 def cleanup_orphan_worktrees_from_env(env: Mapping[str, str]) -> int:
@@ -213,6 +223,28 @@ def _build_observability(env: Mapping[str, str]) -> Observability | None:
         return None
 
 
+def _resolve_state_db_path(env: Mapping[str, str]) -> Path:
+    """Resolve SQLite persistence path with legacy-dir fallback."""
+    if not isinstance(env, Mapping):
+        raise ValueError("env_must_be_mapping")
+    raw = env.get("STATE_DB_PATH", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    legacy_dir = env.get("BOT_STATE_DIR", "").strip()
+    if legacy_dir:
+        return (Path(legacy_dir) / "state.db").expanduser()
+    return Path("~/.ai-dev-team/state.db").expanduser()
+
+
+def _resolve_legacy_tier_sessions_path(env: Mapping[str, str]) -> Path | None:
+    if not isinstance(env, Mapping):
+        raise ValueError("env_must_be_mapping")
+    legacy_dir = env.get("BOT_STATE_DIR", "").strip()
+    if not legacy_dir:
+        return None
+    return (Path(legacy_dir) / "tier_sessions.json").expanduser()
+
+
 def _real_pipeline_eligible(env: Mapping[str, str]) -> bool:
     """True iff `build_real_task_handler_from_env` would return a real handler.
 
@@ -268,7 +300,8 @@ def build_real_task_handler_from_env(
     if not callable(send_progress):
         raise ValueError("send_progress_not_callable")
 
-    dispatcher = build_dispatcher_from_env(env)
+    obs = _build_observability(env)
+    dispatcher = build_dispatcher_from_env(env, observability=obs)
     if dispatcher is None:
         return None
 
@@ -278,7 +311,6 @@ def build_real_task_handler_from_env(
 
     _runner_owned = runner is None
     _runner = runner if runner is not None else BackgroundTaskRunner()
-    obs = _build_observability(env)
     try:
         factory = build_dispatcher_agent_registry_factory(dispatcher)
         return make_real_task_handler(
@@ -367,10 +399,94 @@ def make_switch_handler() -> CommandHandler:
 
 
 class _BudgetState:
-    """In-memory budget store. Replaced by persistent storage in 7b."""
+    """Budget store with optional per-chat StateDB persistence.
 
-    def __init__(self, initial_usd: float) -> None:
-        self.budget_usd = float(initial_usd)
+    Without chat_id context, the store falls back to a process-local default.
+    This keeps legacy tests and non-Telegram contexts working while the real
+    bridge can persist per-chat overrides via IncomingMessage.chat_id.
+    """
+
+    def __init__(
+        self,
+        initial_usd: float,
+        *,
+        state_db: StateDB | None = None,
+    ) -> None:
+        if (
+            isinstance(initial_usd, bool)
+            or not isinstance(initial_usd, (int, float))
+            or initial_usd < 0
+        ):
+            raise ValueError("invalid_initial_budget")
+        if state_db is not None and not isinstance(state_db, StateDB):
+            raise ValueError("invalid_state_db")
+        self._lock = threading.Lock()
+        self._default_budget_usd = float(initial_usd)
+        self._state_db = state_db
+        self._by_chat: dict[int, float] = {}
+
+    @property
+    def budget_usd(self) -> float:
+        with self._lock:
+            return self._default_budget_usd
+
+    @budget_usd.setter
+    def budget_usd(self, value: float) -> None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or value < 0
+        ):
+            raise ValueError("invalid_budget")
+        with self._lock:
+            self._default_budget_usd = float(value)
+
+    @property
+    def state_db(self) -> StateDB | None:
+        return self._state_db
+
+    def get_budget(self, chat_id: int | None = None) -> float:
+        if chat_id is None:
+            return self.budget_usd
+        self._validate_chat_id(chat_id)
+        with self._lock:
+            cached = self._by_chat.get(chat_id)
+            if cached is not None:
+                return cached
+        if self._state_db is not None:
+            stored = self._state_db.get_budget(chat_id)
+            if stored is not None:
+                with self._lock:
+                    self._by_chat[chat_id] = float(stored)
+                return float(stored)
+        return self.budget_usd
+
+    def set_budget(self, usd: float, *, chat_id: int | None = None) -> float:
+        if (
+            isinstance(usd, bool)
+            or not isinstance(usd, (int, float))
+            or usd < 0
+        ):
+            raise ValueError("invalid_budget")
+        amount = float(usd)
+        if chat_id is None:
+            self.budget_usd = amount
+            return amount
+        self._validate_chat_id(chat_id)
+        with self._lock:
+            self._by_chat[chat_id] = amount
+        if self._state_db is not None:
+            self._state_db.set_budget(chat_id, amount)
+        return amount
+
+    @staticmethod
+    def _validate_chat_id(chat_id: int) -> None:
+        if (
+            isinstance(chat_id, bool)
+            or not isinstance(chat_id, int)
+            or chat_id <= 0
+        ):
+            raise ValueError(f"invalid_chat_id:{chat_id!r}")
 
 
 def make_budget_handler(state: _BudgetState) -> CommandHandler:
@@ -378,6 +494,12 @@ def make_budget_handler(state: _BudgetState) -> CommandHandler:
         raise ValueError("invalid_budget_state")
 
     def _handle(cmd: BotCommand, _ctx: Any) -> str:
+        chat_id = getattr(_ctx, "chat_id", None)
+        scoped_chat_id = (
+            chat_id
+            if isinstance(chat_id, int) and not isinstance(chat_id, bool) and chat_id > 0
+            else None
+        )
         try:
             new_value = parse_budget_amount(cmd.args)
         except ValueError as exc:
@@ -390,15 +512,15 @@ def make_budget_handler(state: _BudgetState) -> CommandHandler:
             return (
                 f"💰 Текущий бюджет\n"
                 f"\n"
-                f"▸ ${state.budget_usd:.2f}\n"
+                f"▸ ${state.get_budget(scoped_chat_id):.2f}\n"
                 f"\n"
                 f"Чтобы изменить:  /budget <сумма>"
             )
-        state.budget_usd = float(new_value)
+        updated = state.set_budget(float(new_value), chat_id=scoped_chat_id)
         return (
             f"✅ Бюджет обновлён\n"
             f"\n"
-            f"▸ ${state.budget_usd:.2f}"
+            f"▸ ${updated:.2f}"
         )
 
     return _handle
@@ -884,6 +1006,7 @@ def build_command_registry(
     *,
     initial_budget_usd: float = 10.0,
     active_project: str = "ai-dev-team",
+    state_db: StateDB | None = None,
     tier_store: TierSessionStore | None = None,
     sandbox: SandboxWorkspace | None = None,
     task_history: TaskHistory | None = None,
@@ -907,15 +1030,24 @@ def build_command_registry(
     """
     if not isinstance(personas, PersonaRegistry):
         raise ValueError("invalid_personas")
-    if not isinstance(initial_budget_usd, (int, float)) or initial_budget_usd < 0:
+    if (
+        isinstance(initial_budget_usd, bool)
+        or not isinstance(initial_budget_usd, (int, float))
+        or initial_budget_usd < 0
+    ):
         raise ValueError("invalid_initial_budget")
+    if state_db is not None and not isinstance(state_db, StateDB):
+        raise ValueError("invalid_state_db")
     if tier_store is None:
         tier_store = TierSessionStore(default_tier_registry())
     elif not isinstance(tier_store, TierSessionStore):
         raise ValueError("invalid_tier_store")
 
     reg = CommandRegistry()
-    budget_state = _BudgetState(initial_usd=initial_budget_usd)
+    budget_state = _BudgetState(
+        initial_usd=initial_budget_usd,
+        state_db=state_db,
+    )
 
     # Register in enum order so /help output is consistent.
     reg.register(CommandName.PROJECTS, make_projects_handler(active_project))
@@ -1015,22 +1147,28 @@ def build_bridge_from_env(
     gate = build_confirmation_gate(env)
     whisper = build_whisper_client(env)
     vision = build_vision_client(env)
-
-    # Persistent state (Step 19): if BOT_STATE_DIR is set, tier-session
-    # store survives bot restarts. Otherwise we fall back to in-memory only.
-    bot_state_dir_raw = env.get("BOT_STATE_DIR", "").strip()
-    tier_persistence_path: Path | None = None
-    if bot_state_dir_raw:
-        tier_persistence_path = Path(bot_state_dir_raw) / "tier_sessions.json"
+    tier_registry = default_tier_registry()
+    state_db = StateDB(_resolve_state_db_path(env))
+    legacy_tier_path = _resolve_legacy_tier_sessions_path(env)
+    if legacy_tier_path is not None:
+        migrate_legacy_tier_sessions_json(
+            tier_registry,
+            persistence_path=legacy_tier_path,
+            state_db=state_db,
+        )
     tier_store = TierSessionStore(
-        default_tier_registry(),
-        persistence_path=tier_persistence_path,
+        tier_registry,
+        state_db=state_db,
     )
 
     # Build sandbox once so it can be shared between the task handler
     # (acquire/release worktrees) and the /push command handler (push_branch_from_main).
     sandbox = _try_build_sandbox(env)
-    task_history = TaskHistory() if sandbox is not None else None
+    task_history = (
+        TaskHistory(state_db=state_db)
+        if sandbox is not None
+        else None
+    )
 
     # Build a BackgroundTaskRunner ONLY when the real pipeline is eligible.
     # In simple-stub mode there is nothing to cancel, so spawning an idle
@@ -1042,6 +1180,7 @@ def build_bridge_from_env(
 
     commands = build_command_registry(
         personas,
+        state_db=state_db,
         tier_store=tier_store,
         sandbox=sandbox,
         task_history=task_history,

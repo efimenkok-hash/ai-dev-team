@@ -222,6 +222,41 @@ def test_runtime_validator_failure_synthesizes_for_fixer_items():
         assert item["severity"] == "error"
 
 
+def test_runtime_validator_preservation_failure_includes_restore_guidance():
+    report = ValidationReport(
+        ok=False,
+        strategy=ValidationStrategy.INPLACE,
+        checks=(
+            CheckResult(
+                name="preservation_guard",
+                ok=False,
+                summary="deleted_public_defs:1",
+                raw_output=(
+                    "src/example.py:add\n\n"
+                    "REFERENCE_FILE src/example.py\n---\n"
+                    "def add(a: int, b: int) -> int:\n"
+                    "    return a + b\n---"
+                ),
+                duration_ms=1,
+            ),
+        ),
+        duration_ms=1,
+    )
+
+    payload = Orchestrator._build_runtime_review_payload(
+        report,
+        "preservation_guard:deleted_public_defs:1",
+    )
+    parsed = json.loads(payload)
+
+    assert parsed["verdict"] == "REJECTED"
+    item = parsed["for_fixer"][0]
+    assert item["issue"] == "preservation_guard:deleted_public_defs:1"
+    assert item["repair_mode"] == "preservation_restore"
+    assert "REFERENCE_FILE src/example.py" in item["raw_excerpt"]
+    assert "baseline" in item["instruction"]
+
+
 # ---------------------------------------------------------------------------
 # failure path: hook ok=False repeatedly -> FAIL on loop exhaustion
 # ---------------------------------------------------------------------------

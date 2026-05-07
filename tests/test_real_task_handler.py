@@ -740,6 +740,44 @@ def test_observability_injected_succeeds(runner, sandbox, tier_store):
     _wait_until_idle(runner)
 
 
+def test_cost_budget_exceeded_surfaces_in_real_handler(
+    runner, sandbox, tier_store,
+):
+    tier_store.set_active(42, "STANDARD")
+    send, captured = _make_progress_capture()
+    obs = Observability()
+
+    class _RegistryWithEstimator(dict):
+        pass
+
+    def _factory(_tier):
+        registry = _RegistryWithEstimator(happy_agents(_tier))
+        registry.cost_estimator = lambda _agent, _args, _output: (10, 5, 0.01)
+        return registry
+
+    handler = make_real_task_handler(
+        runner=runner,
+        sandbox=sandbox,
+        tier_store=tier_store,
+        send_progress=send,
+        observability=obs,
+        agent_registry_factory=_factory,
+        config=RealTaskHandlerConfig(cost_budget_usd=0.005),
+        task_id_factory=lambda: "task-budget-001",
+    )
+
+    handler("hi", _msg(chat_id=42))
+    _wait_until_idle(runner)
+    _wait_for_count(
+        captured,
+        lambda c: any("cost_budget_exceeded" in t for _, t in c),
+    )
+
+    final_msgs = [t for _, t in captured if "Не получилось" in t]
+    assert final_msgs
+    assert any("cost_budget_exceeded" in t for t in final_msgs)
+
+
 # ---------------------------------------------------------------------------
 # 14b-9: commit_in_worktree wired on SUCCESS / not called on FAIL
 # ---------------------------------------------------------------------------

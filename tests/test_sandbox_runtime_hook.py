@@ -233,6 +233,210 @@ def test_hook_blocks_deleted_public_defs_for_additive_task(tmp_path):
     assert guard.summary == "deleted_public_defs:2"
     assert "src/example.py:add" in guard.raw_output
     assert "tests/test_example.py:test_add" in guard.raw_output
+    assert "REFERENCE_FILE src/example.py" in guard.raw_output
+    assert "def add(a: int, b: int) -> int:" in guard.raw_output
+
+
+def test_hook_blocks_modified_public_defs_for_additive_task(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_example.py").write_text(
+        (
+            "from src.example import add\n\n\n"
+            "def test_add_negative() -> None:\n"
+            "    assert add(-1, -1) == -2\n"
+        ),
+        encoding="utf-8",
+    )
+
+    writer = json.dumps({
+        "files": [
+            {
+                "path": "tests/test_example.py",
+                "content": (
+                    "from src.example import add, square\n\n\n"
+                    "def test_square() -> None:\n"
+                    "    assert square(3) == 9\n\n\n"
+                    "def test_add_negative() -> None:\n"
+                    "    assert add(-1, 1) == 0\n"
+                ),
+            },
+        ]
+    })
+
+    class _Snap:
+        pass
+
+    snap = _Snap()
+    snap.artifacts = {
+        "planning": json.dumps({"original_task": "добавь функцию square"}),
+        "writer": writer,
+    }
+
+    handle = _make_handle(tmp_path)
+    mock_validator = MagicMock(spec=RuntimeValidator)
+    mock_validator.validate.return_value = _ok_report()
+
+    hook = make_sandbox_hook(handle, _adapter_factory, mock_validator, autofix=False)
+    report = hook("task-preservation-modified-def", snap)
+
+    assert report.ok is False
+    summaries = [check.summary for check in report.checks]
+    assert "modified_public_defs:1" in summaries
+    guard = next(
+        check
+        for check in report.checks
+        if check.summary == "modified_public_defs:1"
+    )
+    assert "tests/test_example.py:test_add_negative" in guard.raw_output
+
+
+def test_hook_blocks_modified_module_docstring_for_additive_task(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "example.py").write_text(
+        (
+            "\"\"\"Простая функция — стартовая точка для тренировки команды.\"\"\"\n\n\n"
+            "def add(a: int, b: int) -> int:\n"
+            "    return a + b\n"
+        ),
+        encoding="utf-8",
+    )
+
+    writer = json.dumps({
+        "files": [
+            {
+                "path": "src/example.py",
+                "content": (
+                    "def square(x: int) -> int:\n"
+                    "    return x * x\n\n\n"
+                    "def add(a: int, b: int) -> int:\n"
+                    "    return a + b\n"
+                ),
+            },
+        ]
+    })
+
+    class _Snap:
+        pass
+
+    snap = _Snap()
+    snap.artifacts = {
+        "planning": json.dumps({"original_task": "добавь функцию square"}),
+        "writer": writer,
+    }
+
+    handle = _make_handle(tmp_path)
+    mock_validator = MagicMock(spec=RuntimeValidator)
+    mock_validator.validate.return_value = _ok_report()
+
+    hook = make_sandbox_hook(handle, _adapter_factory, mock_validator, autofix=False)
+    report = hook("task-preservation-docstring", snap)
+
+    assert report.ok is False
+    summaries = [check.summary for check in report.checks]
+    assert "modified_module_docstrings:1" in summaries
+    guard = next(
+        check
+        for check in report.checks
+        if check.summary == "modified_module_docstrings:1"
+    )
+    assert "src/example.py:module_docstring" in guard.raw_output
+
+
+def test_hook_uses_raw_task_for_additive_detection(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "example.py").write_text(
+        (
+            "def add(a: int, b: int) -> int:\n"
+            "    return a + b\n"
+        ),
+        encoding="utf-8",
+    )
+
+    writer = json.dumps({
+        "files": [
+            {
+                "path": "src/example.py",
+                "content": (
+                    "def square(x: int) -> int:\n"
+                    "    return x * x\n"
+                ),
+            },
+        ]
+    })
+
+    class _Snap:
+        pass
+
+    snap = _Snap()
+    snap.raw_task = "Добавь функцию square(x: int) -> int в src/example.py"
+    snap.artifacts = {
+        "planning": json.dumps({"normalized_task": "implement requested function"}),
+        "writer": writer,
+    }
+
+    handle = _make_handle(tmp_path)
+    mock_validator = MagicMock(spec=RuntimeValidator)
+    mock_validator.validate.return_value = _ok_report()
+
+    hook = make_sandbox_hook(handle, _adapter_factory, mock_validator, autofix=False)
+    report = hook("task-preservation-raw-task", snap)
+
+    assert report.ok is False
+    summaries = [check.summary for check in report.checks]
+    assert "deleted_public_defs:1" in summaries
+    guard = next(
+        check
+        for check in report.checks
+        if check.summary == "deleted_public_defs:1"
+    )
+    assert "src/example.py:add" in guard.raw_output
+
+
+def test_hook_preserves_original_baseline_across_repeated_invocations(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "example.py").write_text(
+        (
+            "\"\"\"Original docstring.\"\"\"\n\n\n"
+            "def add(a: int, b: int) -> int:\n"
+            "    return a + b\n"
+        ),
+        encoding="utf-8",
+    )
+
+    writer = json.dumps({
+        "files": [
+            {
+                "path": "src/example.py",
+                "content": (
+                    "\"\"\"Module docstring.\"\"\"\n\n\n"
+                    "def square(x: int) -> int:\n"
+                    "    return x * x\n"
+                ),
+            },
+        ]
+    })
+
+    class _Snap:
+        pass
+
+    snap = _Snap()
+    snap.raw_task = "Добавь функцию square(x: int) -> int в src/example.py"
+    snap.artifacts = {"writer": writer}
+
+    handle = _make_handle(tmp_path)
+    mock_validator = MagicMock(spec=RuntimeValidator)
+    mock_validator.validate.return_value = _ok_report()
+
+    hook = make_sandbox_hook(handle, _adapter_factory, mock_validator, autofix=False)
+
+    first_report = hook("task-preservation-repeat-1", snap)
+    second_report = hook("task-preservation-repeat-2", snap)
+
+    for report in (first_report, second_report):
+        assert report.ok is False
+        summaries = [check.summary for check in report.checks]
+        assert "deleted_public_defs:1" in summaries
+        assert "modified_module_docstrings:1" in summaries
 
 
 def test_hook_validator_called_exactly_once(tmp_path):

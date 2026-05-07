@@ -39,7 +39,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from core.llm_dispatcher import LLMDispatcher, LLMRequest
-from core.model_tier import TierConfig
+from core.model_tier import REQUIRED_ROLES, TierConfig
 from core.orchestrator import AgentRegistry
 
 # ---------------------------------------------------------------------------
@@ -614,6 +614,28 @@ VERSION: 1.2
 5. Если ruff'овский raw_excerpt пуст или сжат до "[truncated]" — всё равно
    просканируй ВСЕ файлы writer'а на типичные lint-проблемы из списка выше.
 
+## ОБРАБОТКА PRESERVATION_GUARD (CRITICAL)
+Если issue начинается с "preservation_guard:" или repair_mode ==
+"preservation_restore", это значит: задача additive, а текущий код удалил
+или изменил существующий публичный код, тесты или module docstring.
+
+Алгоритм для preservation_guard:
+1. В raw_excerpt сначала идут строки вида `<path>:<symbol>` или
+   `<path>:module_docstring` — это список того, что обязательно восстановить.
+2. Ниже могут быть блоки:
+   `REFERENCE_FILE <path>`
+   `---`
+   `<точное исходное содержимое файла>`
+   `---`
+3. Для каждого затронутого path используй REFERENCE_FILE как ИСТОЧНИК ИСТИНЫ.
+   Сначала восстанови исходный файл из REFERENCE_FILE, потом поверх него
+   аккуратно добавь требуемое additive-изменение из задачи.
+4. Нельзя заменять восстановленные тесты на `pass`, `...`, TODO, заглушки или
+   упрощённые проверки. Если REFERENCE_FILE содержит docstring — сохрани его
+   дословно.
+5. Нельзя удалять существующие public defs/tests ради того, чтобы добавить
+   новую функцию. Итог должен содержать и старый код, и новое additive-изменение.
+
 ## OUTPUT FORMAT
 Верни только валидный JSON объект в точно таком же формате как writer_agent:
 
@@ -648,6 +670,24 @@ BLOCKED: <конкретная причина>
 # ---------------------------------------------------------------------------
 # Validated frozen config
 # ---------------------------------------------------------------------------
+
+
+class DispatcherAgentRegistry(dict[str, Callable[..., str]]):
+    """Registry dict with an attached runtime cost estimator.
+
+    The orchestrator expects a plain dict[str, AgentFn], but the production
+    path can opportunistically read `registry.cost_estimator` before wrapping
+    the registry with progress events.
+    """
+
+    def __init__(
+        self,
+        *args,
+        cost_estimator: Callable[[str, tuple, str], tuple[int, int, float]] | None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.cost_estimator = cost_estimator
 
 
 @dataclass(frozen=True)
@@ -690,6 +730,51 @@ def build_dispatcher_agent_registry_factory(
             )
 
         d = config.dispatcher
+        response_usage: dict[str, tuple[tuple, str, int, int, float]] = {}
+
+        per_call_estimate = tier.estimated_cost_usd / float(len(REQUIRED_ROLES))
+
+        def _estimate_cost_for_response(
+            prompt_tokens: int,
+            completion_tokens: int,
+            attempts_count: int,
+        ) -> float:
+            total_tokens = prompt_tokens + completion_tokens
+            token_multiplier = max(1.0, total_tokens / 1000.0)
+            attempt_multiplier = max(1, attempts_count)
+            return per_call_estimate * token_multiplier * attempt_multiplier
+
+        def _cache_response(
+            agent_role: str,
+            args: tuple,
+            response_text: str,
+            prompt_tokens: int,
+            completion_tokens: int,
+            attempts_count: int,
+        ) -> None:
+            response_usage[agent_role] = (
+                tuple(args),
+                response_text,
+                int(prompt_tokens),
+                int(completion_tokens),
+                _estimate_cost_for_response(
+                    prompt_tokens,
+                    completion_tokens,
+                    attempts_count,
+                ),
+            )
+
+        def _make_cost_estimator() -> Callable[[str, tuple, str], tuple[int, int, float]]:
+            def _estimator(agent_name: str, args: tuple, output: str) -> tuple[int, int, float]:
+                cached = response_usage.get(agent_name)
+                if cached is None:
+                    return 0, 0, 0.0
+                cached_args, cached_output, in_tokens, out_tokens, cost_usd = cached
+                if cached_args != tuple(args) or cached_output != output:
+                    return 0, 0, 0.0
+                return in_tokens, out_tokens, cost_usd
+
+            return _estimator
 
         def planning_agent(task: str) -> str:
             req = LLMRequest(
@@ -699,7 +784,16 @@ def build_dispatcher_agent_registry_factory(
                     {"role": "user", "content": task},
                 ),
             )
-            return d.dispatch(req, tier).text
+            response = d.dispatch(req, tier)
+            _cache_response(
+                "planning_agent",
+                (task,),
+                response.text,
+                response.prompt_tokens,
+                response.completion_tokens,
+                len(response.attempts),
+            )
+            return response.text
 
         def pm_agent(task: str) -> str:
             req = LLMRequest(
@@ -709,7 +803,16 @@ def build_dispatcher_agent_registry_factory(
                     {"role": "user", "content": task},
                 ),
             )
-            return d.dispatch(req, tier).text
+            response = d.dispatch(req, tier)
+            _cache_response(
+                "pm_agent",
+                (task,),
+                response.text,
+                response.prompt_tokens,
+                response.completion_tokens,
+                len(response.attempts),
+            )
+            return response.text
 
         def architect_agent(spec: str) -> str:
             req = LLMRequest(
@@ -719,7 +822,16 @@ def build_dispatcher_agent_registry_factory(
                     {"role": "user", "content": spec},
                 ),
             )
-            return d.dispatch(req, tier).text
+            response = d.dispatch(req, tier)
+            _cache_response(
+                "architect_agent",
+                (spec,),
+                response.text,
+                response.prompt_tokens,
+                response.completion_tokens,
+                len(response.attempts),
+            )
+            return response.text
 
         def writer_agent(architecture: str) -> str:
             req = LLMRequest(
@@ -729,7 +841,16 @@ def build_dispatcher_agent_registry_factory(
                     {"role": "user", "content": architecture},
                 ),
             )
-            return d.dispatch(req, tier).text
+            response = d.dispatch(req, tier)
+            _cache_response(
+                "writer_agent",
+                (architecture,),
+                response.text,
+                response.prompt_tokens,
+                response.completion_tokens,
+                len(response.attempts),
+            )
+            return response.text
 
         def reviewer_agent(writer_output: str, arch_plan: str) -> str:
             user_content = (
@@ -742,7 +863,16 @@ def build_dispatcher_agent_registry_factory(
                     {"role": "user", "content": user_content},
                 ),
             )
-            return d.dispatch(req, tier).text
+            response = d.dispatch(req, tier)
+            _cache_response(
+                "reviewer_agent",
+                (writer_output, arch_plan),
+                response.text,
+                response.prompt_tokens,
+                response.completion_tokens,
+                len(response.attempts),
+            )
+            return response.text
 
         def tester_agent(writer_output: str, arch_plan: str) -> str:
             user_content = (
@@ -755,7 +885,16 @@ def build_dispatcher_agent_registry_factory(
                     {"role": "user", "content": user_content},
                 ),
             )
-            return d.dispatch(req, tier).text
+            response = d.dispatch(req, tier)
+            _cache_response(
+                "tester_agent",
+                (writer_output, arch_plan),
+                response.text,
+                response.prompt_tokens,
+                response.completion_tokens,
+                len(response.attempts),
+            )
+            return response.text
 
         def qa_agent(
             pm_plan: str,
@@ -819,7 +958,16 @@ def build_dispatcher_agent_registry_factory(
                     {"role": "user", "content": user_content},
                 ),
             )
-            return d.dispatch(req, tier).text
+            response = d.dispatch(req, tier)
+            _cache_response(
+                "qa_agent",
+                (pm_plan, arch_plan, writer_output, review, test_output),
+                response.text,
+                response.prompt_tokens,
+                response.completion_tokens,
+                len(response.attempts),
+            )
+            return response.text
 
         def fixer_agent(
             writer_output: str,
@@ -838,17 +986,29 @@ def build_dispatcher_agent_registry_factory(
                     {"role": "user", "content": user_content},
                 ),
             )
-            return d.dispatch(req, tier).text
+            response = d.dispatch(req, tier)
+            _cache_response(
+                "fixer_agent",
+                (writer_output, for_fixer, arch_plan),
+                response.text,
+                response.prompt_tokens,
+                response.completion_tokens,
+                len(response.attempts),
+            )
+            return response.text
 
-        return {
-            "planning_agent": planning_agent,
-            "pm_agent": pm_agent,
-            "architect_agent": architect_agent,
-            "writer_agent": writer_agent,
-            "reviewer_agent": reviewer_agent,
-            "tester_agent": tester_agent,
-            "qa_agent": qa_agent,
-            "fixer_agent": fixer_agent,
-        }
+        return DispatcherAgentRegistry(
+            {
+                "planning_agent": planning_agent,
+                "pm_agent": pm_agent,
+                "architect_agent": architect_agent,
+                "writer_agent": writer_agent,
+                "reviewer_agent": reviewer_agent,
+                "tester_agent": tester_agent,
+                "qa_agent": qa_agent,
+                "fixer_agent": fixer_agent,
+            },
+            cost_estimator=_make_cost_estimator(),
+        )
 
     return factory

@@ -7,6 +7,7 @@ TaskHistory is shared between:
   - make_real_task_handler (writes one record per on_complete)
   - make_push_handler       (reads by task_id to find the branch to push)
   - make_log_handler         (reads recent N records for display — 14c-3)
+  - StateDB-backed restarts  (optional persistence across bot restarts)
 
 CONTRACTS:
 1. TaskSummary is frozen; all string fields are non-empty on construction
@@ -22,6 +23,9 @@ CONTRACTS:
    may still lurk in the deque until it is naturally evicted.  get()
    always returns the most recent record via the dict, so the dict is the
    source of truth.
+6. When state_db is provided, every record() is mirrored into SQLite and
+   the persisted history is trimmed to maxlen so restart semantics match
+   the in-memory ring buffer.
 """
 
 from __future__ import annotations
@@ -29,6 +33,10 @@ from __future__ import annotations
 import threading
 from collections import deque
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.state_db import StateDB
 
 _DEFAULT_MAXLEN = 50
 
@@ -87,21 +95,58 @@ class TaskHistory:
         last_ten = history.recent(10)           # list, newest last
     """
 
-    def __init__(self, maxlen: int = _DEFAULT_MAXLEN) -> None:
+    def __init__(
+        self,
+        maxlen: int = _DEFAULT_MAXLEN,
+        *,
+        state_db: StateDB | None = None,
+    ) -> None:
         if (
             isinstance(maxlen, bool)
             or not isinstance(maxlen, int)
             or maxlen <= 0
         ):
             raise ValueError(f"invalid_maxlen:{maxlen!r}")
+        if state_db is not None:
+            from core.state_db import StateDB as _StateDB
+
+            if not isinstance(state_db, _StateDB):
+                raise ValueError(
+                    f"state_db_must_be_state_db_or_none:{type(state_db).__name__}"
+                )
         self._maxlen = maxlen
         self._deque: deque[TaskSummary] = deque(maxlen=maxlen)
         self._by_id: dict[str, TaskSummary] = {}
         self._lock = threading.Lock()
+        self._state_db = state_db
+        if self._state_db is not None:
+            self._load_from_state_db()
 
     @property
     def maxlen(self) -> int:
         return self._maxlen
+
+    @property
+    def state_db(self) -> StateDB | None:
+        return self._state_db
+
+    def _load_from_state_db(self) -> None:
+        if self._state_db is None:
+            return
+        persisted = self._state_db.recent_tasks(self._maxlen)
+        with self._lock:
+            self._deque.clear()
+            self._by_id.clear()
+            for summary in persisted:
+                self._append_locked(summary)
+
+    def _append_locked(self, summary: TaskSummary) -> None:
+        if len(self._deque) == self._maxlen:
+            evicted = self._deque[0]
+            if self._by_id.get(evicted.task_id) is evicted:
+                del self._by_id[evicted.task_id]
+        self._deque.append(summary)
+        self._by_id[summary.task_id] = summary
 
     def record(self, summary: TaskSummary) -> None:
         """Append summary to history. Thread-safe.
@@ -114,12 +159,10 @@ class TaskHistory:
         if not isinstance(summary, TaskSummary):
             raise ValueError(f"invalid_summary_type:{type(summary).__name__}")
         with self._lock:
-            if len(self._deque) == self._maxlen:
-                evicted = self._deque[0]
-                if self._by_id.get(evicted.task_id) is evicted:
-                    del self._by_id[evicted.task_id]
-            self._deque.append(summary)
-            self._by_id[summary.task_id] = summary
+            if self._state_db is not None:
+                self._state_db.record_task(summary)
+                self._state_db.trim_task_history(self._maxlen)
+            self._append_locked(summary)
 
     def get(self, task_id: str) -> TaskSummary | None:
         """Return the most recent summary for task_id, or None. Thread-safe."""

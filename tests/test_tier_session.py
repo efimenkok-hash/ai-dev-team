@@ -11,10 +11,12 @@ from core.model_tier import (
     TierRegistry,
     default_registry,
 )
+from core.state_db import StateDB
 from core.tier_session import (
     TierSession,
     TierSessionStore,
     format_tier_summary,
+    migrate_legacy_tier_sessions_json,
 )
 
 # ---------------------------------------------------------------------------
@@ -79,6 +81,21 @@ def test_store_construction_happy_path():
 def test_store_rejects_non_registry():
     with pytest.raises(ValueError, match="invalid_registry_type"):
         TierSessionStore("not a registry")  # type: ignore[arg-type]
+
+
+def test_store_rejects_non_state_db():
+    with pytest.raises(ValueError, match="state_db_must_be_state_db_or_none"):
+        TierSessionStore(default_registry(), state_db="bad")  # type: ignore[arg-type]
+
+
+def test_store_rejects_mixing_json_and_state_db(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    with pytest.raises(ValueError, match="cannot_mix_persistence_path_and_state_db"):
+        TierSessionStore(
+            default_registry(),
+            persistence_path=tmp_path / "tier_sessions.json",
+            state_db=db,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -486,3 +503,121 @@ def test_persistence_io_errors_swallowed_after_construction(tmp_path):
         state_file.parent.chmod(0o755)
         state_file.chmod(0o644)
         _ = _os  # silence ruff unused-import in CI (noop)
+
+
+# ---------------------------------------------------------------------------
+# SQLite-backed persistence
+# ---------------------------------------------------------------------------
+
+
+def test_state_db_round_trip(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    a = TierSessionStore(default_registry(), state_db=db)
+    a.set_active(1, "ECONOMY")
+    a.set_active(2, "STANDARD")
+
+    b = TierSessionStore(default_registry(), state_db=db)
+    assert b.active_tier_name(1) == "ECONOMY"
+    assert b.active_tier_name(2) == "STANDARD"
+
+
+def test_state_db_loads_existing_rows_into_snapshot(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    db.set_tier(7, "STANDARD", last_changed_at=7.0)
+    db.set_tier(3, "ECONOMY", last_changed_at=3.0)
+
+    store = TierSessionStore(default_registry(), state_db=db)
+    snap = store.snapshot()
+
+    assert tuple(s.chat_id for s in snap) == (3, 7)
+    assert snap[0].active_tier == "ECONOMY"
+    assert snap[1].active_tier == "STANDARD"
+
+
+def test_state_db_reset_persists(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    store = TierSessionStore(default_registry(), state_db=db)
+    store.set_active(1, "PREMIUM")
+    store.reset(1)
+
+    restarted = TierSessionStore(default_registry(), state_db=db)
+    assert restarted.active_tier_name(1) is None
+
+
+def test_state_db_unknown_tier_dropped_on_load(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    db.set_tier(1, "PREMIUM", last_changed_at=1.0)
+    db.set_tier(2, "GHOST_TIER", last_changed_at=2.0)
+
+    store = TierSessionStore(default_registry(), state_db=db)
+    assert store.active_tier_name(1) == "PREMIUM"
+    assert store.active_tier_name(2) is None
+
+
+def test_migrate_legacy_tier_sessions_json_imports_and_deletes_file(tmp_path):
+    import json
+
+    legacy = tmp_path / "tier_sessions.json"
+    legacy.write_text(json.dumps({
+        "schema_version": 1,
+        "sessions": [
+            {"chat_id": 1, "active_tier": "ECONOMY", "last_changed_at": 11.0},
+            {"chat_id": 2, "active_tier": "PREMIUM", "last_changed_at": 22.0},
+        ],
+    }), encoding="utf-8")
+    db = StateDB(tmp_path / "state.db")
+
+    imported = migrate_legacy_tier_sessions_json(
+        default_registry(),
+        persistence_path=legacy,
+        state_db=db,
+    )
+
+    assert imported == 2
+    assert db.get_tier(1) == "ECONOMY"
+    assert db.get_tier(2) == "PREMIUM"
+    assert not legacy.exists()
+
+
+def test_migrate_legacy_tier_sessions_json_keeps_corrupt_file(tmp_path):
+    legacy = tmp_path / "tier_sessions.json"
+    legacy.write_text("{not-json", encoding="utf-8")
+    db = StateDB(tmp_path / "state.db")
+
+    imported = migrate_legacy_tier_sessions_json(
+        default_registry(),
+        persistence_path=legacy,
+        state_db=db,
+    )
+
+    assert imported == 0
+    assert legacy.exists()
+    assert db.list_tiers() == ()
+
+
+def test_migrate_legacy_tier_sessions_json_does_not_overwrite_existing_rows(tmp_path):
+    import json
+
+    legacy = tmp_path / "tier_sessions.json"
+    legacy.write_text(json.dumps({
+        "schema_version": 1,
+        "sessions": [
+            {"chat_id": 1, "active_tier": "ECONOMY", "last_changed_at": 11.0},
+            {"chat_id": 2, "active_tier": "STANDARD", "last_changed_at": 22.0},
+            {"chat_id": 3, "active_tier": "GHOST_TIER", "last_changed_at": 33.0},
+        ],
+    }), encoding="utf-8")
+    db = StateDB(tmp_path / "state.db")
+    db.set_tier(1, "PREMIUM", last_changed_at=5.0)
+
+    imported = migrate_legacy_tier_sessions_json(
+        default_registry(),
+        persistence_path=legacy,
+        state_db=db,
+    )
+
+    assert imported == 1
+    assert db.get_tier(1) == "PREMIUM"
+    assert db.get_tier(2) == "STANDARD"
+    assert db.get_tier(3) is None
+    assert not legacy.exists()

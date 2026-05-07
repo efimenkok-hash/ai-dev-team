@@ -5,6 +5,7 @@ import time
 
 import pytest
 
+from core.state_db import StateDB
 from core.task_history import TaskHistory, TaskSummary
 
 # ---------------------------------------------------------------------------
@@ -113,15 +114,43 @@ def test_task_history_custom_maxlen():
     assert h.maxlen == 10
 
 
+def test_task_history_state_db_defaults_to_none():
+    h = TaskHistory()
+    assert h.state_db is None
+
+
+def test_task_history_accepts_state_db(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    h = TaskHistory(state_db=db)
+    assert h.state_db is db
+
+
 @pytest.mark.parametrize("bad", [0, -1, True, "5", 1.5])
 def test_task_history_rejects_invalid_maxlen(bad):
     with pytest.raises(ValueError, match="invalid_maxlen"):
         TaskHistory(maxlen=bad)  # type: ignore[arg-type]
 
 
+def test_task_history_rejects_non_state_db():
+    with pytest.raises(ValueError, match="state_db_must_be_state_db_or_none"):
+        TaskHistory(state_db="bad")  # type: ignore[arg-type]
+
+
 def test_task_history_starts_empty():
     h = TaskHistory()
     assert len(h) == 0
+
+
+def test_task_history_loads_recent_entries_from_state_db(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    db.record_task(_summary(task_id="task-1", finished_at=1.0))
+    db.record_task(_summary(task_id="task-2", finished_at=2.0))
+
+    h = TaskHistory(state_db=db)
+
+    assert len(h) == 2
+    assert h.get("task-1") is not None
+    assert [item.task_id for item in h.recent(5)] == ["task-1", "task-2"]
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +192,16 @@ def test_record_rejects_non_summary():
     h = TaskHistory()
     with pytest.raises(ValueError, match="invalid_summary_type"):
         h.record("not a summary")  # type: ignore[arg-type]
+
+
+def test_record_persists_to_state_db(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    h = TaskHistory(state_db=db)
+    summary = _summary(task_id="task-db")
+
+    h.record(summary)
+
+    assert db.get_task("task-db") == summary
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +246,37 @@ def test_newer_record_same_id_not_evicted_from_dict():
     result = h.get("t-0")
     assert result is new
     assert result.final_state == "SUCCESS"
+
+
+def test_state_db_history_trims_to_maxlen(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    h = TaskHistory(maxlen=2, state_db=db)
+
+    h.record(_summary(task_id="task-0", finished_at=1.0))
+    h.record(_summary(task_id="task-1", finished_at=2.0))
+    h.record(_summary(task_id="task-2", finished_at=3.0))
+
+    assert [item.task_id for item in db.recent_tasks(10)] == ["task-1", "task-2"]
+    assert db.get_task("task-0") is None
+
+
+def test_state_db_restart_round_trip_preserves_newest_duplicate(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    h = TaskHistory(maxlen=3, state_db=db)
+    h.record(_summary(task_id="task-0", final_state="FAIL", finished_at=1.0))
+    h.record(_summary(task_id="task-1", finished_at=2.0))
+    h.record(_summary(task_id="task-0", final_state="SUCCESS", finished_at=3.0))
+
+    restarted = TaskHistory(maxlen=3, state_db=db)
+
+    result = restarted.get("task-0")
+    assert result is not None
+    assert result.final_state == "SUCCESS"
+    assert [item.task_id for item in restarted.recent(5)] == [
+        "task-0",
+        "task-1",
+        "task-0",
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -492,6 +492,54 @@ class TestFixerAgent:
             registry["fixer_agent"]("code", "fix", "arch")
 
 
+class TestDispatcherCostEstimator:
+    def test_registry_exposes_cost_estimator(self):
+        _, registry, _ = _patched_registry()
+        assert callable(getattr(registry, "cost_estimator", None))
+
+    def test_cost_estimator_returns_tokens_and_cost_for_last_response(self):
+        d = _make_dispatcher()
+        tier = _make_tier()
+        response = LLMResponse(
+            text="fix-result",
+            model_used="model-x",
+            prompt_tokens=120,
+            completion_tokens=30,
+            attempts=(
+                LLMAttempt(model="model-a", ok=False, reason="timeout", duration_ms=1),
+                LLMAttempt(model="model-x", ok=True, reason="ok", duration_ms=2),
+            ),
+        )
+        factory = build_dispatcher_agent_registry_factory(d)
+        registry = factory(tier)
+        d.dispatch = MagicMock(return_value=response)  # type: ignore[method-assign]
+
+        output = registry["fixer_agent"]("code", "for_fixer", "arch")
+        estimator = registry.cost_estimator
+
+        in_tokens, out_tokens, cost_usd = estimator(
+            "fixer_agent",
+            ("code", "for_fixer", "arch"),
+            output,
+        )
+
+        assert in_tokens == 120
+        assert out_tokens == 30
+        assert cost_usd > 0.0
+
+    def test_cost_estimator_returns_zero_for_mismatched_call(self):
+        _, registry, _ = _patched_registry("writer-result")
+        registry["writer_agent"]("arch-data")
+
+        in_tokens, out_tokens, cost_usd = registry.cost_estimator(
+            "writer_agent",
+            ("different-arch",),
+            "writer-result",
+        )
+
+        assert (in_tokens, out_tokens, cost_usd) == (0, 0, 0.0)
+
+
 # ---------------------------------------------------------------------------
 # Cross-cutting: all agents use correct tier + messages format
 # ---------------------------------------------------------------------------

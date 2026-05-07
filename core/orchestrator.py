@@ -548,14 +548,22 @@ class Orchestrator:
                 name = getattr(check, "name", "<unknown>")
                 check_summary = getattr(check, "summary", "")
                 raw_output = getattr(check, "raw_output", "") or ""
-                items.append(
-                    {
-                        "file": "<runtime>",
-                        "issue": f"{name}:{check_summary}",
-                        "severity": "error",
-                        "raw_excerpt": raw_output[:1000],
-                    }
-                )
+                raw_excerpt_limit = 8000 if name == "preservation_guard" else 1000
+                item = {
+                    "file": "<runtime>",
+                    "issue": f"{name}:{check_summary}",
+                    "severity": "error",
+                    "raw_excerpt": raw_output[:raw_excerpt_limit],
+                }
+                if name == "preservation_guard":
+                    item["repair_mode"] = "preservation_restore"
+                    item["instruction"] = (
+                        "Use REFERENCE_FILE blocks in raw_excerpt as the exact "
+                        "baseline. Restore every listed public definition, test, "
+                        "and module docstring, then merge the requested additive "
+                        "change without replacing preserved code."
+                    )
+                items.append(item)
             except Exception:
                 continue
         if not items:

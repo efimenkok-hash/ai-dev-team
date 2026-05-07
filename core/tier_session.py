@@ -31,6 +31,7 @@ CONTRACTS:
    durability. A corrupt JSON file at startup is silently dropped.
 """
 
+import contextlib
 import json
 import os
 import threading
@@ -39,6 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from core.model_tier import TierRegistry
+from core.state_db import StateDB
 
 _PERSISTENCE_SCHEMA_VERSION = 1
 
@@ -83,6 +85,7 @@ class TierSessionStore:
         registry: TierRegistry,
         *,
         persistence_path: Path | None = None,
+        state_db: StateDB | None = None,
     ) -> None:
         if not isinstance(registry, TierRegistry):
             raise ValueError(
@@ -93,11 +96,20 @@ class TierSessionStore:
                 f"persistence_path_must_be_path_or_none:"
                 f"{type(persistence_path).__name__}"
             )
+        if state_db is not None and not isinstance(state_db, StateDB):
+            raise ValueError(
+                f"state_db_must_be_state_db_or_none:{type(state_db).__name__}"
+            )
+        if persistence_path is not None and state_db is not None:
+            raise ValueError("cannot_mix_persistence_path_and_state_db")
         self._registry = registry
         self._lock = threading.Lock()
         self._by_chat: dict[int, TierSession] = {}
         self._persistence_path = persistence_path
-        if persistence_path is not None:
+        self._state_db = state_db
+        if state_db is not None:
+            self._load_from_state_db()
+        elif persistence_path is not None:
             self._load_from_disk()
 
     @property
@@ -107,6 +119,10 @@ class TierSessionStore:
     @property
     def persistence_path(self) -> Path | None:
         return self._persistence_path
+
+    @property
+    def state_db(self) -> StateDB | None:
+        return self._state_db
 
     # -------------------------------------------------------------------
     # Persistence helpers (atomic, error-swallowing).
@@ -185,6 +201,24 @@ class TierSessionStore:
                 except (ValueError, TypeError):
                     continue
 
+    def _load_from_state_db(self) -> None:
+        if self._state_db is None:
+            return
+        with self._lock:
+            for chat_id, tier_name, last_changed_at in self._state_db.list_tiers():
+                try:
+                    self._registry.get(tier_name)
+                except (KeyError, TypeError):
+                    continue
+                try:
+                    self._by_chat[chat_id] = TierSession(
+                        chat_id=chat_id,
+                        active_tier=tier_name,
+                        last_changed_at=last_changed_at,
+                    )
+                except (ValueError, TypeError):
+                    continue
+
     def get_or_create(self, chat_id: int) -> TierSession:
         if (
             isinstance(chat_id, bool)
@@ -219,7 +253,14 @@ class TierSessionStore:
                 last_changed_at=time.time(),
             )
             self._by_chat[chat_id] = session
-            self._save_to_disk_locked()
+            if self._state_db is not None:
+                self._state_db.set_tier(
+                    chat_id,
+                    normalised,
+                    last_changed_at=session.last_changed_at,
+                )
+            else:
+                self._save_to_disk_locked()
             return session
 
     def reset(self, chat_id: int) -> None:
@@ -232,7 +273,10 @@ class TierSessionStore:
             raise ValueError(f"invalid_chat_id:{chat_id!r}")
         with self._lock:
             self._by_chat.pop(chat_id, None)
-            self._save_to_disk_locked()
+            if self._state_db is not None:
+                self._state_db.reset_tier(chat_id)
+            else:
+                self._save_to_disk_locked()
 
     def needs_choice(self, chat_id: int) -> bool:
         """True if no tier has been picked for this chat yet."""
@@ -255,6 +299,83 @@ class TierSessionStore:
     def __contains__(self, chat_id: object) -> bool:
         with self._lock:
             return chat_id in self._by_chat
+
+
+def migrate_legacy_tier_sessions_json(
+    registry: TierRegistry,
+    *,
+    persistence_path: Path,
+    state_db: StateDB,
+) -> int:
+    """Import legacy tier_sessions.json into StateDB, then delete the file.
+
+    Best-effort semantics mirror the old JSON loader:
+      - missing / corrupt / wrong-schema file -> no-op, file kept
+      - invalid rows / unknown tiers -> skipped
+      - existing StateDB rows win over legacy JSON rows
+      - on successful parse, the legacy file is deleted best-effort
+    """
+    if not isinstance(registry, TierRegistry):
+        raise ValueError(
+            f"invalid_registry_type:{type(registry).__name__}"
+        )
+    if not isinstance(persistence_path, Path):
+        raise ValueError(
+            "persistence_path_must_be_path"
+        )
+    if not isinstance(state_db, StateDB):
+        raise ValueError(
+            f"state_db_must_be_state_db:{type(state_db).__name__}"
+        )
+    if not persistence_path.exists() or not persistence_path.is_file():
+        return 0
+    try:
+        raw = persistence_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if (
+        not isinstance(data, dict)
+        or data.get("schema_version") != _PERSISTENCE_SCHEMA_VERSION
+    ):
+        return 0
+    sessions = data.get("sessions")
+    if not isinstance(sessions, list):
+        return 0
+
+    imported = 0
+    for entry in sessions:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            chat_id = int(entry["chat_id"])
+            active_tier = entry["active_tier"]
+            last_changed_at = float(entry["last_changed_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if active_tier is None:
+            continue
+        try:
+            registry.get(active_tier)
+            session = TierSession(
+                chat_id=chat_id,
+                active_tier=active_tier,
+                last_changed_at=last_changed_at,
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if state_db.get_tier(session.chat_id) is not None:
+            continue
+        state_db.set_tier(
+            session.chat_id,
+            session.active_tier,
+            last_changed_at=session.last_changed_at,
+        )
+        imported += 1
+
+    with contextlib.suppress(OSError):
+        os.remove(persistence_path)
+    return imported
 
 
 def format_tier_summary(

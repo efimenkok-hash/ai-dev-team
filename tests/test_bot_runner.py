@@ -37,6 +37,7 @@ from core.bot_runner import (
 )
 from core.confirmation_gate import ConfirmationGate
 from core.model_tier import default_registry as default_tier_registry
+from core.state_db import StateDB
 from core.task_history import TaskHistory
 from core.telegram_bridge import (
     BridgeReply,
@@ -518,6 +519,19 @@ def test_build_whisper_client_with_key():
     assert isinstance(c, WhisperClient)
 
 
+def test_build_dispatcher_from_env_wires_observability():
+    from core.observability import Observability
+
+    obs = Observability()
+    dispatcher = build_dispatcher_from_env(
+        {"OPENROUTER_API_KEY": "sk-test"},
+        observability=obs,
+    )
+
+    assert dispatcher is not None
+    assert dispatcher._obs is obs
+
+
 def test_build_whisper_client_without_key_returns_none():
     assert build_whisper_client({}) is None
 
@@ -624,6 +638,37 @@ def test_budget_handler_invalid_amount():
 def test_budget_handler_rejects_non_state():
     with pytest.raises(ValueError, match="invalid_budget_state"):
         make_budget_handler("not a state")  # type: ignore[arg-type]
+
+
+def test_budget_state_rejects_invalid_state_db():
+    with pytest.raises(ValueError, match="invalid_state_db"):
+        _BudgetState(initial_usd=10.0, state_db="bad")  # type: ignore[arg-type]
+
+
+def test_budget_handler_scopes_budget_per_chat_in_memory():
+    state = _BudgetState(initial_usd=10.0)
+    handler = make_budget_handler(state)
+    chat_1 = IncomingMessage(chat_id=101, user_id=101, message_id=1, text="/budget")
+    chat_2 = IncomingMessage(chat_id=202, user_id=202, message_id=2, text="/budget")
+
+    handler(parse_command("/budget 25.5"), chat_1)
+
+    assert state.get_budget(101) == 25.5
+    assert "$25.50" in handler(parse_command("/budget"), chat_1)
+    assert "$10.00" in handler(parse_command("/budget"), chat_2)
+
+
+def test_budget_handler_persists_budget_to_state_db(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    state = _BudgetState(initial_usd=10.0, state_db=db)
+    handler = make_budget_handler(state)
+    msg = IncomingMessage(chat_id=303, user_id=303, message_id=1, text="/budget")
+
+    handler(parse_command("/budget 77"), msg)
+
+    assert db.get_budget(303) == pytest.approx(77.0)
+    restarted = _BudgetState(initial_usd=10.0, state_db=db)
+    assert restarted.get_budget(303) == pytest.approx(77.0)
 
 
 def test_agents_handler_lists_all_eight():
@@ -984,6 +1029,12 @@ def test_build_command_registry_rejects_negative_budget():
         build_command_registry(personas, initial_budget_usd=-1.0)
 
 
+def test_build_command_registry_rejects_invalid_state_db():
+    personas = default_registry()
+    with pytest.raises(ValueError, match="invalid_state_db"):
+        build_command_registry(personas, state_db="bad")  # type: ignore[arg-type]
+
+
 def test_build_command_registry_accepts_explicit_tier_store():
     personas = default_registry()
     store = TierSessionStore(default_tier_registry())
@@ -998,6 +1049,17 @@ def test_build_command_registry_rejects_invalid_tier_store():
     personas = default_registry()
     with pytest.raises(ValueError, match="invalid_tier_store"):
         build_command_registry(personas, tier_store="not a store")  # type: ignore[arg-type]
+
+
+def test_build_command_registry_wires_budget_state_db(tmp_path):
+    personas = default_registry()
+    db = StateDB(tmp_path / "state.db")
+    reg = build_command_registry(personas, state_db=db)
+    msg = IncomingMessage(chat_id=404, user_id=404, message_id=1, text="/budget 12.5")
+
+    reg.dispatch(parse_command("/budget 12.5"), ctx=msg)
+
+    assert db.get_budget(404) == pytest.approx(12.5)
 
 
 def test_build_command_registry_dispatches_each_command():
@@ -1077,20 +1139,29 @@ def _captured_send():
     return _send, captured
 
 
-def test_build_bridge_from_env_minimal():
-    env = {"TELEGRAM_OWNER_CHAT_ID": "12345"}
+def _bridge_env(tmp_path, **overrides):
+    env = {
+        "TELEGRAM_OWNER_CHAT_ID": "12345",
+        "STATE_DB_PATH": str(tmp_path / "state.db"),
+    }
+    env.update(overrides)
+    return env
+
+
+def test_build_bridge_from_env_minimal(tmp_path):
+    env = _bridge_env(tmp_path)
     send, _ = _captured_send()
     bridge = build_bridge_from_env(env, send_callable=send)
     assert isinstance(bridge, TelegramBridge)
 
 
-def test_build_bridge_from_env_with_all_keys():
-    env = {
-        "TELEGRAM_OWNER_CHAT_ID": "12345",
-        "OPENAI_API_KEY": "sk-test",
-        "OPENROUTER_API_KEY": "sk-or-test",
-        "BOT_COST_THRESHOLD_USD": "2.5",
-    }
+def test_build_bridge_from_env_with_all_keys(tmp_path):
+    env = _bridge_env(
+        tmp_path,
+        OPENAI_API_KEY="sk-test",
+        OPENROUTER_API_KEY="sk-or-test",
+        BOT_COST_THRESHOLD_USD="2.5",
+    )
     send, _ = _captured_send()
     bridge = build_bridge_from_env(env, send_callable=send)
     assert isinstance(bridge, TelegramBridge)
@@ -1114,9 +1185,9 @@ def test_build_bridge_from_env_requires_callable_send():
         build_bridge_from_env(env, send_callable="not callable")
 
 
-def test_build_bridge_from_env_end_to_end_flow():
+def test_build_bridge_from_env_end_to_end_flow(tmp_path):
     """Smoke: a full message flow through the assembled bridge."""
-    env = {"TELEGRAM_OWNER_CHAT_ID": "777"}
+    env = _bridge_env(tmp_path, TELEGRAM_OWNER_CHAT_ID="777")
     send, captured = _captured_send()
     bridge = build_bridge_from_env(env, send_callable=send)
     msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="привет")
@@ -1126,8 +1197,8 @@ def test_build_bridge_from_env_end_to_end_flow():
     assert "привет" in captured[0].text
 
 
-def test_build_bridge_from_env_command_flow():
-    env = {"TELEGRAM_OWNER_CHAT_ID": "777"}
+def test_build_bridge_from_env_command_flow(tmp_path):
+    env = _bridge_env(tmp_path, TELEGRAM_OWNER_CHAT_ID="777")
     send, captured = _captured_send()
     bridge = build_bridge_from_env(env, send_callable=send)
     msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="/help")
@@ -1137,8 +1208,8 @@ def test_build_bridge_from_env_command_flow():
     assert captured[0].text.startswith("Менеджер:")
 
 
-def test_build_bridge_from_env_intruder_denied():
-    env = {"TELEGRAM_OWNER_CHAT_ID": "777"}
+def test_build_bridge_from_env_intruder_denied(tmp_path):
+    env = _bridge_env(tmp_path, TELEGRAM_OWNER_CHAT_ID="777")
     send, captured = _captured_send()
     bridge = build_bridge_from_env(env, send_callable=send)
     msg = IncomingMessage(chat_id=999, user_id=999, message_id=1, text="привет")
@@ -1148,9 +1219,9 @@ def test_build_bridge_from_env_intruder_denied():
     assert "ограничен" in captured[0].text
 
 
-def test_build_bridge_from_env_uses_simple_handler_when_no_full_env():
+def test_build_bridge_from_env_uses_simple_handler_when_no_full_env(tmp_path):
     """Without OPENROUTER_API_KEY + REPO_PATH, falls back to simple handler."""
-    env = {"TELEGRAM_OWNER_CHAT_ID": "777"}
+    env = _bridge_env(tmp_path, TELEGRAM_OWNER_CHAT_ID="777")
     send, captured = _captured_send()
     bridge = build_bridge_from_env(env, send_callable=send)
     msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="test task")
@@ -1160,12 +1231,13 @@ def test_build_bridge_from_env_uses_simple_handler_when_no_full_env():
     assert "test task" in captured[0].text
 
 
-def test_build_bridge_from_env_uses_simple_handler_no_repo_path():
+def test_build_bridge_from_env_uses_simple_handler_no_repo_path(tmp_path):
     """OPENROUTER_API_KEY alone (no REPO_PATH) → still simple handler."""
-    env = {
-        "TELEGRAM_OWNER_CHAT_ID": "777",
-        "OPENROUTER_API_KEY": "sk-or-test",
-    }
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
     send, captured = _captured_send()
     bridge = build_bridge_from_env(env, send_callable=send)
     msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="hello task")
@@ -1181,11 +1253,12 @@ def test_build_bridge_from_env_uses_real_handler_with_full_env(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".git").mkdir()
-    env = {
-        "TELEGRAM_OWNER_CHAT_ID": "777",
-        "OPENROUTER_API_KEY": "sk-or-test",
-        "REPO_PATH": str(repo),
-    }
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+        REPO_PATH=str(repo),
+    )
     send, captured = _captured_send()
     bridge = build_bridge_from_env(
         env,
@@ -1205,11 +1278,12 @@ def test_build_bridge_from_env_accepts_send_progress_callable(tmp_path):
     repo.mkdir()
     (repo / ".git").mkdir()
     progress_log: list = []
-    env = {
-        "TELEGRAM_OWNER_CHAT_ID": "777",
-        "OPENROUTER_API_KEY": "sk-or-test",
-        "REPO_PATH": str(repo),
-    }
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+        REPO_PATH=str(repo),
+    )
     send, _ = _captured_send()
     bridge = build_bridge_from_env(
         env,
@@ -1226,19 +1300,24 @@ def test_build_bridge_from_env_requires_send_progress_when_real_pipeline(tmp_pat
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".git").mkdir()
-    env = {
-        "TELEGRAM_OWNER_CHAT_ID": "777",
-        "OPENROUTER_API_KEY": "sk-or-test",
-        "REPO_PATH": str(repo),
-    }
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+        REPO_PATH=str(repo),
+    )
     send, _ = _captured_send()
     with pytest.raises(ValueError, match="send_progress_required_for_real_pipeline"):
         build_bridge_from_env(env, send_callable=send)  # no send_progress_callable
 
 
-def test_build_bridge_from_env_no_send_progress_ok_without_real_pipeline():
+def test_build_bridge_from_env_no_send_progress_ok_without_real_pipeline(tmp_path):
     """Simple pipeline (no REPO_PATH) → send_progress_callable can be omitted."""
-    env = {"TELEGRAM_OWNER_CHAT_ID": "777", "OPENROUTER_API_KEY": "sk-or-test"}
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
     send, _ = _captured_send()
     # Must not raise — real pipeline won't activate without REPO_PATH
     bridge = build_bridge_from_env(env, send_callable=send)
@@ -1256,11 +1335,12 @@ def test_build_bridge_from_env_no_send_progress_ok_when_repo_path_invalid(tmp_pa
     not_a_repo = tmp_path / "not_a_git_repo"
     not_a_repo.mkdir()
     # Note: NO .git subdir → SandboxConfig will reject this path
-    env = {
-        "TELEGRAM_OWNER_CHAT_ID": "777",
-        "OPENROUTER_API_KEY": "sk-or-test",
-        "REPO_PATH": str(not_a_repo),
-    }
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+        REPO_PATH=str(not_a_repo),
+    )
     send, captured = _captured_send()
     # Must not raise — real pipeline cannot activate, so send_progress is optional
     bridge = build_bridge_from_env(env, send_callable=send)
@@ -1276,17 +1356,18 @@ def test_build_bridge_from_env_no_send_progress_ok_when_repo_path_missing(tmp_pa
     """REPO_PATH points at a non-existent directory → falls back to simple handler
     even with API key present. send_progress_callable not required.
     """
-    env = {
-        "TELEGRAM_OWNER_CHAT_ID": "777",
-        "OPENROUTER_API_KEY": "sk-or-test",
-        "REPO_PATH": str(tmp_path / "does_not_exist"),
-    }
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+        REPO_PATH=str(tmp_path / "does_not_exist"),
+    )
     send, _ = _captured_send()
     bridge = build_bridge_from_env(env, send_callable=send)
     assert isinstance(bridge, TelegramBridge)
 
 
-def test_build_bridge_stub_mode_does_not_spawn_runner():
+def test_build_bridge_stub_mode_does_not_spawn_runner(tmp_path):
     """Minorka #1: In simple-stub mode (no real pipeline) no BackgroundTaskRunner
     thread should be created — it would be an idle resource waste."""
     from unittest.mock import MagicMock, patch
@@ -1294,7 +1375,7 @@ def test_build_bridge_stub_mode_does_not_spawn_runner():
     from core.background_runner import BackgroundTaskRunner
 
     mock_runner_cls = MagicMock(spec=type(BackgroundTaskRunner))
-    env = {"TELEGRAM_OWNER_CHAT_ID": "777"}  # no OPENROUTER_API_KEY, no REPO_PATH
+    env = _bridge_env(tmp_path, TELEGRAM_OWNER_CHAT_ID="777")
     send, _ = _captured_send()
 
     with patch("core.bot_runner.BackgroundTaskRunner", mock_runner_cls):
@@ -1302,6 +1383,50 @@ def test_build_bridge_stub_mode_does_not_spawn_runner():
 
     mock_runner_cls.assert_not_called()
     assert isinstance(bridge, TelegramBridge)
+
+
+def test_build_bridge_from_env_persists_tier_and_budget_in_state_db(tmp_path):
+    env = _bridge_env(tmp_path, TELEGRAM_OWNER_CHAT_ID="777")
+    send, captured = _captured_send()
+    first = build_bridge_from_env(env, send_callable=send)
+
+    first.handle(IncomingMessage(chat_id=777, user_id=777, message_id=1, text="/tier set PREMIUM"))
+    first.handle(IncomingMessage(chat_id=777, user_id=777, message_id=2, text="/budget 33"))
+    captured.clear()
+
+    restarted = build_bridge_from_env(env, send_callable=send)
+    restarted.handle(IncomingMessage(chat_id=777, user_id=777, message_id=3, text="/tier"))
+    restarted.handle(IncomingMessage(chat_id=777, user_id=777, message_id=4, text="/budget"))
+
+    assert any("PREMIUM" in out.text for out in captured)
+    assert any("$33.00" in out.text for out in captured)
+
+
+def test_build_bridge_from_env_migrates_legacy_tier_sessions_json(tmp_path):
+    import json
+
+    state_dir = tmp_path / "state-dir"
+    state_dir.mkdir()
+    legacy = state_dir / "tier_sessions.json"
+    legacy.write_text(json.dumps({
+        "schema_version": 1,
+        "sessions": [
+            {"chat_id": 777, "active_tier": "ECONOMY", "last_changed_at": 123.0},
+        ],
+    }), encoding="utf-8")
+    state_db_path = state_dir / "state.db"
+    env = {
+        "TELEGRAM_OWNER_CHAT_ID": "777",
+        "BOT_STATE_DIR": str(state_dir),
+        "STATE_DB_PATH": str(state_db_path),
+    }
+    send, _ = _captured_send()
+
+    build_bridge_from_env(env, send_callable=send)
+
+    db = StateDB(state_db_path)
+    assert db.get_tier(777) == "ECONOMY"
+    assert not legacy.exists()
 
 
 # ---------------------------------------------------------------------------

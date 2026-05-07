@@ -303,6 +303,9 @@ def make_real_task_handler(
 
                 memory = memory_factory()
                 base_registry = agent_registry_factory(tier)
+                cost_estimator = getattr(base_registry, "cost_estimator", None)
+                if cost_estimator is not None and not callable(cost_estimator):
+                    raise ValueError("registry_cost_estimator_not_callable")
                 wrapped = wrap_registry_with_progress(base_registry, emitter)
 
                 # Build the runtime-validation hook: writes writer artifact into
@@ -345,6 +348,7 @@ def make_real_task_handler(
                         reject_long_task(config.max_task_chars),
                         reject_injection_markers(),
                     ),
+                    cost_estimator=cost_estimator,
                     cost_budget_usd=config.cost_budget_usd,
                     runtime_validator=runtime_hook,
                 )
