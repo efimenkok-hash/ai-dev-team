@@ -409,9 +409,6 @@ def test_trim_task_history_rejects_invalid_max_entries(tmp_path: Path, bad):
         db.trim_task_history(bad)  # type: ignore[arg-type]
 
 
-@pytest.mark.filterwarnings(
-    "ignore:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning"
-)
 def test_concurrent_task_history_reads_and_writes_do_not_crash(tmp_path: Path):
     db = _make_db(tmp_path)
     errors: list[Exception] = []

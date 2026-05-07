@@ -1402,6 +1402,55 @@ def test_build_bridge_from_env_persists_tier_and_budget_in_state_db(tmp_path):
     assert any("$33.00" in out.text for out in captured)
 
 
+def test_build_bridge_from_env_state_db_failure_falls_back_to_in_memory(tmp_path):
+    bad_db_path = tmp_path / "state-dir"
+    bad_db_path.mkdir()
+    env = {
+        "TELEGRAM_OWNER_CHAT_ID": "777",
+        "STATE_DB_PATH": str(bad_db_path),
+    }
+    send, captured = _captured_send()
+
+    first = build_bridge_from_env(env, send_callable=send)
+    first.handle(IncomingMessage(chat_id=777, user_id=777, message_id=1, text="/budget 25"))
+    captured.clear()
+
+    restarted = build_bridge_from_env(env, send_callable=send)
+    restarted.handle(IncomingMessage(chat_id=777, user_id=777, message_id=2, text="/budget"))
+
+    assert isinstance(restarted, TelegramBridge)
+    assert any("$10.00" in out.text for out in captured)
+
+
+def test_build_bridge_from_env_state_db_failure_falls_back_to_legacy_json(tmp_path):
+    import json
+
+    state_dir = tmp_path / "state-dir"
+    state_dir.mkdir()
+    bad_db_path = state_dir / "db-dir"
+    bad_db_path.mkdir()
+    legacy = state_dir / "tier_sessions.json"
+    legacy.write_text(json.dumps({
+        "schema_version": 1,
+        "sessions": [
+            {"chat_id": 777, "active_tier": "ECONOMY", "last_changed_at": 123.0},
+        ],
+    }), encoding="utf-8")
+    env = {
+        "TELEGRAM_OWNER_CHAT_ID": "777",
+        "BOT_STATE_DIR": str(state_dir),
+        "STATE_DB_PATH": str(bad_db_path),
+    }
+    send, captured = _captured_send()
+
+    bridge = build_bridge_from_env(env, send_callable=send)
+    bridge.handle(IncomingMessage(chat_id=777, user_id=777, message_id=1, text="/tier"))
+
+    assert isinstance(bridge, TelegramBridge)
+    assert any("ECONOMY" in out.text for out in captured)
+    assert legacy.exists()
+
+
 def test_build_bridge_from_env_migrates_legacy_tier_sessions_json(tmp_path):
     import json
 

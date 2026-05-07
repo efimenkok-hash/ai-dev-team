@@ -245,6 +245,19 @@ def _resolve_legacy_tier_sessions_path(env: Mapping[str, str]) -> Path | None:
     return (Path(legacy_dir) / "tier_sessions.json").expanduser()
 
 
+def _try_build_state_db(env: Mapping[str, str]) -> StateDB | None:
+    """Build StateDB from env, or return None on any persistence-path error.
+
+    This mirrors the builder style used elsewhere in this module: optional
+    infrastructure should degrade gracefully instead of preventing the bot
+    from starting at all.
+    """
+    try:
+        return StateDB(_resolve_state_db_path(env))
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def _real_pipeline_eligible(env: Mapping[str, str]) -> bool:
     """True iff `build_real_task_handler_from_env` would return a real handler.
 
@@ -1148,27 +1161,36 @@ def build_bridge_from_env(
     whisper = build_whisper_client(env)
     vision = build_vision_client(env)
     tier_registry = default_tier_registry()
-    state_db = StateDB(_resolve_state_db_path(env))
+    state_db = _try_build_state_db(env)
     legacy_tier_path = _resolve_legacy_tier_sessions_path(env)
-    if legacy_tier_path is not None:
+    if state_db is not None and legacy_tier_path is not None:
         migrate_legacy_tier_sessions_json(
             tier_registry,
             persistence_path=legacy_tier_path,
             state_db=state_db,
         )
-    tier_store = TierSessionStore(
-        tier_registry,
-        state_db=state_db,
-    )
+    if state_db is not None:
+        tier_store = TierSessionStore(
+            tier_registry,
+            state_db=state_db,
+        )
+    else:
+        tier_store = TierSessionStore(
+            tier_registry,
+            persistence_path=legacy_tier_path,
+        )
 
     # Build sandbox once so it can be shared between the task handler
     # (acquire/release worktrees) and the /push command handler (push_branch_from_main).
     sandbox = _try_build_sandbox(env)
-    task_history = (
-        TaskHistory(state_db=state_db)
-        if sandbox is not None
-        else None
-    )
+    if sandbox is not None:
+        task_history = (
+            TaskHistory(state_db=state_db)
+            if state_db is not None
+            else TaskHistory()
+        )
+    else:
+        task_history = None
 
     # Build a BackgroundTaskRunner ONLY when the real pipeline is eligible.
     # In simple-stub mode there is nothing to cancel, so spawning an idle
