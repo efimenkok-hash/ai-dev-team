@@ -1461,8 +1461,49 @@ def test_build_bridge_from_env_multiple_registry_projects_do_not_auto_select(
     msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="hello task")
     bridge.handle(msg)
     assert len(captured) == 1
-    assert "несколько проектов" in captured[0].text.lower()
+    assert "нескольких проектах" in captured[0].text.lower()
+    assert "явный проектный чат" in captured[0].text.lower()
     assert "REPO_PATH" not in captured[0].text
+
+
+def test_build_bridge_from_env_wires_project_context_resolver_for_push_gating(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo_one = _git_repo(tmp_path, "multi-push-one")
+    repo_two = _git_repo(tmp_path, "multi-push-two")
+    registry.register_project(_project_snapshot(repo_one))
+    registry.register_project(
+        _project_snapshot(
+            repo_two,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                repo_two,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
+    send, captured = _captured_send()
+
+    bridge = build_bridge_from_env(env, send_callable=send)
+
+    msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="/push task-001")
+    bridge.handle(msg)
+    assert len(captured) == 1
+    assert "явный проектный чат" in captured[0].text.lower()
 
 
 def test_build_bridge_from_env_missing_runtime_binding_falls_back_truthfully(

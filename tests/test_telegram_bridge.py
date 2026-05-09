@@ -13,6 +13,10 @@ from core.confirmation_gate import (
     ActionKind,
     ConfirmationGate,
 )
+from core.project_context import ProjectContextResolver
+from core.project_models import Project, ProjectChatBinding, ProjectPolicy
+from core.project_registry import ProjectRegistry, ProjectSnapshot
+from core.state_db import StateDB
 from core.telegram_bridge import (
     DEFAULT_DENIAL_MESSAGE,
     DEFAULT_GENERIC_ACK,
@@ -99,6 +103,7 @@ def _make_bridge(
     task_handler=None,
     gate=None,
     sender=None,
+    project_context_resolver=None,
 ):
     return TelegramBridge(
         owner_chat_ids=frozenset({OWNER_CHAT_ID}),
@@ -109,6 +114,7 @@ def _make_bridge(
         gate=gate,
         commands=commands,
         task_handler=task_handler,
+        project_context_resolver=project_context_resolver,
     )
 
 
@@ -129,6 +135,68 @@ def _msg(
         voice_bytes=voice_bytes,
         photo_bytes=photo_bytes,
     )
+
+
+def _make_db(tmp_path):
+    return StateDB(tmp_path / "state.db")
+
+
+def _project(**overrides):
+    data = {
+        "project_id": "alpha_project",
+        "slug": "alpha-project",
+        "name": "Alpha Project",
+        "description": "Primary AI Office project.",
+        "owner_user_id": OWNER_CHAT_ID,
+        "status": "active",
+    }
+    data.update(overrides)
+    return Project(**data)
+
+
+def _policy(**overrides):
+    data = {
+        "project_id": "alpha_project",
+        "allow_hiring": True,
+        "allow_agent_dm": False,
+        "require_owner_approval_for_hires": True,
+    }
+    data.update(overrides)
+    return ProjectPolicy(**data)
+
+
+def _binding(**overrides):
+    data = {
+        "project_id": "alpha_project",
+        "chat_id": -1001234567890,
+        "chat_provider": "telegram",
+    }
+    data.update(overrides)
+    return ProjectChatBinding(**data)
+
+
+def _register_project(
+    registry,
+    *,
+    with_chat_binding,
+    **overrides,
+):
+    chat_id = overrides.pop("chat_id", None)
+    project_id = str(overrides.get("project_id", "alpha_project"))
+    snapshot_data = {
+        "project": _project(**overrides),
+        "policy": _policy(project_id=project_id),
+    }
+    if with_chat_binding:
+        snapshot_data["chat_binding"] = _binding(
+            project_id=project_id,
+            **({} if chat_id is None else {"chat_id": chat_id}),
+        )
+    snapshot = ProjectSnapshot(**snapshot_data)
+    registry.register_project(snapshot)
+    loaded = registry.get_project_snapshot(snapshot.project.project_id)
+    assert loaded is not None
+    return loaded
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +247,67 @@ def test_incoming_message_rejects_non_string_text():
 def test_incoming_message_rejects_non_bytes_voice():
     with pytest.raises(ValueError, match="non_bytes_voice"):
         IncomingMessage(chat_id=1, user_id=1, message_id=1, voice_bytes="x")  # type: ignore[arg-type]
+
+
+def test_incoming_message_rejects_invalid_project_id():
+    with pytest.raises(ValueError, match="invalid_project_id"):
+        IncomingMessage(
+            chat_id=1,
+            user_id=1,
+            message_id=1,
+            text="hi",
+            project_id="bad-id",
+        )
+
+
+def test_incoming_message_rejects_invalid_project_context_source():
+    with pytest.raises(ValueError, match="invalid_project_context_source"):
+        IncomingMessage(
+            chat_id=1,
+            user_id=1,
+            message_id=1,
+            text="hi",
+            project_context_source="registry",
+        )
+
+
+def test_incoming_message_rejects_none_source_with_project_fields():
+    with pytest.raises(ValueError, match="none_project_context_forbids_project_id"):
+        IncomingMessage(
+            chat_id=1,
+            user_id=1,
+            message_id=1,
+            text="hi",
+            project_id="alpha_project",
+            project_slug="alpha-project",
+            project_context_source="none",
+            project_context_reason="project_chat_not_bound",
+        )
+
+
+def test_incoming_message_rejects_project_slug_without_project_id():
+    with pytest.raises(ValueError, match="project_slug_requires_project_id"):
+        IncomingMessage(
+            chat_id=1,
+            user_id=1,
+            message_id=1,
+            text="hi",
+            project_slug="alpha-project",
+        )
+
+
+def test_incoming_message_rejects_resolved_context_without_project_id():
+    with pytest.raises(
+        ValueError,
+        match="resolved_project_context_requires_project_id",
+    ):
+        IncomingMessage(
+            chat_id=1,
+            user_id=1,
+            message_id=1,
+            text="hi",
+            project_context_source="bound_chat",
+        )
 
 
 def test_incoming_message_is_frozen():
@@ -296,6 +425,15 @@ def test_construction_rejects_unknown_manager_role():
         )
 
 
+def test_construction_rejects_invalid_project_context_resolver():
+    with pytest.raises(ValueError, match="invalid_project_context_resolver"):
+        TelegramBridge(
+            owner_chat_ids=frozenset({1}),
+            send=CapturingSender(),
+            project_context_resolver="bad",  # type: ignore[arg-type]
+        )
+
+
 # ---------------------------------------------------------------------------
 # Whitelist enforcement
 # ---------------------------------------------------------------------------
@@ -332,6 +470,368 @@ def test_handle_accepts_owner_via_user_id():
     msg = _msg(chat_id=99, user_id=OWNER_CHAT_ID, text="hello")
     result = bridge.handle(msg)
     assert result.handled is True
+
+
+# ---------------------------------------------------------------------------
+# Project context runtime path
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_mode_task_handler_sees_no_project_context():
+    sender = CapturingSender()
+    captured = []
+
+    def handler(text, msg):
+        captured.append(
+            (
+                msg.project_id,
+                msg.project_slug,
+                msg.project_context_source,
+                msg.project_context_reason,
+            )
+        )
+        return BridgeReply(persona_role="architect_agent", body="ok")
+
+    bridge = _make_bridge(sender=sender, task_handler=handler)
+
+    bridge.handle(_msg(text="legacy task"))
+
+    assert captured == [(None, None, None, None)]
+
+
+def test_bound_project_chat_adds_project_context_to_handler_message(tmp_path):
+    sender = CapturingSender()
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    snapshot = _register_project(
+        registry,
+        with_chat_binding=True,
+        owner_user_id=OWNER_CHAT_ID,
+        chat_id=-100555000111,
+    )
+    captured = []
+
+    def handler(text, msg):
+        captured.append(
+            (
+                msg.project_id,
+                msg.project_slug,
+                msg.project_context_source,
+                msg.project_context_reason,
+            )
+        )
+        return BridgeReply(persona_role="architect_agent", body="ok")
+
+    bridge = _make_bridge(
+        sender=sender,
+        task_handler=handler,
+        project_context_resolver=ProjectContextResolver(registry, (OWNER_CHAT_ID,)),
+    )
+
+    result = bridge.handle(
+        _msg(
+            chat_id=-100555000111,
+            user_id=INTRUDER_CHAT_ID,
+            text="bound chat task",
+        )
+    )
+
+    assert result.handled is True
+    assert captured == [
+        (
+            snapshot.project.project_id,
+            snapshot.project.slug,
+            "bound_chat",
+            None,
+        )
+    ]
+
+
+def test_owner_dm_single_project_fallback_adds_context_to_handler_message(tmp_path):
+    sender = CapturingSender()
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    snapshot = _register_project(
+        registry,
+        with_chat_binding=False,
+        owner_user_id=OWNER_CHAT_ID,
+    )
+    captured = []
+
+    def handler(text, msg):
+        captured.append(
+            (
+                msg.project_id,
+                msg.project_slug,
+                msg.project_context_source,
+            )
+        )
+        return BridgeReply(persona_role="architect_agent", body="ok")
+
+    bridge = _make_bridge(
+        sender=sender,
+        task_handler=handler,
+        project_context_resolver=ProjectContextResolver(registry, (OWNER_CHAT_ID,)),
+    )
+
+    bridge.handle(_msg(text="owner dm task"))
+
+    assert captured == [
+        (
+            snapshot.project.project_id,
+            snapshot.project.slug,
+            "owner_dm_single_project",
+        )
+    ]
+
+
+def test_owner_dm_multi_project_ambiguity_blocks_free_text_before_task_handler(
+    tmp_path,
+):
+    sender = CapturingSender()
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    _register_project(registry, with_chat_binding=False, owner_user_id=OWNER_CHAT_ID)
+    _register_project(
+        registry,
+        with_chat_binding=False,
+        project_id="beta_project",
+        slug="beta-project",
+        name="Beta Project",
+        owner_user_id=22222,
+    )
+    calls = []
+
+    bridge = _make_bridge(
+        sender=sender,
+        task_handler=lambda text, msg: calls.append((text, msg)) or BridgeReply(
+            persona_role="architect_agent",
+            body="ok",
+        ),
+        project_context_resolver=ProjectContextResolver(registry, (OWNER_CHAT_ID,)),
+    )
+
+    result = bridge.handle(_msg(text="ambiguous owner task"))
+
+    assert result.handled is False
+    assert result.reason == "project_context_missing"
+    assert calls == []
+    assert "явный проектный чат" in sender.sent[0].text.lower()
+
+
+def test_unbound_non_owner_chat_blocks_free_text_before_task_handler(tmp_path):
+    sender = CapturingSender()
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    _register_project(registry, with_chat_binding=False, owner_user_id=OWNER_CHAT_ID)
+    calls = []
+
+    bridge = _make_bridge(
+        sender=sender,
+        task_handler=lambda text, msg: calls.append((text, msg)) or BridgeReply(
+            persona_role="architect_agent",
+            body="ok",
+        ),
+        project_context_resolver=ProjectContextResolver(registry, (OWNER_CHAT_ID,)),
+    )
+
+    result = bridge.handle(
+        _msg(
+            chat_id=INTRUDER_CHAT_ID,
+            user_id=INTRUDER_CHAT_ID,
+            text="unbound task",
+        )
+    )
+
+    assert result.handled is False
+    assert result.reason == "project_context_missing"
+    assert calls == []
+    assert "ещё не привязан к проекту" in sender.sent[0].text.lower()
+
+
+def test_unbound_chat_blocks_push_before_command_handler(tmp_path):
+    sender = CapturingSender()
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    _register_project(registry, with_chat_binding=False, owner_user_id=OWNER_CHAT_ID)
+    reg = CommandRegistry()
+    calls = []
+    reg.register(CommandName.PUSH, lambda c, ctx: calls.append(("push", ctx)) or "push")
+
+    bridge = _make_bridge(
+        sender=sender,
+        commands=reg,
+        project_context_resolver=ProjectContextResolver(registry, (OWNER_CHAT_ID,)),
+    )
+
+    result = bridge.handle(
+        _msg(
+            chat_id=INTRUDER_CHAT_ID,
+            user_id=INTRUDER_CHAT_ID,
+            text="/push task-001",
+        )
+    )
+
+    assert result.handled is False
+    assert calls == []
+    assert "ещё не привязан к проекту" in sender.sent[0].text.lower()
+
+
+def test_unbound_chat_blocks_pr_before_command_handler(tmp_path):
+    sender = CapturingSender()
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    _register_project(registry, with_chat_binding=False, owner_user_id=OWNER_CHAT_ID)
+    reg = CommandRegistry()
+    calls = []
+    reg.register(CommandName.PR, lambda c, ctx: calls.append(("pr", ctx)) or "pr")
+
+    bridge = _make_bridge(
+        sender=sender,
+        commands=reg,
+        project_context_resolver=ProjectContextResolver(registry, (OWNER_CHAT_ID,)),
+    )
+
+    result = bridge.handle(
+        _msg(
+            chat_id=INTRUDER_CHAT_ID,
+            user_id=INTRUDER_CHAT_ID,
+            text="/pr task-001",
+        )
+    )
+
+    assert result.handled is False
+    assert calls == []
+    assert "ещё не привязан к проекту" in sender.sent[0].text.lower()
+
+
+def test_owner_dm_single_project_allows_push_command(tmp_path):
+    sender = CapturingSender()
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    _register_project(registry, with_chat_binding=False, owner_user_id=OWNER_CHAT_ID)
+    reg = CommandRegistry()
+    calls = []
+    reg.register(
+        CommandName.PUSH,
+        lambda c, ctx: calls.append(
+            (
+                c.name.value,
+                ctx.project_id,
+                ctx.project_context_source,
+            )
+        )
+        or "push ok",
+    )
+
+    bridge = _make_bridge(
+        sender=sender,
+        commands=reg,
+        project_context_resolver=ProjectContextResolver(registry, (OWNER_CHAT_ID,)),
+    )
+
+    result = bridge.handle(_msg(text="/push task-001"))
+
+    assert result.handled is True
+    assert calls == [("push", "alpha_project", "owner_dm_single_project")]
+    assert "push ok" in sender.sent[0].text
+
+
+def test_bound_project_chat_allows_pr_command(tmp_path):
+    sender = CapturingSender()
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    _register_project(
+        registry,
+        with_chat_binding=True,
+        owner_user_id=OWNER_CHAT_ID,
+        chat_id=-100321000999,
+    )
+    reg = CommandRegistry()
+    calls = []
+    reg.register(
+        CommandName.PR,
+        lambda c, ctx: calls.append(
+            (
+                c.name.value,
+                ctx.project_id,
+                ctx.project_context_source,
+            )
+        )
+        or "pr ok",
+    )
+
+    bridge = _make_bridge(
+        sender=sender,
+        commands=reg,
+        project_context_resolver=ProjectContextResolver(registry, (OWNER_CHAT_ID,)),
+    )
+
+    result = bridge.handle(
+        _msg(
+            chat_id=-100321000999,
+            user_id=INTRUDER_CHAT_ID,
+            text="/pr task-001",
+        )
+    )
+
+    assert result.handled is True
+    assert calls == [("pr", "alpha_project", "bound_chat")]
+    assert "pr ok" in sender.sent[0].text
+
+
+def test_unbound_chat_allows_help_without_project_context(tmp_path):
+    sender = CapturingSender()
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    _register_project(registry, with_chat_binding=False, owner_user_id=OWNER_CHAT_ID)
+    reg = CommandRegistry()
+    reg.register(CommandName.HELP, lambda c, ctx: "Список команд: ...")
+
+    bridge = _make_bridge(
+        sender=sender,
+        commands=reg,
+        project_context_resolver=ProjectContextResolver(registry, (OWNER_CHAT_ID,)),
+    )
+
+    result = bridge.handle(
+        _msg(
+            chat_id=INTRUDER_CHAT_ID,
+            user_id=INTRUDER_CHAT_ID,
+            text="/help",
+        )
+    )
+
+    assert result.handled is True
+    assert result.reason == "command"
+    assert "Список команд" in sender.sent[0].text
+
+
+def test_unbound_chat_allows_tier_without_project_context(tmp_path):
+    sender = CapturingSender()
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    _register_project(registry, with_chat_binding=False, owner_user_id=OWNER_CHAT_ID)
+    reg = CommandRegistry()
+    reg.register(CommandName.TIER, lambda c, ctx: "tier ok")
+
+    bridge = _make_bridge(
+        sender=sender,
+        commands=reg,
+        project_context_resolver=ProjectContextResolver(registry, (OWNER_CHAT_ID,)),
+    )
+
+    result = bridge.handle(
+        _msg(
+            chat_id=INTRUDER_CHAT_ID,
+            user_id=INTRUDER_CHAT_ID,
+            text="/tier",
+        )
+    )
+
+    assert result.handled is True
+    assert result.reason == "command"
+    assert "tier ok" in sender.sent[0].text
 
 
 # ---------------------------------------------------------------------------

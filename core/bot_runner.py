@@ -60,6 +60,8 @@ from core.project_bootstrap import (
     ProjectBootstrapResult,
     build_project_bootstrap_result,
 )
+from core.project_context import ProjectContextResolver
+from core.project_registry import ProjectRegistry
 from core.project_runtime import ProjectRuntimeBinding
 from core.real_task_handler import RealTaskHandlerConfig, make_real_task_handler
 from core.sandbox_workspace import SandboxWorkspace
@@ -304,6 +306,23 @@ def _try_build_state_db(env: Mapping[str, str]) -> StateDB | None:
         return StateDB(_resolve_state_db_path(env))
     except (OSError, TypeError, ValueError):
         return None
+
+
+def _try_build_project_context_resolver(
+    state_db: StateDB | None,
+    owner_chat_ids: frozenset[int],
+) -> ProjectContextResolver | None:
+    if state_db is None:
+        return None
+    if not isinstance(owner_chat_ids, frozenset):
+        raise ValueError("owner_chat_ids_must_be_frozenset")
+    registry = ProjectRegistry(state_db)
+    if not registry.list_project_snapshots():
+        return None
+    return ProjectContextResolver(
+        registry,
+        tuple(sorted(owner_chat_ids)),
+    )
 
 
 def _pipeline_unavailable_reason(
@@ -1470,6 +1489,10 @@ def build_bridge_from_env(
             ),
         )
     )
+    project_context_resolver = _try_build_project_context_resolver(
+        state_db,
+        owner_chat_ids,
+    )
 
     return TelegramBridge(
         owner_chat_ids=owner_chat_ids,
@@ -1480,4 +1503,5 @@ def build_bridge_from_env(
         gate=gate,
         commands=commands,
         task_handler=task_handler,
+        project_context_resolver=project_context_resolver,
     )

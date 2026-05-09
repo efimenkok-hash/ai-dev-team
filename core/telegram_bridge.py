@@ -22,8 +22,9 @@ CONTRACTS:
 2. handle(msg) is total: never raises. All exceptions become persona-signed
    apology replies. The bridge logs to observability if available, then
    recovers.
-3. Whitelist check fires FIRST. Non-whitelisted senders get a single
-   denial line (no further processing, no resource consumption).
+3. Legacy mode (without ProjectContextResolver) keeps the original owner
+   whitelist behaviour. Project-aware mode resolves Telegram chat context
+   first and gates only project-sensitive actions when context is missing.
 4. Modality precedence inside one IncomingMessage: text > voice > photo.
    Multi-modal messages fall through in that order.
 5. Voice/photo failure (Whisper/Vision exception) is reported as an
@@ -35,13 +36,17 @@ CONTRACTS:
    None, bridge sends a generic "принял задачу" ack from Менеджер.
    If it returns BridgeReply, bridge formats and sends. If it raises,
    bridge sends an apology with class+message of the exception.
-8. send() callable is invoked exactly once per outbound reply. Bridge
+8. In project-aware mode, free-text plus project-sensitive commands
+   (`/push`, `/pr`) are blocked before handler execution when project context
+   cannot be resolved.
+9. send() callable is invoked exactly once per outbound reply. Bridge
    never batches or reorders.
 """
 
 import contextlib
+import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from core.agent_personas import AgentPersona, PersonaRegistry, default_registry
@@ -51,6 +56,7 @@ from core.confirmation_gate import (
     ConfirmationGate,
 )
 from core.observability import Observability
+from core.project_context import VALID_PROJECT_CONTEXT_SOURCES, ProjectContextResolver
 from core.vision_client import VisionClient, VisionError
 from core.whisper_client import WhisperClient, WhisperError
 
@@ -60,6 +66,8 @@ DEFAULT_DENIAL_MESSAGE = (
     "Этот бот обслуживает только владельца проекта."
 )
 DEFAULT_GENERIC_ACK = "👋 Принял задачу. Сейчас разберём."
+_PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_PROJECT_CONTEXT_BLOCKED_COMMANDS = frozenset({"push", "pr"})
 
 
 @dataclass(frozen=True)
@@ -74,6 +82,10 @@ class IncomingMessage:
     photo_bytes: bytes | None = None
     photo_mime: str = "image/jpeg"
     timestamp: float = 0.0
+    project_id: str | None = None
+    project_slug: str | None = None
+    project_context_source: str | None = None
+    project_context_reason: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.chat_id, int) or isinstance(self.chat_id, bool):
@@ -94,6 +106,52 @@ class IncomingMessage:
             raise ValueError("empty_photo_mime")
         if not isinstance(self.timestamp, (int, float)) or isinstance(self.timestamp, bool):
             raise ValueError("invalid_timestamp")
+        if self.project_id is not None:
+            if not isinstance(self.project_id, str) or not self.project_id.strip():
+                raise ValueError("empty_project_id")
+            normalized_project_id = self.project_id.strip().lower()
+            if not normalized_project_id.isascii():
+                raise ValueError(f"non_ascii_project_id:{normalized_project_id}")
+            if not _PROJECT_ID_RE.fullmatch(normalized_project_id):
+                raise ValueError(f"invalid_project_id:{normalized_project_id}")
+            object.__setattr__(self, "project_id", normalized_project_id)
+        if self.project_slug is not None:
+            if not isinstance(self.project_slug, str) or not self.project_slug.strip():
+                raise ValueError("empty_project_slug")
+            object.__setattr__(self, "project_slug", self.project_slug.strip())
+        if (
+            self.project_context_source is not None
+            and (
+                not isinstance(self.project_context_source, str)
+                or self.project_context_source not in VALID_PROJECT_CONTEXT_SOURCES
+            )
+        ):
+            raise ValueError(
+                "invalid_project_context_source:"
+                f"{self.project_context_source!r}"
+            )
+        if self.project_context_reason is not None:
+            if (
+                not isinstance(self.project_context_reason, str)
+                or not self.project_context_reason.strip()
+            ):
+                raise ValueError("invalid_project_context_reason")
+            object.__setattr__(
+                self,
+                "project_context_reason",
+                self.project_context_reason.strip(),
+            )
+        if self.project_id is None and self.project_slug is not None:
+            raise ValueError("project_slug_requires_project_id")
+        if self.project_context_source == "none" and self.project_id is not None:
+            raise ValueError("none_project_context_forbids_project_id")
+        if self.project_context_source in {
+            "bound_chat",
+            "owner_dm_single_project",
+        } and self.project_id is None:
+            raise ValueError(
+                "resolved_project_context_requires_project_id"
+            )
         # Must contain at least one modality.
         if (
             (self.text is None or not self.text.strip())
@@ -177,6 +235,7 @@ class TelegramBridge:
         observability: Observability | None = None,
         manager_role: str = "pm_agent",
         denial_message: str = DEFAULT_DENIAL_MESSAGE,
+        project_context_resolver: ProjectContextResolver | None = None,
     ) -> None:
         if not isinstance(owner_chat_ids, frozenset):
             raise ValueError("owner_chat_ids_must_be_frozenset")
@@ -193,6 +252,11 @@ class TelegramBridge:
             raise ValueError("empty_manager_role")
         if not isinstance(denial_message, str) or not denial_message.strip():
             raise ValueError("empty_denial_message")
+        if (
+            project_context_resolver is not None
+            and not isinstance(project_context_resolver, ProjectContextResolver)
+        ):
+            raise ValueError("invalid_project_context_resolver")
 
         self._owner_chat_ids = owner_chat_ids
         self._send = send
@@ -204,6 +268,7 @@ class TelegramBridge:
         self._task_handler = task_handler
         self._obs = observability
         self._denial_message = denial_message
+        self._project_context_resolver = project_context_resolver
 
         # Eagerly resolve the manager persona so we fail at construction
         # if manager_role is unknown.
@@ -238,25 +303,46 @@ class TelegramBridge:
                     sent_count=ctx.sent_count,
                 )
 
-            # 1. Whitelist
-            if not self._is_owner(msg):
-                self._safe_send(
-                    OutgoingMessage(chat_id=msg.chat_id, text=self._denial_message),
-                    ctx,
-                )
-                return BridgeResult(
-                    chat_id=msg.chat_id,
-                    handled=False,
-                    reason="not_owner",
-                    sent_count=ctx.sent_count,
-                )
+            # 1. Legacy whitelist or project-aware context resolution.
+            resolved_msg = msg
+            if self._project_context_resolver is None:
+                if not self._is_owner(msg):
+                    self._safe_send(
+                        OutgoingMessage(chat_id=msg.chat_id, text=self._denial_message),
+                        ctx,
+                    )
+                    return BridgeResult(
+                        chat_id=msg.chat_id,
+                        handled=False,
+                        reason="not_owner",
+                        sent_count=ctx.sent_count,
+                    )
+            else:
+                resolved_msg = self._apply_project_context(msg)
+                if self._should_block_for_missing_project_context(resolved_msg):
+                    self._safe_send(
+                        OutgoingMessage(
+                            chat_id=resolved_msg.chat_id,
+                            text=self._sign_manager(
+                                self._format_missing_project_context_message(
+                                    resolved_msg.project_context_reason
+                                )
+                            ),
+                        ),
+                        ctx,
+                    )
+                    return BridgeResult(
+                        chat_id=resolved_msg.chat_id,
+                        handled=False,
+                        reason="project_context_missing",
+                        sent_count=ctx.sent_count,
+                    )
 
             # 2. Resolve text from text/voice/photo
-            text = self._resolve_text(msg, ctx)
+            text = self._resolve_text(resolved_msg, ctx)
             if text is None:
-                # _resolve_text already sent an apology if needed
                 return BridgeResult(
-                    chat_id=msg.chat_id,
+                    chat_id=resolved_msg.chat_id,
                     handled=False,
                     reason="no_text_resolved",
                     sent_count=ctx.sent_count,
@@ -267,9 +353,9 @@ class TelegramBridge:
             # 3. Slash command?
             cmd = parse_command(text)
             if cmd is not None:
-                self._handle_command(cmd, msg, ctx)
+                self._handle_command(cmd, resolved_msg, ctx)
                 return BridgeResult(
-                    chat_id=msg.chat_id,
+                    chat_id=resolved_msg.chat_id,
                     handled=True,
                     reason="command",
                     sent_count=ctx.sent_count,
@@ -277,9 +363,9 @@ class TelegramBridge:
                 )
 
             # 4. Free-text task
-            self._handle_task(text, msg, ctx)
+            self._handle_task(text, resolved_msg, ctx)
             return BridgeResult(
-                chat_id=msg.chat_id,
+                chat_id=resolved_msg.chat_id,
                 handled=True,
                 reason="task",
                 sent_count=ctx.sent_count,
@@ -313,6 +399,66 @@ class TelegramBridge:
         return (
             msg.chat_id in self._owner_chat_ids
             or msg.user_id in self._owner_chat_ids
+        )
+
+    def _apply_project_context(
+        self,
+        msg: IncomingMessage,
+    ) -> IncomingMessage:
+        if self._project_context_resolver is None:
+            return msg
+        resolution = self._project_context_resolver.resolve_telegram_context(
+            chat_id=msg.chat_id,
+            user_id=msg.user_id,
+        )
+        if resolution.snapshot is None:
+            return replace(
+                msg,
+                project_id=None,
+                project_slug=None,
+                project_context_source=resolution.source,
+                project_context_reason=resolution.reason,
+            )
+        return replace(
+            msg,
+            project_id=resolution.snapshot.project.project_id,
+            project_slug=resolution.snapshot.project.slug,
+            project_context_source=resolution.source,
+            project_context_reason=resolution.reason,
+        )
+
+    def _should_block_for_missing_project_context(
+        self,
+        msg: IncomingMessage,
+    ) -> bool:
+        if self._project_context_resolver is None:
+            return False
+        if msg.project_context_source != "none":
+            return False
+        return _message_requires_project_context(msg)
+
+    def _format_missing_project_context_message(self, reason: str | None) -> str:
+        if reason == "owner_dm_requires_explicit_project_chat":
+            return (
+                "⚠️ Проект не определён.\n"
+                "\n"
+                "Для owner DM при нескольких проектах нужен явный проектный чат."
+            )
+        if reason == "project_chat_not_bound":
+            return (
+                "⚠️ Проект не определён.\n"
+                "\n"
+                "Этот чат ещё не привязан к проекту."
+            )
+        return (
+            "⚠️ Проект не определён.\n"
+            "\n"
+            "Не удалось определить проектный контекст для этого действия."
+            + (
+                f"\n\nТехническая причина: {reason}"
+                if isinstance(reason, str) and reason.strip()
+                else ""
+            )
         )
 
     def _resolve_text(
@@ -568,3 +714,16 @@ class TelegramBridge:
 def _short_err(exc: Any, limit: int = 200) -> str:
     text = f"{type(exc).__name__}: {exc}"
     return text if len(text) <= limit else text[:limit] + "...[truncated]"
+
+
+def _command_requires_project_context(cmd) -> bool:
+    return cmd.name.value in _PROJECT_CONTEXT_BLOCKED_COMMANDS
+
+
+def _message_requires_project_context(msg: IncomingMessage) -> bool:
+    if msg.text is not None and msg.text.strip():
+        cmd = parse_command(msg.text.strip())
+        if cmd is not None:
+            return _command_requires_project_context(cmd)
+        return True
+    return True
