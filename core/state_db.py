@@ -2,7 +2,7 @@
 core/state_db.py
 
 SQLite-backed persistent state for chat tier selection, completed task
-history, and per-chat budget.
+history, per-chat budget, and the AI Office project model.
 
 Design goals:
 1. Single-file stdlib-only storage (`sqlite3`), safe for bot restarts.
@@ -11,32 +11,55 @@ Design goals:
 3. API mirrors the current in-memory stores closely, so migration can be
    incremental: TierSessionStore / TaskHistory / budget can swap internals
    without changing their public contracts.
+4. Project persistence remains runtime-agnostic: no TelegramBridge,
+   bot_runner, registry, or onboarding flow wiring lives here.
 
 CONTRACTS:
 1. StateDB(path) requires a Path; constructor creates parent directories and
    initializes/migrates the schema eagerly.
-2. Current schema version is 2. Unknown future versions raise ValueError.
+2. Current schema version is 3. Unknown future versions raise ValueError.
 3. Every public method validates arguments via isinstance/ValueError.
 4. Writes are serialized with a process-local lock; reads use independent
    SQLite connections and remain safe under concurrent access.
 5. task_history keeps an append-only audit log. get_task(task_id) returns the
    newest record for that task_id; recent_tasks(n) returns newest-last order.
-6. schema migration supports v1 -> v2:
-   - tier_sessions.tier_name -> active_tier
-   - task_history gains AUTOINCREMENT id for stable append-order semantics
+6. schema migration supports v1 -> v2 -> v3:
+   - v1 -> v2: tier_sessions.tier_name -> active_tier
+   - v1 -> v2: task_history gains AUTOINCREMENT id for stable append-order
+     semantics
+   - v2 -> v3: adds projects, project_policies, project_members,
+     project_chat_bindings
+7. Identity model is explicit:
+   - Project.owner_user_id is a positive Telegram owner user id stored in
+     projects.owner_user_id.
+   - ProjectMembership.member_id is a logical stable ASCII identifier, unique
+     within (project_id, member_id), and is never treated as a chat id or
+     Telegram user id.
+   - ProjectChatBinding.chat_id is an external transport chat id and may be
+     negative for Telegram supergroups; project/chat binding is one-to-one.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
 
+from core.project_models import (
+    VALID_CHAT_PROVIDERS,
+    Project,
+    ProjectChatBinding,
+    ProjectMembership,
+    ProjectPolicy,
+)
 from core.task_history import TaskSummary
 
-_CURRENT_SCHEMA_VERSION = 2
+_CURRENT_SCHEMA_VERSION = 3
 _SQLITE_TIMEOUT_SECONDS = 30.0
+_IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 _CREATE_SCHEMA_META = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -70,6 +93,47 @@ _CREATE_BUDGET = """
 CREATE TABLE IF NOT EXISTS budget (
     chat_id INTEGER PRIMARY KEY,
     usd REAL NOT NULL
+)
+"""
+
+_CREATE_PROJECTS = """
+CREATE TABLE IF NOT EXISTS projects (
+    project_id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    owner_user_id INTEGER NOT NULL CHECK(owner_user_id > 0),
+    status TEXT NOT NULL
+)
+"""
+
+_CREATE_PROJECT_POLICIES = """
+CREATE TABLE IF NOT EXISTS project_policies (
+    project_id TEXT PRIMARY KEY,
+    allow_hiring INTEGER NOT NULL CHECK(allow_hiring IN (0, 1)),
+    allow_agent_dm INTEGER NOT NULL CHECK(allow_agent_dm IN (0, 1)),
+    require_owner_approval_for_hires INTEGER NOT NULL
+        CHECK(require_owner_approval_for_hires IN (0, 1))
+)
+"""
+
+_CREATE_PROJECT_MEMBERS = """
+CREATE TABLE IF NOT EXISTS project_members (
+    project_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    member_type TEXT NOT NULL,
+    role_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    PRIMARY KEY(project_id, member_id)
+)
+"""
+
+_CREATE_PROJECT_CHAT_BINDINGS = """
+CREATE TABLE IF NOT EXISTS project_chat_bindings (
+    project_id TEXT PRIMARY KEY,
+    chat_provider TEXT NOT NULL,
+    chat_id INTEGER NOT NULL CHECK(chat_id != 0),
+    UNIQUE(chat_provider, chat_id)
 )
 """
 
@@ -293,6 +357,295 @@ class StateDB:
             )
 
     # ------------------------------------------------------------------
+    # Project model
+    # ------------------------------------------------------------------
+
+    def upsert_project(self, project: Project) -> None:
+        if not isinstance(project, Project):
+            raise ValueError(f"invalid_project_type:{type(project).__name__}")
+        with self._lock, self._connect() as conn:
+            self._ensure_project_slug_available(
+                conn,
+                project_id=project.project_id,
+                slug=project.slug,
+            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO projects(
+                        project_id,
+                        slug,
+                        name,
+                        description,
+                        owner_user_id,
+                        status
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id) DO UPDATE SET
+                        slug = excluded.slug,
+                        name = excluded.name,
+                        description = excluded.description,
+                        owner_user_id = excluded.owner_user_id,
+                        status = excluded.status
+                    """,
+                    (
+                        project.project_id,
+                        project.slug,
+                        project.name,
+                        project.description,
+                        project.owner_user_id,
+                        project.status,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    f"project_slug_already_exists:{project.slug}"
+                ) from exc
+
+    def get_project(self, project_id: str) -> Project | None:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT project_id, slug, name, description, owner_user_id, status
+                FROM projects
+                WHERE project_id = ?
+                """,
+                (normalized_project_id,),
+            ).fetchone()
+        return self._row_to_project(row)
+
+    def get_project_by_slug(self, slug: str) -> Project | None:
+        normalized_slug = self._normalize_project_slug(slug, field_name="slug")
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT project_id, slug, name, description, owner_user_id, status
+                FROM projects
+                WHERE slug = ?
+                """,
+                (normalized_slug,),
+            ).fetchone()
+        return self._row_to_project(row)
+
+    def list_projects(self) -> list[Project]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT project_id, slug, name, description, owner_user_id, status
+                FROM projects
+                ORDER BY project_id
+                """
+            ).fetchall()
+        return [self._row_to_project(row) for row in rows if row is not None]
+
+    def set_project_policy(self, policy: ProjectPolicy) -> None:
+        if not isinstance(policy, ProjectPolicy):
+            raise ValueError(
+                f"invalid_project_policy_type:{type(policy).__name__}"
+            )
+        with self._lock, self._connect() as conn:
+            self._ensure_project_exists(conn, policy.project_id)
+            conn.execute(
+                """
+                INSERT INTO project_policies(
+                    project_id,
+                    allow_hiring,
+                    allow_agent_dm,
+                    require_owner_approval_for_hires
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    allow_hiring = excluded.allow_hiring,
+                    allow_agent_dm = excluded.allow_agent_dm,
+                    require_owner_approval_for_hires =
+                        excluded.require_owner_approval_for_hires
+                """,
+                (
+                    policy.project_id,
+                    int(policy.allow_hiring),
+                    int(policy.allow_agent_dm),
+                    int(policy.require_owner_approval_for_hires),
+                ),
+            )
+
+    def get_project_policy(self, project_id: str) -> ProjectPolicy | None:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT project_id, allow_hiring, allow_agent_dm,
+                       require_owner_approval_for_hires
+                FROM project_policies
+                WHERE project_id = ?
+                """,
+                (normalized_project_id,),
+            ).fetchone()
+        return self._row_to_project_policy(row)
+
+    def upsert_project_membership(
+        self,
+        membership: ProjectMembership,
+    ) -> None:
+        if not isinstance(membership, ProjectMembership):
+            raise ValueError(
+                f"invalid_project_membership_type:{type(membership).__name__}"
+            )
+        with self._lock, self._connect() as conn:
+            self._ensure_project_exists(conn, membership.project_id)
+            conn.execute(
+                """
+                INSERT INTO project_members(
+                    project_id,
+                    member_id,
+                    member_type,
+                    role_name,
+                    status
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, member_id) DO UPDATE SET
+                    member_type = excluded.member_type,
+                    role_name = excluded.role_name,
+                    status = excluded.status
+                """,
+                (
+                    membership.project_id,
+                    membership.member_id,
+                    membership.member_type,
+                    membership.role_name,
+                    membership.status,
+                ),
+            )
+
+    def get_project_membership(
+        self,
+        project_id: str,
+        member_id: str,
+    ) -> ProjectMembership | None:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_member_id = self._normalize_project_identifier(
+            member_id,
+            field_name="member_id",
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT project_id, member_id, member_type, role_name, status
+                FROM project_members
+                WHERE project_id = ? AND member_id = ?
+                """,
+                (normalized_project_id, normalized_member_id),
+            ).fetchone()
+        return self._row_to_project_membership(row)
+
+    def list_project_memberships(
+        self,
+        project_id: str,
+    ) -> list[ProjectMembership]:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT project_id, member_id, member_type, role_name, status
+                FROM project_members
+                WHERE project_id = ?
+                ORDER BY member_id
+                """,
+                (normalized_project_id,),
+            ).fetchall()
+        return [
+            self._row_to_project_membership(row)
+            for row in rows
+            if row is not None
+        ]
+
+    def bind_project_chat(self, binding: ProjectChatBinding) -> None:
+        if not isinstance(binding, ProjectChatBinding):
+            raise ValueError(
+                f"invalid_project_chat_binding_type:{type(binding).__name__}"
+            )
+        with self._lock, self._connect() as conn:
+            self._ensure_project_exists(conn, binding.project_id)
+            self._ensure_chat_binding_available(
+                conn,
+                project_id=binding.project_id,
+                chat_provider=binding.chat_provider,
+                chat_id=binding.chat_id,
+            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO project_chat_bindings(
+                        project_id,
+                        chat_provider,
+                        chat_id
+                    )
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(project_id) DO UPDATE SET
+                        chat_provider = excluded.chat_provider,
+                        chat_id = excluded.chat_id
+                    """,
+                    (
+                        binding.project_id,
+                        binding.chat_provider,
+                        binding.chat_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    f"chat_binding_conflict:{binding.chat_provider}:{binding.chat_id}"
+                ) from exc
+
+    def get_project_chat_binding(
+        self,
+        project_id: str,
+    ) -> ProjectChatBinding | None:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT project_id, chat_provider, chat_id
+                FROM project_chat_bindings
+                WHERE project_id = ?
+                """,
+                (normalized_project_id,),
+            ).fetchone()
+        return self._row_to_project_chat_binding(row)
+
+    def get_project_for_chat(
+        self,
+        chat_provider: str,
+        chat_id: int,
+    ) -> ProjectChatBinding | None:
+        normalized_chat_provider = self._normalize_chat_provider(chat_provider)
+        self._validate_transport_chat_id(chat_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT project_id, chat_provider, chat_id
+                FROM project_chat_bindings
+                WHERE chat_provider = ? AND chat_id = ?
+                """,
+                (normalized_chat_provider, chat_id),
+            ).fetchone()
+        return self._row_to_project_chat_binding(row)
+
+    # ------------------------------------------------------------------
     # Schema management
     # ------------------------------------------------------------------
 
@@ -300,7 +653,7 @@ class StateDB:
         with self._lock, self._connect() as conn:
             version = self._detect_schema_version(conn)
             if version == 0:
-                self._create_v2_schema(conn)
+                self._create_v3_schema(conn)
                 return
             if version > _CURRENT_SCHEMA_VERSION:
                 raise ValueError(
@@ -311,13 +664,21 @@ class StateDB:
                     self._migrate_v1_to_v2(conn)
                     version = 2
                     continue
+                if version == 2:
+                    self._migrate_v2_to_v3(conn)
+                    version = 3
+                    continue
                 raise ValueError(f"unsupported_schema_version:{version}")
 
-    def _create_v2_schema(self, conn: sqlite3.Connection) -> None:
+    def _create_v3_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE_SCHEMA_META)
         conn.execute(_CREATE_TIER_SESSIONS)
         conn.execute(_CREATE_TASK_HISTORY)
         conn.execute(_CREATE_BUDGET)
+        conn.execute(_CREATE_PROJECTS)
+        conn.execute(_CREATE_PROJECT_POLICIES)
+        conn.execute(_CREATE_PROJECT_MEMBERS)
+        conn.execute(_CREATE_PROJECT_CHAT_BINDINGS)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_TASK_ID)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_FINISHED)
         self._set_schema_version(conn, _CURRENT_SCHEMA_VERSION)
@@ -330,6 +691,13 @@ class StateDB:
         conn.execute(_CREATE_INDEX_TASK_HISTORY_TASK_ID)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_FINISHED)
         self._set_schema_version(conn, 2)
+
+    def _migrate_v2_to_v3(self, conn: sqlite3.Connection) -> None:
+        conn.execute(_CREATE_PROJECTS)
+        conn.execute(_CREATE_PROJECT_POLICIES)
+        conn.execute(_CREATE_PROJECT_MEMBERS)
+        conn.execute(_CREATE_PROJECT_CHAT_BINDINGS)
+        self._set_schema_version(conn, 3)
 
     def _migrate_tier_sessions_to_v2(self, conn: sqlite3.Connection) -> None:
         columns = self._table_columns(conn, "tier_sessions")
@@ -488,6 +856,113 @@ class StateDB:
         )
 
     @staticmethod
+    def _row_to_project(row: sqlite3.Row | None) -> Project | None:
+        if row is None:
+            return None
+        return Project(
+            project_id=str(row["project_id"]),
+            slug=str(row["slug"]),
+            name=str(row["name"]),
+            description=str(row["description"]),
+            owner_user_id=int(row["owner_user_id"]),
+            status=str(row["status"]),
+        )
+
+    @staticmethod
+    def _row_to_project_policy(row: sqlite3.Row | None) -> ProjectPolicy | None:
+        if row is None:
+            return None
+        return ProjectPolicy(
+            project_id=str(row["project_id"]),
+            allow_hiring=bool(row["allow_hiring"]),
+            allow_agent_dm=bool(row["allow_agent_dm"]),
+            require_owner_approval_for_hires=bool(
+                row["require_owner_approval_for_hires"]
+            ),
+        )
+
+    @staticmethod
+    def _row_to_project_membership(
+        row: sqlite3.Row | None,
+    ) -> ProjectMembership | None:
+        if row is None:
+            return None
+        return ProjectMembership(
+            project_id=str(row["project_id"]),
+            member_id=str(row["member_id"]),
+            member_type=str(row["member_type"]),
+            role_name=str(row["role_name"]),
+            status=str(row["status"]),
+        )
+
+    @staticmethod
+    def _row_to_project_chat_binding(
+        row: sqlite3.Row | None,
+    ) -> ProjectChatBinding | None:
+        if row is None:
+            return None
+        return ProjectChatBinding(
+            project_id=str(row["project_id"]),
+            chat_provider=str(row["chat_provider"]),
+            chat_id=int(row["chat_id"]),
+        )
+
+    def _ensure_project_exists(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+    ) -> None:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM projects
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown_project_id:{project_id}")
+
+    def _ensure_project_slug_available(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+        slug: str,
+    ) -> None:
+        row = conn.execute(
+            """
+            SELECT project_id
+            FROM projects
+            WHERE slug = ?
+            """,
+            (slug,),
+        ).fetchone()
+        if row is not None and str(row["project_id"]) != project_id:
+            raise ValueError(f"project_slug_already_exists:{slug}")
+
+    def _ensure_chat_binding_available(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+        chat_provider: str,
+        chat_id: int,
+    ) -> None:
+        row = conn.execute(
+            """
+            SELECT project_id
+            FROM project_chat_bindings
+            WHERE chat_provider = ? AND chat_id = ?
+            """,
+            (chat_provider, chat_id),
+        ).fetchone()
+        if row is not None and str(row["project_id"]) != project_id:
+            raise ValueError(
+                f"chat_binding_conflict:{chat_provider}:{chat_id}"
+            )
+
+    @staticmethod
     def _validate_chat_id(chat_id: int) -> None:
         if (
             isinstance(chat_id, bool)
@@ -509,6 +984,45 @@ class StateDB:
     def _validate_non_empty_text(value: str, field_name: str) -> None:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"empty_{field_name}")
+
+    @staticmethod
+    def _normalize_project_identifier(value: str, *, field_name: str) -> str:
+        StateDB._validate_non_empty_text(value, field_name)
+        normalized = value.strip().lower()
+        if not normalized.isascii():
+            raise ValueError(f"non_ascii_{field_name}")
+        if not _IDENTIFIER_RE.fullmatch(normalized):
+            raise ValueError(f"invalid_{field_name}:{normalized}")
+        return normalized
+
+    @staticmethod
+    def _normalize_project_slug(value: str, *, field_name: str) -> str:
+        StateDB._validate_non_empty_text(value, field_name)
+        normalized = value.strip().lower()
+        if not normalized.isascii():
+            raise ValueError(f"non_ascii_{field_name}")
+        if not _SLUG_RE.fullmatch(normalized):
+            raise ValueError(f"invalid_{field_name}:{normalized}")
+        return normalized
+
+    @staticmethod
+    def _normalize_chat_provider(chat_provider: str) -> str:
+        normalized = StateDB._normalize_project_identifier(
+            chat_provider,
+            field_name="chat_provider",
+        )
+        if normalized not in VALID_CHAT_PROVIDERS:
+            raise ValueError(f"invalid_chat_provider:{normalized}")
+        return normalized
+
+    @staticmethod
+    def _validate_transport_chat_id(chat_id: int) -> None:
+        if (
+            isinstance(chat_id, bool)
+            or not isinstance(chat_id, int)
+            or chat_id == 0
+        ):
+            raise ValueError(f"invalid_chat_id:{chat_id!r}")
 
     @staticmethod
     def _validate_budget(usd: float) -> None:

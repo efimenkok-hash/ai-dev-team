@@ -9,6 +9,12 @@ from pathlib import Path
 
 import pytest
 
+from core.project_models import (
+    Project,
+    ProjectChatBinding,
+    ProjectMembership,
+    ProjectPolicy,
+)
 from core.state_db import StateDB
 from core.task_history import TaskSummary
 
@@ -33,8 +39,82 @@ def _summary(
     )
 
 
+def _project(**overrides: object) -> Project:
+    data: dict[str, object] = {
+        "project_id": "alpha_project",
+        "slug": "alpha-project",
+        "name": "Alpha Project",
+        "description": "Primary AI Office project.",
+        "owner_user_id": 101,
+        "status": "active",
+    }
+    data.update(overrides)
+    return Project(**data)
+
+
+def _policy(**overrides: object) -> ProjectPolicy:
+    data: dict[str, object] = {
+        "project_id": "alpha_project",
+        "allow_hiring": True,
+        "allow_agent_dm": False,
+        "require_owner_approval_for_hires": True,
+    }
+    data.update(overrides)
+    return ProjectPolicy(**data)
+
+
+def _membership(**overrides: object) -> ProjectMembership:
+    data: dict[str, object] = {
+        "project_id": "alpha_project",
+        "member_id": "coordinator_01",
+        "member_type": "agent",
+        "role_name": "coordinator_agent",
+        "status": "active",
+    }
+    data.update(overrides)
+    return ProjectMembership(**data)
+
+
+def _binding(**overrides: object) -> ProjectChatBinding:
+    data: dict[str, object] = {
+        "project_id": "alpha_project",
+        "chat_id": -1001234567890,
+        "chat_provider": "telegram",
+    }
+    data.update(overrides)
+    return ProjectChatBinding(**data)
+
+
 def _make_db(tmp_path: Path) -> StateDB:
     return StateDB(tmp_path / "state.db")
+
+
+def _table_names(path: Path) -> set[str]:
+    conn = sqlite3.connect(path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    return {
+        str(row[0])
+        for row in rows
+        if not str(row[0]).startswith("sqlite_")
+    }
+
+
+def _table_columns(path: Path, table_name: str) -> list[str]:
+    conn = sqlite3.connect(path)
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    finally:
+        conn.close()
+    return [str(row[1]) for row in rows]
 
 
 def _build_v1_db(path: Path, *, with_schema_meta: bool) -> None:
@@ -112,6 +192,81 @@ def _build_v1_db(path: Path, *, with_schema_meta: bool) -> None:
         conn.close()
 
 
+def _build_v2_db(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2')"
+        )
+        conn.execute(
+            """
+            CREATE TABLE tier_sessions (
+                chat_id INTEGER PRIMARY KEY,
+                active_tier TEXT NOT NULL,
+                last_changed_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE task_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                commit_sha TEXT,
+                final_state TEXT NOT NULL,
+                failure_reason TEXT,
+                tier_name TEXT NOT NULL,
+                finished_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE budget (
+                chat_id INTEGER PRIMARY KEY,
+                usd REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO tier_sessions(chat_id, active_tier, last_changed_at)
+            VALUES (1, 'STANDARD', 1234.5)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO task_history(
+                task_id, branch, commit_sha, final_state,
+                failure_reason, tier_name, finished_at
+            )
+            VALUES (
+                'task-v2',
+                'feature/task-v2',
+                'feedface',
+                'SUCCESS',
+                NULL,
+                'PREMIUM',
+                3333.5
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO budget(chat_id, usd)
+            VALUES (1, 8.25)
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Construction / schema
 # ---------------------------------------------------------------------------
@@ -141,7 +296,48 @@ def test_constructor_creates_database_file(tmp_path: Path):
 
 def test_schema_version_is_current(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 2
+    assert db.schema_version() == 3
+
+
+def test_fresh_schema_creates_project_tables(tmp_path: Path):
+    db = _make_db(tmp_path)
+    assert db.schema_version() == 3
+    assert _table_names(db.path) >= {
+        "schema_meta",
+        "tier_sessions",
+        "task_history",
+        "budget",
+        "projects",
+        "project_policies",
+        "project_members",
+        "project_chat_bindings",
+    }
+    assert _table_columns(db.path, "projects") == [
+        "project_id",
+        "slug",
+        "name",
+        "description",
+        "owner_user_id",
+        "status",
+    ]
+    assert _table_columns(db.path, "project_policies") == [
+        "project_id",
+        "allow_hiring",
+        "allow_agent_dm",
+        "require_owner_approval_for_hires",
+    ]
+    assert _table_columns(db.path, "project_members") == [
+        "project_id",
+        "member_id",
+        "member_type",
+        "role_name",
+        "status",
+    ]
+    assert _table_columns(db.path, "project_chat_bindings") == [
+        "project_id",
+        "chat_provider",
+        "chat_id",
+    ]
 
 
 def test_wal_mode_enabled(tmp_path: Path):
@@ -292,14 +488,14 @@ def test_concurrent_tier_reads_and_writes_do_not_crash(tmp_path: Path):
         try:
             for _ in range(20):
                 db.set_tier(chat_id, "STANDARD")
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover - failure path
             errors.append(exc)
 
     def reader(chat_id: int) -> None:
         try:
             for _ in range(20):
                 _ = db.get_tier(chat_id)
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover - failure path
             errors.append(exc)
 
     threads = [threading.Thread(target=writer, args=(i,)) for i in range(1, 6)]
@@ -417,7 +613,7 @@ def test_concurrent_task_history_reads_and_writes_do_not_crash(tmp_path: Path):
         try:
             for i in range(10):
                 db.record_task(_summary(task_id=f"task-{worker_id}-{i}"))
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover - failure path
             errors.append(exc)
 
     def reader() -> None:
@@ -425,7 +621,7 @@ def test_concurrent_task_history_reads_and_writes_do_not_crash(tmp_path: Path):
             for _ in range(20):
                 _ = db.recent_tasks(5)
                 _ = db.get_task("task-0-0")
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover - failure path
             errors.append(exc)
 
     threads = [threading.Thread(target=writer, args=(i,)) for i in range(5)]
@@ -492,14 +688,14 @@ def test_concurrent_budget_reads_and_writes_do_not_crash(tmp_path: Path):
         try:
             for i in range(20):
                 db.set_budget(chat_id, float(i))
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover - failure path
             errors.append(exc)
 
     def reader(chat_id: int) -> None:
         try:
             for _ in range(20):
                 _ = db.get_budget(chat_id)
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover - failure path
             errors.append(exc)
 
     threads = [threading.Thread(target=writer, args=(1,))]
@@ -514,7 +710,325 @@ def test_concurrent_budget_reads_and_writes_do_not_crash(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v1 -> v2
+# Projects
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_project_and_get_project_round_trip(tmp_path: Path):
+    db = _make_db(tmp_path)
+    project = _project()
+
+    db.upsert_project(project)
+
+    assert db.get_project("alpha_project") == project
+
+
+def test_get_project_returns_none_for_unknown_project(tmp_path: Path):
+    db = _make_db(tmp_path)
+    assert db.get_project("missing_project") is None
+
+
+def test_get_project_by_slug_round_trip(tmp_path: Path):
+    db = _make_db(tmp_path)
+    project = _project(slug="alpha-project")
+
+    db.upsert_project(project)
+
+    assert db.get_project_by_slug("  Alpha-Project  ") == project
+
+
+def test_upsert_project_overwrites_existing_project_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    updated = _project(name="Alpha Project v2", description="Updated description.")
+
+    db.upsert_project(updated)
+
+    assert db.get_project("alpha_project") == updated
+
+
+def test_list_projects_returns_sorted_by_project_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project(project_id="zeta_project", slug="zeta-project"))
+    db.upsert_project(_project(project_id="alpha_project", slug="alpha-project"))
+    db.upsert_project(_project(project_id="beta_project", slug="beta-project"))
+
+    assert [project.project_id for project in db.list_projects()] == [
+        "alpha_project",
+        "beta_project",
+        "zeta_project",
+    ]
+
+
+def test_upsert_project_rejects_duplicate_slug_for_other_project(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project(project_id="alpha_project", slug="shared-project"))
+
+    with pytest.raises(ValueError, match="project_slug_already_exists:shared-project"):
+        db.upsert_project(_project(project_id="beta_project", slug="shared-project"))
+
+
+def test_upsert_project_rejects_non_project(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_project_type"):
+        db.upsert_project("bad")  # type: ignore[arg-type]
+
+
+def test_get_project_rejects_empty_project_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="empty_project_id"):
+        db.get_project("  ")
+
+
+def test_get_project_rejects_invalid_project_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_project_id"):
+        db.get_project("bad-id")
+
+
+def test_get_project_by_slug_rejects_empty_slug(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="empty_slug"):
+        db.get_project_by_slug(" ")
+
+
+def test_get_project_by_slug_rejects_invalid_slug(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_slug"):
+        db.get_project_by_slug("bad_slug")
+
+
+# ---------------------------------------------------------------------------
+# Project policies
+# ---------------------------------------------------------------------------
+
+
+def test_project_policy_round_trip(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    policy = _policy(allow_hiring=False, allow_agent_dm=True)
+
+    db.set_project_policy(policy)
+
+    assert db.get_project_policy("alpha_project") == policy
+
+
+def test_project_policy_flags_restore_as_bool(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.set_project_policy(
+        _policy(
+            allow_hiring=False,
+            allow_agent_dm=True,
+            require_owner_approval_for_hires=False,
+        )
+    )
+
+    policy = db.get_project_policy("alpha_project")
+
+    assert policy is not None
+    assert isinstance(policy.allow_hiring, bool)
+    assert isinstance(policy.allow_agent_dm, bool)
+    assert isinstance(policy.require_owner_approval_for_hires, bool)
+    assert policy.allow_hiring is False
+    assert policy.allow_agent_dm is True
+    assert policy.require_owner_approval_for_hires is False
+
+
+def test_get_project_policy_returns_none_for_unknown_project(tmp_path: Path):
+    db = _make_db(tmp_path)
+    assert db.get_project_policy("missing_project") is None
+
+
+def test_set_project_policy_rejects_non_policy(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_project_policy_type"):
+        db.set_project_policy("bad")  # type: ignore[arg-type]
+
+
+def test_set_project_policy_rejects_unknown_project(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="unknown_project_id:alpha_project"):
+        db.set_project_policy(_policy())
+
+
+def test_get_project_policy_rejects_invalid_project_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_project_id"):
+        db.get_project_policy("bad-id")
+
+
+# ---------------------------------------------------------------------------
+# Project memberships
+# ---------------------------------------------------------------------------
+
+
+def test_project_membership_round_trip(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    membership = _membership()
+
+    db.upsert_project_membership(membership)
+
+    assert db.get_project_membership("alpha_project", "coordinator_01") == membership
+
+
+def test_list_project_memberships_returns_sorted_by_member_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_project_membership(_membership(member_id="writer_01", role_name="writer_agent"))
+    db.upsert_project_membership(_membership(member_id="architect_01", role_name="architect_agent"))
+    db.upsert_project_membership(_membership(member_id="coordinator_01", role_name="coordinator_agent"))
+
+    assert [item.member_id for item in db.list_project_memberships("alpha_project")] == [
+        "architect_01",
+        "coordinator_01",
+        "writer_01",
+    ]
+
+
+def test_member_id_is_unique_within_project_via_upsert(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_project_membership(_membership(status="active"))
+    db.upsert_project_membership(
+        _membership(
+            status="inactive",
+            role_name="writer_agent",
+            member_type="human",
+        )
+    )
+
+    memberships = db.list_project_memberships("alpha_project")
+
+    assert len(memberships) == 1
+    assert memberships[0].member_id == "coordinator_01"
+    assert memberships[0].status == "inactive"
+    assert memberships[0].role_name == "writer_agent"
+    assert memberships[0].member_type == "human"
+
+
+def test_same_member_id_can_exist_in_different_projects(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project(project_id="alpha_project", slug="alpha-project"))
+    db.upsert_project(_project(project_id="beta_project", slug="beta-project"))
+    db.upsert_project_membership(_membership(project_id="alpha_project", member_id="shared_member"))
+    db.upsert_project_membership(_membership(project_id="beta_project", member_id="shared_member"))
+
+    alpha = db.get_project_membership("alpha_project", "shared_member")
+    beta = db.get_project_membership("beta_project", "shared_member")
+
+    assert alpha is not None
+    assert beta is not None
+    assert alpha.project_id == "alpha_project"
+    assert beta.project_id == "beta_project"
+
+
+def test_member_id_is_not_treated_as_chat_or_user_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_project_membership(_membership(member_id="member_101"))
+
+    with pytest.raises(ValueError, match="empty_member_id"):
+        db.get_project_membership("alpha_project", 101)  # type: ignore[arg-type]
+
+
+def test_get_project_membership_returns_none_for_unknown_member(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    assert db.get_project_membership("alpha_project", "missing_member") is None
+
+
+def test_upsert_project_membership_rejects_non_membership(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_project_membership_type"):
+        db.upsert_project_membership("bad")  # type: ignore[arg-type]
+
+
+def test_upsert_project_membership_rejects_unknown_project(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="unknown_project_id:alpha_project"):
+        db.upsert_project_membership(_membership())
+
+
+def test_membership_methods_reject_invalid_project_or_member_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_project_id"):
+        db.get_project_membership("bad-id", "member_01")
+    with pytest.raises(ValueError, match="invalid_member_id"):
+        db.get_project_membership("alpha_project", "bad-id")
+    with pytest.raises(ValueError, match="invalid_project_id"):
+        db.list_project_memberships("bad-id")
+
+
+# ---------------------------------------------------------------------------
+# Project chat bindings
+# ---------------------------------------------------------------------------
+
+
+def test_project_chat_binding_round_trip_with_negative_telegram_chat_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    binding = _binding(chat_id=-1009876543210)
+
+    db.bind_project_chat(binding)
+
+    assert db.get_project_chat_binding("alpha_project") == binding
+
+
+def test_get_project_for_chat_round_trip(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    binding = _binding(chat_id=-1001234567890)
+    db.bind_project_chat(binding)
+
+    assert db.get_project_for_chat("telegram", -1001234567890) == binding
+
+
+def test_project_chat_binding_is_one_to_one(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project(project_id="alpha_project", slug="alpha-project"))
+    db.upsert_project(_project(project_id="beta_project", slug="beta-project"))
+    db.bind_project_chat(_binding(project_id="alpha_project", chat_id=-100123))
+
+    with pytest.raises(ValueError, match="chat_binding_conflict:telegram:-100123"):
+        db.bind_project_chat(_binding(project_id="beta_project", chat_id=-100123))
+
+
+def test_bind_project_chat_rejects_non_binding(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_project_chat_binding_type"):
+        db.bind_project_chat("bad")  # type: ignore[arg-type]
+
+
+def test_bind_project_chat_rejects_unknown_project(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="unknown_project_id:alpha_project"):
+        db.bind_project_chat(_binding())
+
+
+def test_get_project_chat_binding_returns_none_for_unknown_project(tmp_path: Path):
+    db = _make_db(tmp_path)
+    assert db.get_project_chat_binding("missing_project") is None
+
+
+def test_get_project_for_chat_returns_none_for_unknown_chat(tmp_path: Path):
+    db = _make_db(tmp_path)
+    assert db.get_project_for_chat("telegram", -1001) is None
+
+
+def test_chat_binding_methods_reject_invalid_project_provider_and_chat_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_project_id"):
+        db.get_project_chat_binding("bad-id")
+    with pytest.raises(ValueError, match="invalid_chat_provider"):
+        db.get_project_for_chat("discord", -1001)
+    with pytest.raises(ValueError, match="invalid_chat_id"):
+        db.get_project_for_chat("telegram", 0)
+
+
+# ---------------------------------------------------------------------------
+# Migration v1 -> v3
 # ---------------------------------------------------------------------------
 
 
@@ -524,12 +1038,18 @@ def test_migrates_v1_schema_with_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 2
+    assert db.schema_version() == 3
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v1")
     assert task is not None
     assert task.branch == "feature/task-v1"
     assert db.get_budget(1) == pytest.approx(7.5)
+    assert _table_names(db_path) >= {
+        "projects",
+        "project_policies",
+        "project_members",
+        "project_chat_bindings",
+    }
 
 
 def test_migrates_v1_schema_without_schema_meta(tmp_path: Path):
@@ -538,7 +1058,7 @@ def test_migrates_v1_schema_without_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 2
+    assert db.schema_version() == 3
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(7.5)
 
@@ -562,17 +1082,8 @@ def test_v1_migration_renames_tier_name_column_to_active_tier(tmp_path: Path):
 
     StateDB(db_path)
 
-    conn = sqlite3.connect(db_path)
-    try:
-        columns = [
-            row[1]
-            for row in conn.execute("PRAGMA table_info(tier_sessions)").fetchall()
-        ]
-    finally:
-        conn.close()
-
-    assert "active_tier" in columns
-    assert "tier_name" not in columns
+    assert "active_tier" in _table_columns(db_path, "tier_sessions")
+    assert "tier_name" not in _table_columns(db_path, "tier_sessions")
 
 
 def test_v1_migration_adds_autoincrement_id_to_task_history(tmp_path: Path):
@@ -581,13 +1092,39 @@ def test_v1_migration_adds_autoincrement_id_to_task_history(tmp_path: Path):
 
     StateDB(db_path)
 
-    conn = sqlite3.connect(db_path)
-    try:
-        columns = [
-            row[1]
-            for row in conn.execute("PRAGMA table_info(task_history)").fetchall()
-        ]
-    finally:
-        conn.close()
+    assert _table_columns(db_path, "task_history")[0] == "id"
 
-    assert columns[0] == "id"
+
+# ---------------------------------------------------------------------------
+# Migration v2 -> v3
+# ---------------------------------------------------------------------------
+
+
+def test_migrates_v2_schema_to_v3_and_preserves_existing_data(tmp_path: Path):
+    db_path = tmp_path / "v2.db"
+    _build_v2_db(db_path)
+
+    db = StateDB(db_path)
+
+    assert db.schema_version() == 3
+    assert db.get_tier(1) == "STANDARD"
+    task = db.get_task("task-v2")
+    assert task is not None
+    assert task.branch == "feature/task-v2"
+    assert task.commit_sha == "feedface"
+    assert db.get_budget(1) == pytest.approx(8.25)
+
+
+def test_v2_migration_adds_project_tables(tmp_path: Path):
+    db_path = tmp_path / "v2-projects.db"
+    _build_v2_db(db_path)
+
+    StateDB(db_path)
+
+    assert _table_names(db_path) >= {
+        "projects",
+        "project_policies",
+        "project_members",
+        "project_chat_bindings",
+    }
+
