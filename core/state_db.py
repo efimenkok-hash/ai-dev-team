@@ -45,7 +45,9 @@ import re
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 from core.project_models import (
     VALID_CHAT_PROVIDERS,
@@ -60,6 +62,7 @@ _CURRENT_SCHEMA_VERSION = 3
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_T = TypeVar("_T")
 
 _CREATE_SCHEMA_META = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -363,44 +366,9 @@ class StateDB:
     def upsert_project(self, project: Project) -> None:
         if not isinstance(project, Project):
             raise ValueError(f"invalid_project_type:{type(project).__name__}")
-        with self._lock, self._connect() as conn:
-            self._ensure_project_slug_available(
-                conn,
-                project_id=project.project_id,
-                slug=project.slug,
-            )
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO projects(
-                        project_id,
-                        slug,
-                        name,
-                        description,
-                        owner_user_id,
-                        status
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(project_id) DO UPDATE SET
-                        slug = excluded.slug,
-                        name = excluded.name,
-                        description = excluded.description,
-                        owner_user_id = excluded.owner_user_id,
-                        status = excluded.status
-                    """,
-                    (
-                        project.project_id,
-                        project.slug,
-                        project.name,
-                        project.description,
-                        project.owner_user_id,
-                        project.status,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                raise ValueError(
-                    f"project_slug_already_exists:{project.slug}"
-                ) from exc
+        self._run_write_transaction(
+            lambda conn: self._upsert_project_conn(conn, project)
+        )
 
     def get_project(self, project_id: str) -> Project | None:
         normalized_project_id = self._normalize_project_identifier(
@@ -447,30 +415,9 @@ class StateDB:
             raise ValueError(
                 f"invalid_project_policy_type:{type(policy).__name__}"
             )
-        with self._lock, self._connect() as conn:
-            self._ensure_project_exists(conn, policy.project_id)
-            conn.execute(
-                """
-                INSERT INTO project_policies(
-                    project_id,
-                    allow_hiring,
-                    allow_agent_dm,
-                    require_owner_approval_for_hires
-                )
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(project_id) DO UPDATE SET
-                    allow_hiring = excluded.allow_hiring,
-                    allow_agent_dm = excluded.allow_agent_dm,
-                    require_owner_approval_for_hires =
-                        excluded.require_owner_approval_for_hires
-                """,
-                (
-                    policy.project_id,
-                    int(policy.allow_hiring),
-                    int(policy.allow_agent_dm),
-                    int(policy.require_owner_approval_for_hires),
-                ),
-            )
+        self._run_write_transaction(
+            lambda conn: self._set_project_policy_conn(conn, policy)
+        )
 
     def get_project_policy(self, project_id: str) -> ProjectPolicy | None:
         normalized_project_id = self._normalize_project_identifier(
@@ -497,31 +444,9 @@ class StateDB:
             raise ValueError(
                 f"invalid_project_membership_type:{type(membership).__name__}"
             )
-        with self._lock, self._connect() as conn:
-            self._ensure_project_exists(conn, membership.project_id)
-            conn.execute(
-                """
-                INSERT INTO project_members(
-                    project_id,
-                    member_id,
-                    member_type,
-                    role_name,
-                    status
-                )
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, member_id) DO UPDATE SET
-                    member_type = excluded.member_type,
-                    role_name = excluded.role_name,
-                    status = excluded.status
-                """,
-                (
-                    membership.project_id,
-                    membership.member_id,
-                    membership.member_type,
-                    membership.role_name,
-                    membership.status,
-                ),
-            )
+        self._run_write_transaction(
+            lambda conn: self._upsert_project_membership_conn(conn, membership)
+        )
 
     def get_project_membership(
         self,
@@ -576,37 +501,9 @@ class StateDB:
             raise ValueError(
                 f"invalid_project_chat_binding_type:{type(binding).__name__}"
             )
-        with self._lock, self._connect() as conn:
-            self._ensure_project_exists(conn, binding.project_id)
-            self._ensure_chat_binding_available(
-                conn,
-                project_id=binding.project_id,
-                chat_provider=binding.chat_provider,
-                chat_id=binding.chat_id,
-            )
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO project_chat_bindings(
-                        project_id,
-                        chat_provider,
-                        chat_id
-                    )
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(project_id) DO UPDATE SET
-                        chat_provider = excluded.chat_provider,
-                        chat_id = excluded.chat_id
-                    """,
-                    (
-                        binding.project_id,
-                        binding.chat_provider,
-                        binding.chat_id,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                raise ValueError(
-                    f"chat_binding_conflict:{binding.chat_provider}:{binding.chat_id}"
-                ) from exc
+        self._run_write_transaction(
+            lambda conn: self._bind_project_chat_conn(conn, binding)
+        )
 
     def get_project_chat_binding(
         self,
@@ -825,6 +722,15 @@ class StateDB:
         rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
         return tuple(str(row["name"]) for row in rows)
 
+    def _run_write_transaction(
+        self,
+        operation: Callable[[sqlite3.Connection], _T],
+    ) -> _T:
+        if not callable(operation):
+            raise ValueError("operation_not_callable")
+        with self._lock, self._connect() as conn:
+            return operation(conn)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -906,6 +812,159 @@ class StateDB:
             chat_provider=str(row["chat_provider"]),
             chat_id=int(row["chat_id"]),
         )
+
+    def _upsert_project_conn(
+        self,
+        conn: sqlite3.Connection,
+        project: Project,
+    ) -> None:
+        self._ensure_project_slug_available(
+            conn,
+            project_id=project.project_id,
+            slug=project.slug,
+        )
+        try:
+            conn.execute(
+                """
+                INSERT INTO projects(
+                    project_id,
+                    slug,
+                    name,
+                    description,
+                    owner_user_id,
+                    status
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    slug = excluded.slug,
+                    name = excluded.name,
+                    description = excluded.description,
+                    owner_user_id = excluded.owner_user_id,
+                    status = excluded.status
+                """,
+                (
+                    project.project_id,
+                    project.slug,
+                    project.name,
+                    project.description,
+                    project.owner_user_id,
+                    project.status,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                f"project_slug_already_exists:{project.slug}"
+            ) from exc
+
+    def _set_project_policy_conn(
+        self,
+        conn: sqlite3.Connection,
+        policy: ProjectPolicy,
+    ) -> None:
+        self._ensure_project_exists(conn, policy.project_id)
+        conn.execute(
+            """
+            INSERT INTO project_policies(
+                project_id,
+                allow_hiring,
+                allow_agent_dm,
+                require_owner_approval_for_hires
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(project_id) DO UPDATE SET
+                allow_hiring = excluded.allow_hiring,
+                allow_agent_dm = excluded.allow_agent_dm,
+                require_owner_approval_for_hires =
+                    excluded.require_owner_approval_for_hires
+            """,
+            (
+                policy.project_id,
+                int(policy.allow_hiring),
+                int(policy.allow_agent_dm),
+                int(policy.require_owner_approval_for_hires),
+            ),
+        )
+
+    def _upsert_project_membership_conn(
+        self,
+        conn: sqlite3.Connection,
+        membership: ProjectMembership,
+    ) -> None:
+        self._ensure_project_exists(conn, membership.project_id)
+        conn.execute(
+            """
+            INSERT INTO project_members(
+                project_id,
+                member_id,
+                member_type,
+                role_name,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, member_id) DO UPDATE SET
+                member_type = excluded.member_type,
+                role_name = excluded.role_name,
+                status = excluded.status
+            """,
+            (
+                membership.project_id,
+                membership.member_id,
+                membership.member_type,
+                membership.role_name,
+                membership.status,
+            ),
+        )
+
+    def _bind_project_chat_conn(
+        self,
+        conn: sqlite3.Connection,
+        binding: ProjectChatBinding,
+    ) -> None:
+        self._ensure_project_exists(conn, binding.project_id)
+        self._ensure_chat_binding_available(
+            conn,
+            project_id=binding.project_id,
+            chat_provider=binding.chat_provider,
+            chat_id=binding.chat_id,
+        )
+        try:
+            conn.execute(
+                """
+                INSERT INTO project_chat_bindings(
+                    project_id,
+                    chat_provider,
+                    chat_id
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    chat_provider = excluded.chat_provider,
+                    chat_id = excluded.chat_id
+                """,
+                (
+                    binding.project_id,
+                    binding.chat_provider,
+                    binding.chat_id,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                f"chat_binding_conflict:{binding.chat_provider}:{binding.chat_id}"
+            ) from exc
+
+    def _project_exists_conn(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+    ) -> bool:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM projects
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+        return row is not None
 
     def _ensure_project_exists(
         self,
