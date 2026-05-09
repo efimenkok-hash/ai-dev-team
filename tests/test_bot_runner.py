@@ -37,6 +37,9 @@ from core.bot_runner import (
 )
 from core.confirmation_gate import ConfirmationGate
 from core.model_tier import default_registry as default_tier_registry
+from core.project_models import Project, ProjectPolicy
+from core.project_registry import ProjectRegistry, ProjectSnapshot
+from core.project_runtime import ProjectRuntimeBinding
 from core.state_db import StateDB
 from core.task_history import TaskHistory
 from core.telegram_bridge import (
@@ -47,6 +50,66 @@ from core.telegram_bridge import (
 from core.tier_session import TierSessionStore
 from core.vision_client import VisionClient
 from core.whisper_client import WhisperClient
+
+
+def _git_repo(tmp_path, name="repo"):
+    repo = tmp_path / name
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / ".git").mkdir(exist_ok=True)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    return repo
+
+
+def _project(**overrides):
+    data = {
+        "project_id": "alpha_project",
+        "slug": "alpha-project",
+        "name": "Alpha Project",
+        "description": "Primary AI Office project.",
+        "owner_user_id": 101,
+        "status": "active",
+    }
+    data.update(overrides)
+    return Project(**data)
+
+
+def _policy(**overrides):
+    data = {
+        "project_id": "alpha_project",
+        "allow_hiring": True,
+        "allow_agent_dm": False,
+        "require_owner_approval_for_hires": True,
+    }
+    data.update(overrides)
+    return ProjectPolicy(**data)
+
+
+def _runtime_binding(repo_path, **overrides):
+    data = {
+        "project_id": "alpha_project",
+        "adapter_name": "alpha_adapter",
+        "repo_path": repo_path,
+        "worktree_root": repo_path.parent / "worktrees",
+        "base_branch": "main",
+        "branch_prefix": "feature/",
+        "language": "python",
+        "rules": (),
+        "commands": (),
+        "forbidden_paths": (),
+        "forbidden_tokens": (),
+    }
+    data.update(overrides)
+    return ProjectRuntimeBinding(**data)
+
+
+def _project_snapshot(repo_path, **overrides):
+    data = {
+        "project": _project(),
+        "policy": _policy(),
+        "runtime_binding": _runtime_binding(repo_path),
+    }
+    data.update(overrides)
+    return ProjectSnapshot(**data)
 
 # ---------------------------------------------------------------------------
 # parse_owner_chat_ids
@@ -316,6 +379,22 @@ def test_build_real_task_handler_custom_worktree_root(tmp_path):
         tier_store=store,
         send_progress=_noop_progress,
     )
+    assert callable(result)
+
+
+def test_build_real_task_handler_works_from_registry_backed_project(tmp_path):
+    repo = _git_repo(tmp_path, "registry-repo")
+    db = StateDB(tmp_path / "state.db")
+    ProjectRegistry(db).register_project(_project_snapshot(repo))
+    store = TierSessionStore(default_tier_registry())
+
+    result = build_real_task_handler_from_env(
+        {"OPENROUTER_API_KEY": "sk-or-test"},
+        tier_store=store,
+        send_progress=_noop_progress,
+        state_db=db,
+    )
+
     assert callable(result)
 
 
@@ -1125,6 +1204,20 @@ def test_simple_task_handler_truncates_long_text():
     assert "обрезано" in reply.body
 
 
+def test_simple_task_handler_reports_truthful_multiple_projects_reason():
+    personas = default_registry()
+    handler = make_simple_task_handler(
+        personas,
+        pipeline_unavailable_reason="multiple_projects_require_explicit_binding",
+    )
+    msg = IncomingMessage(chat_id=1, user_id=1, message_id=1, text="hello")
+
+    reply = handler("hello", msg)
+
+    assert "несколько проектов" in reply.body.lower()
+    assert "REPO_PATH" not in reply.body
+
+
 # ---------------------------------------------------------------------------
 # build_bridge_from_env (top-level integration)
 # ---------------------------------------------------------------------------
@@ -1244,6 +1337,155 @@ def test_build_bridge_from_env_uses_simple_handler_no_repo_path(tmp_path):
     bridge.handle(msg)
     assert len(captured) == 1
     assert "hello task" in captured[0].text
+
+
+def test_build_bridge_from_env_uses_registry_backed_active_project(tmp_path):
+    repo = _git_repo(tmp_path, "registry-bridge-repo")
+    db = StateDB(tmp_path / "state.db")
+    ProjectRegistry(db).register_project(_project_snapshot(repo))
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
+    send, captured = _captured_send()
+
+    bridge = build_bridge_from_env(
+        env,
+        send_callable=send,
+        send_progress_callable=lambda _cid, _txt: None,
+    )
+
+    msg = IncomingMessage(
+        chat_id=777,
+        user_id=777,
+        message_id=1,
+        text="build me a CLI",
+    )
+    bridge.handle(msg)
+    assert len(captured) == 1
+    assert "тариф" in captured[0].text.lower() or "/tier" in captured[0].text
+
+
+def test_build_bridge_from_env_seeds_registry_from_legacy_env(tmp_path):
+    repo = _git_repo(tmp_path, "seed-bridge-repo")
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+        REPO_PATH=str(repo),
+    )
+    send, captured = _captured_send()
+
+    bridge = build_bridge_from_env(
+        env,
+        send_callable=send,
+        send_progress_callable=lambda _cid, _txt: None,
+    )
+
+    seeded_db = StateDB(tmp_path / "state.db")
+    seeded_registry = ProjectRegistry(seeded_db)
+    snapshots = seeded_registry.list_project_snapshots()
+    assert len(snapshots) == 1
+    assert snapshots[0].runtime_binding is not None
+
+    msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="task")
+    bridge.handle(msg)
+    assert len(captured) == 1
+    assert "тариф" in captured[0].text.lower() or "/tier" in captured[0].text
+
+
+def test_build_bridge_from_env_multi_owner_legacy_bootstrap_uses_real_handler(
+    tmp_path,
+):
+    repo = _git_repo(tmp_path, "multi-owner-seed-repo")
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777,888",
+        OPENROUTER_API_KEY="sk-or-test",
+        REPO_PATH=str(repo),
+    )
+    send, captured = _captured_send()
+
+    bridge = build_bridge_from_env(
+        env,
+        send_callable=send,
+        send_progress_callable=lambda _cid, _txt: None,
+    )
+
+    seeded_db = StateDB(tmp_path / "state.db")
+    snapshots = ProjectRegistry(seeded_db).list_project_snapshots()
+    assert len(snapshots) == 1
+    assert snapshots[0].project.owner_user_id == 777
+
+    msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="task")
+    bridge.handle(msg)
+    assert len(captured) == 1
+    assert "тариф" in captured[0].text.lower() or "/tier" in captured[0].text
+
+
+def test_build_bridge_from_env_multiple_registry_projects_do_not_auto_select(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo_one = _git_repo(tmp_path, "multi-one")
+    repo_two = _git_repo(tmp_path, "multi-two")
+    registry.register_project(_project_snapshot(repo_one))
+    registry.register_project(
+        _project_snapshot(
+            repo_two,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                repo_two,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
+    send, captured = _captured_send()
+
+    bridge = build_bridge_from_env(env, send_callable=send)
+
+    msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="hello task")
+    bridge.handle(msg)
+    assert len(captured) == 1
+    assert "несколько проектов" in captured[0].text.lower()
+    assert "REPO_PATH" not in captured[0].text
+
+
+def test_build_bridge_from_env_missing_runtime_binding_falls_back_truthfully(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    ProjectRegistry(db).register_project(
+        ProjectSnapshot(project=_project(), policy=_policy())
+    )
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
+    send, captured = _captured_send()
+
+    bridge = build_bridge_from_env(env, send_callable=send)
+
+    msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="hello task")
+    bridge.handle(msg)
+    assert len(captured) == 1
+    assert "runtime binding" in captured[0].text.lower()
+    assert "REPO_PATH" not in captured[0].text
 
 
 def test_build_bridge_from_env_uses_real_handler_with_full_env(tmp_path):

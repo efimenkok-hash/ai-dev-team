@@ -26,10 +26,11 @@ CONTRACTS:
    is set, else None.
 7. build_real_task_handler_from_env assembles the full
    BackgroundTaskRunner + SandboxWorkspace + LLMDispatcher pipeline when
-   OPENROUTER_API_KEY and REPO_PATH are both present in env.  Returns
-   None (silently) if any required env var is missing or any setup error
-   occurs (invalid path, OSError, TypeError, ValueError from subsystems)
-   — callers fall back to make_simple_task_handler in that case.
+   OPENROUTER_API_KEY is present and an active project runtime binding can
+   be resolved from ProjectRegistry or legacy env bootstrap. Returns None
+   (silently) if any required config is missing or any setup error occurs
+   (invalid path, OSError, TypeError, ValueError from subsystems) —
+   callers fall back to make_simple_task_handler in that case.
 8. build_bridge_from_env tries build_real_task_handler_from_env first;
    falls back to make_simple_task_handler when the full stack is absent.
 """
@@ -55,8 +56,13 @@ from core.dispatcher_agents import build_dispatcher_agent_registry_factory
 from core.llm_dispatcher import LLMDispatcher
 from core.model_tier import default_registry as default_tier_registry
 from core.observability import JsonLinesSink, Observability
+from core.project_bootstrap import (
+    ProjectBootstrapResult,
+    build_project_bootstrap_result,
+)
+from core.project_runtime import ProjectRuntimeBinding
 from core.real_task_handler import RealTaskHandlerConfig, make_real_task_handler
-from core.sandbox_workspace import SandboxConfig, SandboxWorkspace
+from core.sandbox_workspace import SandboxWorkspace
 from core.state_db import StateDB
 from core.task_history import TaskHistory
 from core.telegram_bridge import (
@@ -174,7 +180,18 @@ def cleanup_orphan_worktrees_from_env(env: Mapping[str, str]) -> int:
     """
     if not isinstance(env, Mapping):
         raise ValueError("env_must_be_mapping")
-    sandbox = _try_build_sandbox(env)
+    owner_chat_id = env.get("TELEGRAM_OWNER_CHAT_ID")
+    state_db = (
+        _try_build_state_db(env)
+        if isinstance(owner_chat_id, str) and owner_chat_id.strip()
+        else None
+    )
+    bootstrap_result = build_project_bootstrap_result(env, state_db)
+    sandbox = _try_build_sandbox(
+        env,
+        state_db=state_db,
+        bootstrap_result=bootstrap_result,
+    )
     if sandbox is None:
         return 0
     try:
@@ -183,29 +200,60 @@ def cleanup_orphan_worktrees_from_env(env: Mapping[str, str]) -> int:
         return 0
 
 
-def _try_build_sandbox(env: Mapping[str, str]) -> SandboxWorkspace | None:
-    """Build SandboxWorkspace from env-vars, or return None on any failure.
-
-    Reads REPO_PATH (required) and WORKTREE_ROOT (optional). Returns None
-    when REPO_PATH is missing/empty, the path doesn't exist, isn't a git
-    repo, or any subsystem raises ValueError/TypeError/OSError. No threads
-    or background resources are created — safe to call as a probe.
-    """
-    repo_path_raw = env.get("REPO_PATH", "").strip()
-    if not repo_path_raw:
+def _runtime_binding_from_bootstrap(
+    bootstrap_result: ProjectBootstrapResult,
+) -> ProjectRuntimeBinding | None:
+    if not isinstance(bootstrap_result, ProjectBootstrapResult):
+        raise ValueError("invalid_bootstrap_result")
+    if bootstrap_result.active_snapshot is None:
         return None
+    return bootstrap_result.active_snapshot.runtime_binding
+
+
+def _sandbox_from_runtime_binding(
+    binding: ProjectRuntimeBinding,
+) -> SandboxWorkspace | None:
+    if not isinstance(binding, ProjectRuntimeBinding):
+        raise ValueError("invalid_project_runtime_binding")
     try:
-        repo_path = Path(repo_path_raw)
-        worktree_raw = env.get("WORKTREE_ROOT", "").strip()
-        worktree_root = Path(worktree_raw) if worktree_raw else None
-
-        sandbox_cfg_kwargs: dict = {"main_repo_path": repo_path}
-        if worktree_root is not None:
-            sandbox_cfg_kwargs["worktree_root"] = worktree_root
-
-        return SandboxWorkspace(SandboxConfig(**sandbox_cfg_kwargs))
+        return SandboxWorkspace(binding.build_sandbox_config())
     except (ValueError, TypeError, OSError):
         return None
+
+
+def _try_build_sandbox(
+    env: Mapping[str, str],
+    *,
+    state_db: StateDB | None = None,
+    bootstrap_result: ProjectBootstrapResult | None = None,
+) -> SandboxWorkspace | None:
+    """Build SandboxWorkspace from the active project runtime binding.
+
+    Resolution order:
+      1. ProjectRegistry-backed active snapshot, when available.
+      2. Legacy env bootstrap from REPO_PATH / WORKTREE_ROOT.
+
+    Returns None when no active project is available or when the runtime
+    binding cannot materialize a valid SandboxWorkspace.
+    """
+    if not isinstance(env, Mapping):
+        raise ValueError("env_must_be_mapping")
+    if state_db is not None and not isinstance(state_db, StateDB):
+        raise ValueError("invalid_state_db")
+    if (
+        bootstrap_result is not None
+        and not isinstance(bootstrap_result, ProjectBootstrapResult)
+    ):
+        raise ValueError("invalid_bootstrap_result")
+    resolved_bootstrap = (
+        bootstrap_result
+        if bootstrap_result is not None
+        else build_project_bootstrap_result(env, state_db)
+    )
+    binding = _runtime_binding_from_bootstrap(resolved_bootstrap)
+    if binding is None:
+        return None
+    return _sandbox_from_runtime_binding(binding)
 
 
 def _build_observability(env: Mapping[str, str]) -> Observability | None:
@@ -258,18 +306,53 @@ def _try_build_state_db(env: Mapping[str, str]) -> StateDB | None:
         return None
 
 
-def _real_pipeline_eligible(env: Mapping[str, str]) -> bool:
+def _pipeline_unavailable_reason(
+    env: Mapping[str, str],
+    *,
+    bootstrap_result: ProjectBootstrapResult,
+    sandbox: SandboxWorkspace | None,
+) -> str | None:
+    if not isinstance(env, Mapping):
+        raise ValueError("env_must_be_mapping")
+    if not isinstance(bootstrap_result, ProjectBootstrapResult):
+        raise ValueError("invalid_bootstrap_result")
+    if not env.get("OPENROUTER_API_KEY", "").strip():
+        return "missing_openrouter_api_key"
+    if bootstrap_result.active_snapshot is None:
+        return bootstrap_result.reason or "active_project_not_available"
+    if bootstrap_result.active_snapshot.runtime_binding is None:
+        return "active_project_missing_runtime_binding"
+    if sandbox is None:
+        return "active_project_sandbox_unavailable"
+    return None
+
+
+def _real_pipeline_eligible(
+    env: Mapping[str, str],
+    *,
+    bootstrap_result: ProjectBootstrapResult,
+    sandbox: SandboxWorkspace | None,
+) -> bool:
     """True iff `build_real_task_handler_from_env` would return a real handler.
 
-    Validates everything except runner/factory creation: API key present
-    AND sandbox would be successfully built. Used by build_bridge_from_env
-    to decide whether to require send_progress_callable.
+    Validates everything except runner/factory creation: API key present,
+    active project resolved, runtime binding present, and sandbox materialized.
+    Used by build_bridge_from_env to decide whether to require
+    send_progress_callable.
     """
     if not isinstance(env, Mapping):
         return False
-    if not env.get("OPENROUTER_API_KEY", "").strip():
+    try:
+        return (
+            _pipeline_unavailable_reason(
+                env,
+                bootstrap_result=bootstrap_result,
+                sandbox=sandbox,
+            )
+            is None
+        )
+    except ValueError:
         return False
-    return _try_build_sandbox(env) is not None
 
 
 def build_real_task_handler_from_env(
@@ -280,15 +363,18 @@ def build_real_task_handler_from_env(
     sandbox: SandboxWorkspace | None = None,
     task_history: TaskHistory | None = None,
     runner: BackgroundTaskRunner | None = None,
+    state_db: StateDB | None = None,
+    bootstrap_result: ProjectBootstrapResult | None = None,
 ) -> TaskHandler | None:
     """Assemble the full pipeline TaskHandler from env when possible.
 
     Required env vars:
       OPENROUTER_API_KEY — passed to LLMDispatcher
-      REPO_PATH          — path to the main git repository (must exist + have .git)
 
-    Optional env vars:
-      WORKTREE_ROOT      — where worktrees are placed (default: tmp dir)
+    Active project resolution:
+      - first from ProjectRegistry when state_db is supplied and has a single
+        project with a runtime binding
+      - otherwise from legacy REPO_PATH / WORKTREE_ROOT bootstrap
 
     Optional kwargs:
       sandbox       — pre-built SandboxWorkspace (built from env if None).
@@ -299,10 +385,14 @@ def build_real_task_handler_from_env(
                       build_command_registry so /stop can cancel real tasks.
                       When a caller-owned runner is passed, this function
                       will NOT shut it down on error (the caller owns it).
+      state_db      — optional StateDB used to resolve the active project.
+      bootstrap_result — optional pre-built bootstrap decision to avoid
+                         rebuilding / re-seeding registry state.
 
-    Returns None (silently) if OPENROUTER_API_KEY or REPO_PATH are absent,
-    or if any setup error occurs (invalid path, OSError, TypeError, ValueError
-    from subsystems). Callers fall back to make_simple_task_handler in that case.
+    Returns None (silently) if OPENROUTER_API_KEY is absent, if no active
+    project runtime binding can be resolved, or if any setup error occurs
+    (invalid path, OSError, TypeError, ValueError from subsystems). Callers
+    fall back to make_simple_task_handler in that case.
 
     Raises ValueError for non-Mapping env or non-TierSessionStore tier_store.
     """
@@ -312,13 +402,33 @@ def build_real_task_handler_from_env(
         raise ValueError(f"invalid_tier_store:{type(tier_store).__name__}")
     if not callable(send_progress):
         raise ValueError("send_progress_not_callable")
+    if state_db is not None and not isinstance(state_db, StateDB):
+        raise ValueError(f"invalid_state_db:{type(state_db).__name__}")
+    if (
+        bootstrap_result is not None
+        and not isinstance(bootstrap_result, ProjectBootstrapResult)
+    ):
+        raise ValueError("invalid_bootstrap_result")
 
     obs = _build_observability(env)
     dispatcher = build_dispatcher_from_env(env, observability=obs)
     if dispatcher is None:
         return None
 
-    _sandbox = sandbox if sandbox is not None else _try_build_sandbox(env)
+    resolved_bootstrap = (
+        bootstrap_result
+        if bootstrap_result is not None
+        else build_project_bootstrap_result(env, state_db)
+    )
+    _sandbox = (
+        sandbox
+        if sandbox is not None
+        else _try_build_sandbox(
+            env,
+            state_db=state_db,
+            bootstrap_result=resolved_bootstrap,
+        )
+    )
     if _sandbox is None:
         return None
 
@@ -595,7 +705,8 @@ def make_push_handler(
       - Returns ✅ on success with branch + short SHA, ❌ with reason on failure.
 
     When either is None (pipeline not configured):
-      - Returns an informative stub explaining how to enable the feature.
+      - Returns an informative stub explaining that an active project runtime
+        binding is required.
 
     The TaskHistory guard prevents pushing branches of failed tasks that exist
     in main_repo but contain no new commits (they were created by acquire() and
@@ -613,7 +724,7 @@ def make_push_handler(
             return (
                 "🚀 /push <task_id>\n"
                 "\n"
-                "Push недоступен: настрой REPO_PATH чтобы включить."
+                "Push недоступен: активный проект с runtime binding не определён."
             )
         positional = cmd.positional_args()
         if not positional:
@@ -682,7 +793,7 @@ def make_pr_handler(
         * Push the branch (idempotent — safe if already pushed).
         * Run `gh pr create --draft` with title/body derived from the task.
         * Return PR URL on success.
-      - When either is None: returns "настрой REPO_PATH" stub.
+      - When either is None: returns an active-project-runtime stub.
 
     The PR is created as a DRAFT so user can review before requesting review.
     """
@@ -698,7 +809,7 @@ def make_pr_handler(
             return (
                 "🪄 /pr <task_id>\n"
                 "\n"
-                "PR недоступен: настрой REPO_PATH чтобы включить полный pipeline.\n"
+                "PR недоступен: активный проект с runtime binding не определён.\n"
                 "Также нужен `gh` CLI с авторизацией: `gh auth login`."
             )
         positional = cmd.positional_args()
@@ -1033,7 +1144,7 @@ def build_command_registry(
 
     sandbox + task_history are optional: when both are provided the /push
     handler is fully wired (real push to GitHub). When either is None,
-    /push returns a "настрой REPO_PATH" stub.
+    /push returns an active-project-runtime stub.
 
     task_history is also passed to /log: when provided, /log lists recent
     completed tasks and shows per-task details. When None, /log returns a stub.
@@ -1087,31 +1198,122 @@ def build_command_registry(
 # ---------------------------------------------------------------------------
 
 
-def make_simple_task_handler(_personas: PersonaRegistry) -> TaskHandler:
+def _describe_pipeline_unavailable_reason(reason: str | None) -> str:
+    if reason == "missing_openrouter_api_key":
+        return (
+            "Не задан `OPENROUTER_API_KEY`, поэтому LLM-pipeline не может "
+            "стартовать."
+        )
+    if reason == "multiple_projects_require_explicit_binding":
+        return (
+            "В registry найдено несколько проектов, а явный выбор активного "
+            "проекта для single-project runtime ещё не включён."
+        )
+    if reason == "active_project_missing_runtime_binding":
+        return (
+            "Активный проект найден, но у него нет runtime binding "
+            "(repo/adapter/worktree config)."
+        )
+    if reason == "active_project_runtime_binding_invalid":
+        return (
+            "Активный проект найден, но его runtime binding сейчас не "
+            "валидируется на этой машине."
+        )
+    if reason == "active_project_sandbox_unavailable":
+        return (
+            "Активный проект найден, но из его runtime binding не удалось "
+            "построить sandbox."
+        )
+    if reason == "legacy_repo_path_missing":
+        return (
+            "Активный проект не найден, а legacy bootstrap не может "
+            "сработать без `REPO_PATH`."
+        )
+    if reason in {"legacy_repo_path_not_dir", "legacy_repo_path_not_git"}:
+        return (
+            "Legacy bootstrap не прошёл: проверь `REPO_PATH` и убедись, "
+            "что это реальный git-репозиторий."
+        )
+    if reason in {
+        "legacy_owner_chat_id_missing",
+        "legacy_owner_user_id_invalid",
+    }:
+        return (
+            "Legacy bootstrap требует валидный `TELEGRAM_OWNER_CHAT_ID`: "
+            "одно или несколько положительных integer ids."
+        )
+    if reason is not None:
+        return (
+            "Активный проект для полного pipeline не определён. "
+            f"Техническая причина: `{reason}`."
+        )
+    return "Активный проект для полного pipeline не определён."
+
+
+def _describe_pipeline_recovery_hint(reason: str | None) -> str:
+    if reason == "missing_openrouter_api_key":
+        return (
+            "Чтобы включить полный режим, добавь `OPENROUTER_API_KEY` и "
+            "перезапусти бота."
+        )
+    if reason in {
+        "multiple_projects_require_explicit_binding",
+        "active_project_missing_runtime_binding",
+        "active_project_runtime_binding_invalid",
+        "active_project_sandbox_unavailable",
+    }:
+        return (
+            "Чтобы включить полный режим, нужен один активный проект с "
+            "валидным runtime binding в registry."
+        )
+    return (
+        "Чтобы включить полный режим, нужен `OPENROUTER_API_KEY` и активный "
+        "проект с валидным runtime binding в registry либо через legacy "
+        "`REPO_PATH` bootstrap."
+    )
+
+
+def make_simple_task_handler(
+    _personas: PersonaRegistry,
+    *,
+    pipeline_unavailable_reason: str | None = None,
+) -> TaskHandler:
     """MVP task handler. Acknowledges receipt — used when the real LLM
     pipeline isn't fully configured.
 
-    The bot falls into this mode when either OPENROUTER_API_KEY or
-    REPO_PATH is missing from the environment. The reply explicitly tells
-    the user what's missing so they don't think the bot is broken.
+    The bot falls into this mode when the OpenRouter key is absent, when no
+    active project can be resolved, or when the runtime binding cannot be
+    materialized into a sandbox. The reply should stay truthful about the
+    actual blocker instead of always blaming REPO_PATH.
     """
+    if (
+        pipeline_unavailable_reason is not None
+        and (
+            not isinstance(pipeline_unavailable_reason, str)
+            or not pipeline_unavailable_reason.strip()
+        )
+    ):
+        raise ValueError("invalid_pipeline_unavailable_reason")
+    detail = _describe_pipeline_unavailable_reason(pipeline_unavailable_reason)
+    recovery_hint = _describe_pipeline_recovery_hint(
+        pipeline_unavailable_reason
+    )
 
     def _handle(text: str, _msg: IncomingMessage) -> BridgeReply:
         excerpt = text if len(text) <= 200 else text[:200] + " …[обрезано]"
         return BridgeReply(
             persona_role="pm_agent",
             body=(
-                f"⚠️ Реальный pipeline не настроен — задачу не могу выполнить.\n"
+                f"⚠️ Реальный pipeline сейчас недоступен — задачу не могу "
+                f"выполнить.\n"
                 f"\n"
                 f"Получил:\n"
                 f"«{excerpt}»\n"
                 f"\n"
-                f"Чтобы агенты заработали, добавь в .env:\n"
-                f"  • OPENROUTER_API_KEY (https://openrouter.ai/keys)\n"
-                f"  • REPO_PATH = путь к git-репозиторию (с .git/)\n"
+                f"Причина:\n"
+                f"{detail}\n"
                 f"\n"
-                f"Затем перезапусти бота. Без этих переменных я могу только "
-                f"подтверждать приём, а не запускать пайплайн."
+                f"{recovery_hint}"
             ),
         )
 
@@ -1141,9 +1343,10 @@ def build_bridge_from_env(
     `lambda cid, txt: bot.send_message(chat_id=cid, text=txt)`.
 
     Pipeline selection:
-      - If OPENROUTER_API_KEY + REPO_PATH are set → full LLMDispatcher pipeline
-        via make_real_task_handler (dispatcher_agents + BackgroundTaskRunner +
-        SandboxWorkspace). Progress routed through send_progress_callable.
+      - If OPENROUTER_API_KEY is set and an active project runtime binding can
+        be resolved from ProjectRegistry or legacy env bootstrap → full
+        LLMDispatcher pipeline via make_real_task_handler
+        (dispatcher_agents + BackgroundTaskRunner + SandboxWorkspace).
       - Otherwise → make_simple_task_handler (MVP stub, always available).
 
     Raises ValueError if required env vars are missing.
@@ -1182,7 +1385,12 @@ def build_bridge_from_env(
 
     # Build sandbox once so it can be shared between the task handler
     # (acquire/release worktrees) and the /push command handler (push_branch_from_main).
-    sandbox = _try_build_sandbox(env)
+    bootstrap_result = build_project_bootstrap_result(env, state_db)
+    sandbox = _try_build_sandbox(
+        env,
+        state_db=state_db,
+        bootstrap_result=bootstrap_result,
+    )
     if sandbox is not None:
         task_history = (
             TaskHistory(state_db=state_db)
@@ -1197,11 +1405,24 @@ def build_bridge_from_env(
     # worker thread is wasteful.  make_stop_handler(None) correctly returns
     # a "pipeline not configured" stub when runner is None.
     runner: BackgroundTaskRunner | None = (
-        BackgroundTaskRunner() if _real_pipeline_eligible(env) else None
+        BackgroundTaskRunner()
+        if _real_pipeline_eligible(
+            env,
+            bootstrap_result=bootstrap_result,
+            sandbox=sandbox,
+        )
+        else None
+    )
+
+    active_project_name = (
+        bootstrap_result.active_snapshot.project.slug
+        if bootstrap_result.active_snapshot is not None
+        else "не выбран"
     )
 
     commands = build_command_registry(
         personas,
+        active_project=active_project_name,
         state_db=state_db,
         tier_store=tier_store,
         sandbox=sandbox,
@@ -1215,21 +1436,40 @@ def build_bridge_from_env(
     # must raise rather than silently swallow 30+ seconds of events. We use a
     # full eligibility check (not just env-var presence) so misconfigured paths
     # don't trigger this guard — they'll fall back to the simple handler.
-    if _real_pipeline_eligible(env) and send_progress_callable is None:
+    pipeline_unavailable_reason = _pipeline_unavailable_reason(
+        env,
+        bootstrap_result=bootstrap_result,
+        sandbox=sandbox,
+    )
+    if pipeline_unavailable_reason is None and send_progress_callable is None:
         raise ValueError("send_progress_required_for_real_pipeline")
 
     _send_progress: Callable[[int, str], None] = (
         send_progress_callable if send_progress_callable is not None
         else lambda _cid, _txt: None
     )
-    task_handler: TaskHandler = build_real_task_handler_from_env(
+    real_task_handler = build_real_task_handler_from_env(
         env,
         tier_store=tier_store,
         send_progress=_send_progress,
         sandbox=sandbox,
         task_history=task_history,
         runner=runner,
-    ) or make_simple_task_handler(personas)
+        state_db=state_db,
+        bootstrap_result=bootstrap_result,
+    )
+    task_handler: TaskHandler = (
+        real_task_handler
+        if real_task_handler is not None
+        else make_simple_task_handler(
+            personas,
+            pipeline_unavailable_reason=(
+                pipeline_unavailable_reason
+                if pipeline_unavailable_reason is not None
+                else "real_pipeline_initialization_failed"
+            ),
+        )
+    )
 
     return TelegramBridge(
         owner_chat_ids=owner_chat_ids,
