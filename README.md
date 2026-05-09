@@ -128,7 +128,7 @@ Available Telegram commands:
 - `/projects here` - show explicit binding status for the current chat
 - `/projects bind <project_id_or_slug>` - bind the current Telegram group/supergroup chat to an existing runtime-bound project (owner only)
 - `/projects unbind` - remove the explicit project binding from the current chat (owner only)
-- `/switch`
+- `/switch` - read-only project-context helper; it does not select or switch runtime-projects
 - `/budget`
 - `/agents`
 - `/tier`
@@ -146,6 +146,7 @@ Project context requirements today:
 - `/pr` requires a resolved project runtime
 - explicit project chat bindings are managed through `/projects bind` and `/projects unbind`
 - explicit project chats are group/supergroup chats only (`chat_id < 0`)
+- `/switch` is navigation/status only and never changes project resolution or runtime routing
 - owner DM without explicit chat binding works only when the registry has exactly one project
 - unbound chats with multiple projects do not get an implicit runtime
 

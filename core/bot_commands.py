@@ -47,7 +47,7 @@ class CommandName(str, Enum):
 # and what /help renders.
 COMMAND_DESCRIPTIONS: dict[CommandName, str] = {
     CommandName.PROJECTS: "проекты и binding чата (/projects [here|bind|unbind])",
-    CommandName.SWITCH: "переключить проект (/switch <имя>)",
+    CommandName.SWITCH: "статус project context (/switch [project])",
     CommandName.BUDGET: "бюджет (/budget [сумма])",
     CommandName.AGENTS: "состав и перфоманс команды",
     CommandName.TIER: "тариф моделей (/tier [set <имя>|reset])",

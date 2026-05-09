@@ -38,6 +38,7 @@ from core.bot_runner import (
 from core.confirmation_gate import ConfirmationGate
 from core.model_tier import default_registry as default_tier_registry
 from core.project_chat_binding_service import ProjectChatBindingService
+from core.project_context import ProjectContextResolver
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
@@ -1013,17 +1014,213 @@ def test_projects_unbind_owner_can_unbind(tmp_path):
     assert registry.get_project_snapshot_for_chat("telegram", -100123450506) is None
 
 
-def test_switch_handler_no_args():
-    handler = make_switch_handler()
-    text = handler(parse_command("/switch"), None)
-    assert "<имя_проекта>" in text
+def test_switch_handler_bound_project_chat_reports_no_switching(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "switch-bound")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            chat_binding=_chat_binding(chat_id=-100123450701),
+        )
+    )
+    handler = make_switch_handler(ProjectContextResolver(registry, (777,)))
+
+    text = handler(
+        parse_command("/switch"),
+        IncomingMessage(
+            chat_id=-100123450701,
+            user_id=999,
+            message_id=1,
+            text="/switch",
+        ),
+    )
+
+    assert "уже привязан к проекту" in text.lower()
+    assert "alpha-project" in text
+    assert "не используется" in text.lower()
 
 
-def test_switch_handler_with_arg():
-    handler = make_switch_handler()
-    text = handler(parse_command("/switch hedgekeeper"), None)
-    assert "hedgekeeper" in text
-    assert "7b" in text
+def test_switch_handler_bound_project_chat_with_arg_still_does_not_switch(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    alpha_repo = _git_repo(tmp_path, "switch-bound-alpha")
+    beta_repo = _git_repo(tmp_path, "switch-bound-beta")
+    registry.register_project(
+        _project_snapshot(
+            alpha_repo,
+            chat_binding=_chat_binding(chat_id=-100123450702),
+        )
+    )
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    handler = make_switch_handler(resolver)
+
+    text = handler(
+        parse_command("/switch beta-project"),
+        IncomingMessage(
+            chat_id=-100123450702,
+            user_id=999,
+            message_id=1,
+            text="/switch beta-project",
+        ),
+    )
+
+    assert "beta-project" in text
+    assert "не меняет runtime-проект" in text.lower()
+    resolution = resolver.resolve_telegram_context(-100123450702, 999)
+    assert resolution.source == "bound_chat"
+    assert resolution.snapshot is not None
+    assert resolution.snapshot.project.project_id == "alpha_project"
+
+
+def test_switch_handler_unbound_group_chat_points_to_projects_bind(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "switch-unbound-group")
+    registry.register_project(_project_snapshot(repo))
+    handler = make_switch_handler(ProjectContextResolver(registry, (777,)))
+
+    text = handler(
+        parse_command("/switch"),
+        IncomingMessage(
+            chat_id=-100123450703,
+            user_id=999,
+            message_id=1,
+            text="/switch",
+        ),
+    )
+
+    assert "ещё не привязан к проекту" in text.lower()
+    assert "/projects bind" in text
+
+
+def test_switch_handler_unbound_group_with_arg_does_not_create_selection_state(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    alpha_repo = _git_repo(tmp_path, "switch-unbound-alpha")
+    beta_repo = _git_repo(tmp_path, "switch-unbound-beta")
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    handler = make_switch_handler(resolver)
+
+    text = handler(
+        parse_command("/switch beta-project"),
+        IncomingMessage(
+            chat_id=-100123450704,
+            user_id=999,
+            message_id=1,
+            text="/switch beta-project",
+        ),
+    )
+
+    assert "/projects bind" in text
+    assert "selection-state" in text.lower()
+    resolution = resolver.resolve_telegram_context(-100123450704, 999)
+    assert resolution.source == "none"
+    assert resolution.reason == "project_chat_not_bound"
+
+
+def test_switch_handler_owner_dm_single_project_reports_fallback_context(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "switch-owner-single")
+    registry.register_project(_project_snapshot(repo))
+    handler = make_switch_handler(ProjectContextResolver(registry, (777,)))
+
+    text = handler(
+        parse_command("/switch alpha-project"),
+        IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=1,
+            text="/switch alpha-project",
+        ),
+    )
+
+    assert "доступен один проект" in text.lower()
+    assert "fallback" in text.lower()
+    assert "не требуется" in text.lower()
+
+
+def test_switch_handler_owner_dm_multi_project_requires_explicit_project_chat(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    alpha_repo = _git_repo(tmp_path, "switch-owner-multi-alpha")
+    beta_repo = _git_repo(tmp_path, "switch-owner-multi-beta")
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    handler = make_switch_handler(ProjectContextResolver(registry, (777,)))
+
+    text = handler(
+        parse_command("/switch beta-project"),
+        IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=1,
+            text="/switch beta-project",
+        ),
+    )
+
+    assert "явный project chat" in text.lower()
+    assert "не выбирает runtime-проект" in text.lower()
 
 
 def test_budget_handler_show_default():
@@ -1847,6 +2044,155 @@ def test_build_bridge_from_env_wires_project_context_resolver_for_push_gating(
     bridge.handle(msg)
     assert len(captured) == 1
     assert "явный проектный чат" in captured[0].text.lower()
+
+
+def test_switch_does_not_change_bound_chat_free_text_routing(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    alpha_repo = _git_repo(tmp_path, "switch-routing-alpha")
+    beta_repo = _git_repo(tmp_path, "switch-routing-beta")
+    registry.register_project(
+        _project_snapshot(
+            alpha_repo,
+            chat_binding=_chat_binding(chat_id=-100123450710),
+        )
+    )
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+            chat_binding=_chat_binding(
+                project_id="beta_project",
+                chat_id=-100123450711,
+            ),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    task_calls = []
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: task_calls.append(
+            (
+                text,
+                msg.project_id,
+                msg.project_context_source,
+            )
+        )
+        or BridgeReply(persona_role="architect_agent", body="task ok"),
+        project_context_resolver=resolver,
+    )
+
+    switch_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450710,
+            user_id=999,
+            message_id=1,
+            text="/switch beta-project",
+        )
+    )
+    task_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450710,
+            user_id=999,
+            message_id=2,
+            text="bound task after switch",
+        )
+    )
+
+    assert switch_result.handled is True
+    assert switch_result.reason == "command"
+    assert "не меняет runtime-проект" in captured[0].text.lower()
+    assert task_result.handled is True
+    assert task_result.reason == "task"
+    assert task_calls == [
+        (
+            "bound task after switch",
+            "alpha_project",
+            "bound_chat",
+        )
+    ]
+
+
+def test_switch_does_not_create_hidden_state_for_unbound_group_chat(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    alpha_repo = _git_repo(tmp_path, "switch-hidden-state-alpha")
+    beta_repo = _git_repo(tmp_path, "switch-hidden-state-beta")
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    task_calls = []
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: task_calls.append((text, msg.project_id))
+        or BridgeReply(persona_role="architect_agent", body="task ok"),
+        project_context_resolver=resolver,
+    )
+
+    switch_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450712,
+            user_id=999,
+            message_id=1,
+            text="/switch beta-project",
+        )
+    )
+    blocked_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450712,
+            user_id=999,
+            message_id=2,
+            text="unbound task after switch",
+        )
+    )
+
+    assert switch_result.handled is True
+    assert switch_result.reason == "command"
+    assert "/projects bind" in captured[0].text
+    assert blocked_result.handled is False
+    assert blocked_result.reason == "project_context_missing"
+    assert task_calls == []
 
 
 def test_build_bridge_from_env_projects_bind_then_unbind_changes_runtime_resolution(

@@ -772,22 +772,145 @@ def make_projects_handler(
     return _handle
 
 
-def make_switch_handler() -> CommandHandler:
-    def _handle(cmd: BotCommand, _ctx: Any) -> str:
+def _switch_target_matches_current_project(
+    target: str | None,
+    *,
+    project_id: str,
+    project_slug: str,
+) -> bool:
+    if target is None:
+        return True
+    if not isinstance(target, str) or not target.strip():
+        raise ValueError("invalid_switch_target")
+    normalized_target = target.strip().lower()
+    return normalized_target in {project_id, project_slug}
+
+
+def make_switch_handler(
+    project_context_resolver: ProjectContextResolver | None = None,
+) -> CommandHandler:
+    if (
+        project_context_resolver is not None
+        and not isinstance(project_context_resolver, ProjectContextResolver)
+    ):
+        raise ValueError("invalid_project_context_resolver")
+
+    def _handle(cmd: BotCommand, ctx: Any) -> str:
         positional = cmd.positional_args()
-        if not positional:
+        target = positional[0] if positional else None
+        if (
+            project_context_resolver is None
+            or not isinstance(ctx, IncomingMessage)
+        ):
             return (
-                "🔄 Переключение проекта\n"
+                "🔄 /switch\n"
                 "\n"
-                "Использование:  /switch <имя_проекта>\n"
-                "Пример:         /switch hedgekeeper-v2"
+                "Эта команда больше не переключает runtime-проект.\n"
+                "\n"
+                "Она работает только как project-context helper внутри "
+                "Telegram bridge."
             )
-        target = positional[0]
+
+        resolution = project_context_resolver.resolve_telegram_context(
+            chat_id=ctx.chat_id,
+            user_id=ctx.user_id,
+        )
+        project_count = len(
+            project_context_resolver.registry.list_project_snapshots()
+        )
+        target_note = (
+            f"Запрос `{target}` не меняет runtime-проект.\n\n"
+            if target is not None
+            else ""
+        )
+
+        if resolution.source == "bound_chat":
+            snapshot = resolution.snapshot
+            if snapshot is None:
+                raise ValueError("bound_chat_missing_snapshot")
+            return (
+                "🔄 /switch\n"
+                "\n"
+                f"{target_note}"
+                "Этот чат уже привязан к проекту "
+                f"`{snapshot.project.slug}` "
+                f"(`{snapshot.project.project_id}`); переключение здесь не "
+                "используется.\n"
+                "\n"
+                "Если нужен другой проект, используй другой project chat."
+            )
+
+        if resolution.source == "owner_dm_single_project":
+            snapshot = resolution.snapshot
+            if snapshot is None:
+                raise ValueError("owner_dm_single_project_missing_snapshot")
+            if _switch_target_matches_current_project(
+                target,
+                project_id=snapshot.project.project_id,
+                project_slug=snapshot.project.slug,
+            ):
+                return (
+                    "🔄 /switch\n"
+                    "\n"
+                    "Доступен один проект "
+                    f"`{snapshot.project.slug}` "
+                    f"(`{snapshot.project.project_id}`); отдельное "
+                    "переключение не требуется.\n"
+                    "\n"
+                    "Owner DM уже использует однозначный fallback-контекст "
+                    "этого проекта."
+                )
+            return (
+                "🔄 /switch\n"
+                "\n"
+                "Доступен только один проект "
+                f"`{snapshot.project.slug}` "
+                f"(`{snapshot.project.project_id}`).\n"
+                "\n"
+                f"{target_note}"
+                "Отдельное переключение не используется: owner DM уже "
+                "работает через однозначный fallback-контекст."
+            )
+
+        if resolution.reason == "owner_dm_requires_explicit_project_chat":
+            return (
+                "🔄 /switch\n"
+                "\n"
+                f"{target_note}"
+                "При нескольких проектах нужен явный project chat; "
+                "`/switch` не выбирает runtime-проект.\n"
+                "\n"
+                "Для обзора используй `/projects`, а для выполнения задач — "
+                "нужный project chat."
+            )
+
+        if ctx.chat_id < 0:
+            return (
+                "🔄 /switch\n"
+                "\n"
+                f"{target_note}"
+                "Этот чат ещё не привязан к проекту; сначала используй "
+                "`/projects bind <project_id_or_slug>`.\n"
+                "\n"
+                "`/switch` не создаёт временный selection-state."
+            )
+
+        if resolution.is_owner_chat and project_count == 0:
+            return (
+                "🔄 /switch\n"
+                "\n"
+                "Проекты ещё не зарегистрированы; `/switch` не выбирает "
+                "runtime-проект."
+            )
+
         return (
-            f"🔄 Принял запрос на переключение → «{target}»\n"
-            f"\n"
-            f"🔜 Реальное переключение появится в Модуле 7b "
-            f"(подключение AdapterRegistry)."
+            "🔄 /switch\n"
+            "\n"
+            f"{target_note}"
+            "Этот чат сейчас не определяет project runtime-контекст.\n"
+            "\n"
+            "Для multi-project работы нужен явный project chat; `/switch` "
+            "не создаёт скрытый выбор проекта."
         )
 
     return _handle
@@ -1579,6 +1702,7 @@ def build_command_registry(
     runner: BackgroundTaskRunner | None = None,
     runtime_router: ProjectRuntimeRouter | None = None,
     project_chat_binding_service: ProjectChatBindingService | None = None,
+    project_context_resolver: ProjectContextResolver | None = None,
 ) -> CommandRegistry:
     """Build a CommandRegistry pre-populated with all 10 default handlers.
 
@@ -1623,6 +1747,14 @@ def build_command_registry(
         )
     ):
         raise ValueError("invalid_project_chat_binding_service")
+    if (
+        project_context_resolver is not None
+        and not isinstance(
+            project_context_resolver,
+            ProjectContextResolver,
+        )
+    ):
+        raise ValueError("invalid_project_context_resolver")
 
     reg = CommandRegistry()
     budget_state = _BudgetState(
@@ -1638,7 +1770,10 @@ def build_command_registry(
             project_chat_binding_service=project_chat_binding_service,
         ),
     )
-    reg.register(CommandName.SWITCH, make_switch_handler())
+    reg.register(
+        CommandName.SWITCH,
+        make_switch_handler(project_context_resolver),
+    )
     reg.register(CommandName.BUDGET, make_budget_handler(budget_state))
     reg.register(CommandName.AGENTS, make_agents_handler(personas))
     reg.register(CommandName.TIER, make_tier_handler(tier_store))
@@ -1887,6 +2022,10 @@ def build_bridge_from_env(
         if bootstrap_result.active_snapshot is not None
         else "не выбран"
     )
+    project_context_resolver = _try_build_project_context_resolver(
+        state_db,
+        owner_chat_ids,
+    )
     project_chat_binding_service = _try_build_project_chat_binding_service(
         state_db,
         owner_chat_ids,
@@ -1901,6 +2040,7 @@ def build_bridge_from_env(
         runner=runner,
         runtime_router=runtime_router,
         project_chat_binding_service=project_chat_binding_service,
+        project_context_resolver=project_context_resolver,
     )
 
     # Attempt to build the full dispatcher-backed pipeline; fall back to stub.
@@ -1943,11 +2083,6 @@ def build_bridge_from_env(
             ),
         )
     )
-    project_context_resolver = _try_build_project_context_resolver(
-        state_db,
-        owner_chat_ids,
-    )
-
     return TelegramBridge(
         owner_chat_ids=owner_chat_ids,
         send=send_callable,
