@@ -46,7 +46,7 @@ class CommandName(str, Enum):
 # Russian-language descriptions; these match what we registered in BotFather
 # and what /help renders.
 COMMAND_DESCRIPTIONS: dict[CommandName, str] = {
-    CommandName.PROJECTS: "список проектов",
+    CommandName.PROJECTS: "проекты и binding чата (/projects [here|bind|unbind])",
     CommandName.SWITCH: "переключить проект (/switch <имя>)",
     CommandName.BUDGET: "бюджет (/budget [сумма])",
     CommandName.AGENTS: "состав и перфоманс команды",

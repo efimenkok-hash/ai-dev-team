@@ -37,6 +37,7 @@ from core.bot_runner import (
 )
 from core.confirmation_gate import ConfirmationGate
 from core.model_tier import default_registry as default_tier_registry
+from core.project_chat_binding_service import ProjectChatBindingService
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
@@ -811,6 +812,205 @@ def test_projects_handler_returns_active_project():
 def test_projects_handler_rejects_empty_project():
     with pytest.raises(ValueError, match="empty_active_project"):
         make_projects_handler(active_project="")
+
+
+def test_projects_handler_lists_projects_with_binding_state_and_current_chat(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    alpha_repo = _git_repo(tmp_path, "projects-alpha")
+    registry.register_project(
+        _project_snapshot(
+            alpha_repo,
+            chat_binding=_chat_binding(chat_id=-100123450501),
+        )
+    )
+    registry.register_project(
+        ProjectSnapshot(
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+        )
+    )
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects"),
+        ctx=IncomingMessage(
+            chat_id=-100123450501,
+            user_id=777,
+            message_id=1,
+            text="/projects",
+        ),
+    )
+
+    assert "alpha-project" in text
+    assert "beta-project" in text
+    assert "runtime binding: yes" in text
+    assert "runtime binding: no" in text
+    assert "unbound" in text
+    assert "текущий чат" in text.lower()
+
+
+def test_projects_here_shows_bound_chat_status(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "projects-here-bound")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            chat_binding=_chat_binding(chat_id=-100123450502),
+        )
+    )
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects here"),
+        ctx=IncomingMessage(
+            chat_id=-100123450502,
+            user_id=777,
+            message_id=1,
+            text="/projects here",
+        ),
+    )
+
+    assert "alpha-project" in text
+    assert "-100123450502" in text
+    assert "привязан" in text.lower()
+
+
+def test_projects_here_shows_unbound_chat_status(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "projects-here-unbound")
+    registry.register_project(_project_snapshot(repo))
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects here"),
+        ctx=IncomingMessage(
+            chat_id=-100123450503,
+            user_id=777,
+            message_id=1,
+            text="/projects here",
+        ),
+    )
+
+    assert "не привязан" in text.lower()
+    assert "chat_not_bound" in text
+
+
+def test_projects_bind_owner_group_chat_can_bind_current_chat(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "projects-bind-owner")
+    registry.register_project(_project_snapshot(repo))
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects bind alpha-project"),
+        ctx=IncomingMessage(
+            chat_id=-100123450504,
+            user_id=777,
+            message_id=1,
+            text="/projects bind alpha-project",
+        ),
+    )
+
+    assert "привязан" in text.lower()
+    assert registry.get_project_snapshot_for_chat("telegram", -100123450504) is not None
+
+
+def test_projects_bind_non_owner_cannot_bind(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "projects-bind-non-owner")
+    registry.register_project(_project_snapshot(repo))
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects bind alpha-project"),
+        ctx=IncomingMessage(
+            chat_id=-100123450505,
+            user_id=999,
+            message_id=1,
+            text="/projects bind alpha-project",
+        ),
+    )
+
+    assert "owner user" in text.lower()
+
+
+def test_projects_bind_owner_dm_is_rejected(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "projects-bind-dm")
+    registry.register_project(_project_snapshot(repo))
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects bind alpha-project"),
+        ctx=IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=1,
+            text="/projects bind alpha-project",
+        ),
+    )
+
+    assert "group/supergroup" in text
+
+
+def test_projects_unbind_owner_can_unbind(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "projects-unbind")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            chat_binding=_chat_binding(chat_id=-100123450506),
+        )
+    )
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects unbind"),
+        ctx=IncomingMessage(
+            chat_id=-100123450506,
+            user_id=777,
+            message_id=1,
+            text="/projects unbind",
+        ),
+    )
+
+    assert "отвязан" in text.lower()
+    assert registry.get_project_snapshot_for_chat("telegram", -100123450506) is None
 
 
 def test_switch_handler_no_args():
@@ -1647,6 +1847,71 @@ def test_build_bridge_from_env_wires_project_context_resolver_for_push_gating(
     bridge.handle(msg)
     assert len(captured) == 1
     assert "явный проектный чат" in captured[0].text.lower()
+
+
+def test_build_bridge_from_env_projects_bind_then_unbind_changes_runtime_resolution(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "bind-flow")
+    registry.register_project(_project_snapshot(repo))
+    env = _bridge_env(tmp_path, TELEGRAM_OWNER_CHAT_ID="777")
+    send, captured = _captured_send()
+
+    bridge = build_bridge_from_env(env, send_callable=send)
+
+    bind_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450601,
+            user_id=777,
+            message_id=1,
+            text="/projects bind alpha-project",
+        )
+    )
+
+    assert bind_result.handled is True
+    assert bind_result.reason == "command"
+    assert "привязан" in captured[-1].text.lower()
+
+    task_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450601,
+            user_id=999,
+            message_id=2,
+            text="task after bind",
+        )
+    )
+
+    assert task_result.handled is True
+    assert task_result.reason == "task"
+    assert "task after bind" in captured[-1].text
+
+    unbind_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450601,
+            user_id=777,
+            message_id=3,
+            text="/projects unbind",
+        )
+    )
+
+    assert unbind_result.handled is True
+    assert unbind_result.reason == "command"
+    assert "отвязан" in captured[-1].text.lower()
+
+    blocked_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450601,
+            user_id=999,
+            message_id=4,
+            text="task after unbind",
+        )
+    )
+
+    assert blocked_result.handled is False
+    assert blocked_result.reason == "project_context_missing"
+    assert "ещё не привязан к проекту" in captured[-1].text.lower()
 
 
 def test_build_bridge_from_env_multi_project_bound_chat_uses_real_handler(

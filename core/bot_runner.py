@@ -60,6 +60,9 @@ from core.project_bootstrap import (
     ProjectBootstrapResult,
     build_project_bootstrap_result,
 )
+from core.project_chat_binding_service import (
+    ProjectChatBindingService,
+)
 from core.project_context import ProjectContextResolver
 from core.project_registry import ProjectRegistry
 from core.project_runtime import ProjectRuntimeBinding
@@ -329,6 +332,20 @@ def _try_build_project_context_resolver(
     )
 
 
+def _try_build_project_chat_binding_service(
+    state_db: StateDB | None,
+    owner_chat_ids: frozenset[int],
+) -> ProjectChatBindingService | None:
+    if state_db is None:
+        return None
+    if not isinstance(owner_chat_ids, frozenset):
+        raise ValueError("owner_chat_ids_must_be_frozenset")
+    return ProjectChatBindingService(
+        ProjectRegistry(state_db),
+        tuple(sorted(owner_chat_ids)),
+    )
+
+
 def _try_build_project_runtime_router(
     state_db: StateDB | None,
     bootstrap_result: ProjectBootstrapResult | None,
@@ -542,18 +559,215 @@ def make_help_handler(registered: tuple[CommandName, ...]) -> CommandHandler:
     return _handle
 
 
-def make_projects_handler(active_project: str = "ai-dev-team") -> CommandHandler:
+def _projects_context_ids(ctx: Any) -> tuple[int, int] | None:
+    chat_id = getattr(ctx, "chat_id", None)
+    user_id = getattr(ctx, "user_id", None)
+    if (
+        isinstance(chat_id, int)
+        and not isinstance(chat_id, bool)
+        and chat_id != 0
+        and isinstance(user_id, int)
+        and not isinstance(user_id, bool)
+        and user_id > 0
+    ):
+        return (chat_id, user_id)
+    return None
+
+
+def _format_projects_service_error(code: str) -> str:
+    if not isinstance(code, str) or not code.strip():
+        raise ValueError("empty_projects_error_code")
+    if code == "binding_requires_owner_user":
+        return "Эта операция доступна только owner user."
+    if code == "explicit_project_chat_must_be_group":
+        return "Project chat должен быть group/supergroup, а не личным чатом."
+    if code == "project_not_found":
+        return "Проект не найден."
+    if code == "project_missing_runtime_binding":
+        return "Проект существует, но у него ещё нет runtime binding."
+    if code == "chat_already_bound_to_other_project":
+        return "Этот чат уже привязан к другому проекту."
+    if code == "project_already_bound_to_other_chat":
+        return "Этот проект уже привязан к другому чату."
+    if code == "chat_not_bound":
+        return "Этот чат сейчас не привязан к проекту."
+    return f"Операция не выполнена. Техническая причина: `{code}`."
+
+
+def _format_projects_usage() -> str:
+    return (
+        "📋 /projects\n"
+        "\n"
+        "Использование:\n"
+        "  /projects\n"
+        "  /projects here\n"
+        "  /projects bind <project_id_or_slug>\n"
+        "  /projects unbind"
+    )
+
+
+def make_projects_handler(
+    active_project: str = "ai-dev-team",
+    project_chat_binding_service: ProjectChatBindingService | None = None,
+) -> CommandHandler:
     if not isinstance(active_project, str) or not active_project.strip():
         raise ValueError("empty_active_project")
-
-    def _handle(_cmd: BotCommand, _ctx: Any) -> str:
-        return (
-            f"📋 Проекты\n"
-            f"\n"
-            f"▸ Активный: {active_project}\n"
-            f"\n"
-            f"🔜 Несколько проектов одновременно — в Модуле 7b."
+    if (
+        project_chat_binding_service is not None
+        and not isinstance(
+            project_chat_binding_service,
+            ProjectChatBindingService,
         )
+    ):
+        raise ValueError("invalid_project_chat_binding_service")
+
+    def _handle(cmd: BotCommand, ctx: Any) -> str:
+        if project_chat_binding_service is None:
+            return (
+                f"📋 Проекты\n"
+                f"\n"
+                f"▸ Активный: {active_project}\n"
+                f"\n"
+                f"Project chat binding сейчас недоступен: registry/state_db "
+                f"не подключены."
+            )
+
+        positional = cmd.positional_args()
+        ctx_ids = _projects_context_ids(ctx)
+
+        if not positional:
+            views = project_chat_binding_service.list_project_bindings()
+            lines = ["📋 Проекты", ""]
+            current_project_id: str | None = None
+            if ctx_ids is not None:
+                status = project_chat_binding_service.get_chat_binding_status(
+                    "telegram",
+                    ctx_ids[0],
+                )
+                if status.snapshot is not None:
+                    current_project_id = status.snapshot.project.project_id
+                    lines.append(
+                        "Текущий чат привязан к "
+                        f"`{status.snapshot.project.slug}` "
+                        f"(`{status.snapshot.project.project_id}`)."
+                    )
+                    lines.append("")
+            if not views:
+                lines.append("Проекты ещё не зарегистрированы.")
+                return "\n".join(lines)
+            for view in views:
+                marker = (
+                    " <- текущий чат"
+                    if view.project.project_id == current_project_id
+                    else ""
+                )
+                binding_text = (
+                    f"`{view.chat_binding.chat_id}`{marker}"
+                    if view.chat_binding is not None
+                    else "unbound"
+                )
+                lines.append(
+                    f"• `{view.project.slug}` / `{view.project.project_id}`"
+                )
+                lines.append(
+                    "  runtime binding: "
+                    f"{'yes' if view.has_runtime_binding else 'no'}"
+                )
+                lines.append(f"  chat binding: {binding_text}")
+                lines.append("")
+            while lines and lines[-1] == "":
+                lines.pop()
+            return "\n".join(lines)
+
+        action = positional[0].lower()
+        if action == "here":
+            if ctx_ids is None:
+                return (
+                    "📍 /projects here\n"
+                    "\n"
+                    "Не удалось определить текущий чат для этой команды."
+                )
+            status = project_chat_binding_service.get_chat_binding_status(
+                "telegram",
+                ctx_ids[0],
+            )
+            if status.snapshot is None:
+                return (
+                    "📍 Текущий project chat\n"
+                    "\n"
+                    "Этот чат сейчас не привязан к проекту.\n"
+                    "\n"
+                    f"Причина: `{status.reason}`"
+                )
+            return (
+                "📍 Текущий project chat\n"
+                "\n"
+                "Этот чат привязан к проекту "
+                f"`{status.snapshot.project.slug}` "
+                f"(`{status.snapshot.project.project_id}`).\n"
+                "\n"
+                f"chat_id: `{status.chat_id}`"
+            )
+
+        if action == "bind":
+            if len(positional) < 2:
+                return _format_projects_usage()
+            if ctx_ids is None:
+                return (
+                    "📋 /projects bind\n"
+                    "\n"
+                    "Не удалось определить текущий чат для этой команды."
+                )
+            try:
+                snapshot = project_chat_binding_service.bind_chat_to_project(
+                    chat_provider="telegram",
+                    chat_id=ctx_ids[0],
+                    actor_user_id=ctx_ids[1],
+                    project_ref=positional[1],
+                )
+            except ValueError as exc:
+                return (
+                    "⚠️ Не удалось привязать чат к проекту.\n"
+                    "\n"
+                    f"{_format_projects_service_error(str(exc))}"
+                )
+            return (
+                "✅ Project chat привязан\n"
+                "\n"
+                f"project: `{snapshot.project.slug}` "
+                f"(`{snapshot.project.project_id}`)\n"
+                f"chat_id: `{ctx_ids[0]}`\n"
+                "\n"
+                "Теперь этот чат является project chat."
+            )
+
+        if action == "unbind":
+            if ctx_ids is None:
+                return (
+                    "📋 /projects unbind\n"
+                    "\n"
+                    "Не удалось определить текущий чат для этой команды."
+                )
+            try:
+                binding = project_chat_binding_service.unbind_chat(
+                    chat_provider="telegram",
+                    chat_id=ctx_ids[0],
+                    actor_user_id=ctx_ids[1],
+                )
+            except ValueError as exc:
+                return (
+                    "⚠️ Не удалось отвязать чат от проекта.\n"
+                    "\n"
+                    f"{_format_projects_service_error(str(exc))}"
+                )
+            return (
+                "✅ Project chat отвязан\n"
+                "\n"
+                f"project: `{binding.project_id}`\n"
+                f"chat_id: `{binding.chat_id}`"
+            )
+
+        return _format_projects_usage()
 
     return _handle
 
@@ -1364,6 +1578,7 @@ def build_command_registry(
     task_history: TaskHistory | None = None,
     runner: BackgroundTaskRunner | None = None,
     runtime_router: ProjectRuntimeRouter | None = None,
+    project_chat_binding_service: ProjectChatBindingService | None = None,
 ) -> CommandRegistry:
     """Build a CommandRegistry pre-populated with all 10 default handlers.
 
@@ -1400,6 +1615,14 @@ def build_command_registry(
         ProjectRuntimeRouter,
     ):
         raise ValueError("invalid_project_runtime_router")
+    if (
+        project_chat_binding_service is not None
+        and not isinstance(
+            project_chat_binding_service,
+            ProjectChatBindingService,
+        )
+    ):
+        raise ValueError("invalid_project_chat_binding_service")
 
     reg = CommandRegistry()
     budget_state = _BudgetState(
@@ -1408,7 +1631,13 @@ def build_command_registry(
     )
 
     # Register in enum order so /help output is consistent.
-    reg.register(CommandName.PROJECTS, make_projects_handler(active_project))
+    reg.register(
+        CommandName.PROJECTS,
+        make_projects_handler(
+            active_project,
+            project_chat_binding_service=project_chat_binding_service,
+        ),
+    )
     reg.register(CommandName.SWITCH, make_switch_handler())
     reg.register(CommandName.BUDGET, make_budget_handler(budget_state))
     reg.register(CommandName.AGENTS, make_agents_handler(personas))
@@ -1658,6 +1887,10 @@ def build_bridge_from_env(
         if bootstrap_result.active_snapshot is not None
         else "не выбран"
     )
+    project_chat_binding_service = _try_build_project_chat_binding_service(
+        state_db,
+        owner_chat_ids,
+    )
 
     commands = build_command_registry(
         personas,
@@ -1667,6 +1900,7 @@ def build_bridge_from_env(
         task_history=task_history,
         runner=runner,
         runtime_router=runtime_router,
+        project_chat_binding_service=project_chat_binding_service,
     )
 
     # Attempt to build the full dispatcher-backed pipeline; fall back to stub.

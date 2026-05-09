@@ -124,7 +124,10 @@ Optional:
 
 Available Telegram commands:
 
-- `/projects`
+- `/projects` - list registered projects, runtime binding state, and explicit chat bindings
+- `/projects here` - show explicit binding status for the current chat
+- `/projects bind <project_id_or_slug>` - bind the current Telegram group/supergroup chat to an existing runtime-bound project (owner only)
+- `/projects unbind` - remove the explicit project binding from the current chat (owner only)
 - `/switch`
 - `/budget`
 - `/agents`
@@ -141,6 +144,8 @@ Project context requirements today:
 - free-text tasks require a resolved project runtime
 - `/push` requires a resolved project runtime
 - `/pr` requires a resolved project runtime
+- explicit project chat bindings are managed through `/projects bind` and `/projects unbind`
+- explicit project chats are group/supergroup chats only (`chat_id < 0`)
 - owner DM without explicit chat binding works only when the registry has exactly one project
 - unbound chats with multiple projects do not get an implicit runtime
 
