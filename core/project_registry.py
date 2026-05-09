@@ -20,6 +20,7 @@ from core.project_models import (
     ProjectMembership,
     ProjectPolicy,
 )
+from core.project_runtime import ProjectRuntimeBinding
 from core.state_db import StateDB
 
 
@@ -29,6 +30,7 @@ class ProjectSnapshot:
     policy: ProjectPolicy | None = None
     memberships: tuple[ProjectMembership, ...] = ()
     chat_binding: ProjectChatBinding | None = None
+    runtime_binding: ProjectRuntimeBinding | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.project, Project):
@@ -47,6 +49,14 @@ class ProjectSnapshot:
                 "invalid_project_chat_binding_type:"
                 f"{type(self.chat_binding).__name__}"
             )
+        if self.runtime_binding is not None and not isinstance(
+            self.runtime_binding,
+            ProjectRuntimeBinding,
+        ):
+            raise ValueError(
+                "invalid_project_runtime_binding_type:"
+                f"{type(self.runtime_binding).__name__}"
+            )
         if not isinstance(self.memberships, tuple):
             raise ValueError("memberships_must_be_tuple")
 
@@ -60,6 +70,14 @@ class ProjectSnapshot:
             raise ValueError(
                 "project_chat_binding_project_id_mismatch:"
                 f"{self.chat_binding.project_id}!={project_id}"
+            )
+        if (
+            self.runtime_binding is not None
+            and self.runtime_binding.project_id != project_id
+        ):
+            raise ValueError(
+                "project_runtime_binding_project_id_mismatch:"
+                f"{self.runtime_binding.project_id}!={project_id}"
             )
 
         normalized_memberships: list[ProjectMembership] = []
@@ -127,6 +145,11 @@ class ProjectRegistry:
                 self._state_db._upsert_project_membership_conn(conn, membership)
             if snapshot.chat_binding is not None:
                 self._state_db._bind_project_chat_conn(conn, snapshot.chat_binding)
+            if snapshot.runtime_binding is not None:
+                self._state_db._upsert_project_runtime_binding_conn(
+                    conn,
+                    snapshot.runtime_binding,
+                )
 
         self._state_db._run_write_transaction(_write)
 
@@ -178,6 +201,18 @@ class ProjectRegistry:
     def bind_project_chat(self, binding: ProjectChatBinding) -> None:
         self._state_db.bind_project_chat(binding)
 
+    def set_project_runtime_binding(
+        self,
+        binding: ProjectRuntimeBinding,
+    ) -> None:
+        self._state_db.upsert_project_runtime_binding(binding)
+
+    def get_project_runtime_binding(
+        self,
+        project_id: str,
+    ) -> ProjectRuntimeBinding | None:
+        return self._state_db.get_project_runtime_binding(project_id)
+
     def _build_snapshot(self, project: Project) -> ProjectSnapshot:
         if not isinstance(project, Project):
             raise ValueError(
@@ -190,4 +225,7 @@ class ProjectRegistry:
                 self._state_db.list_project_memberships(project.project_id)
             ),
             chat_binding=self._state_db.get_project_chat_binding(project.project_id),
+            runtime_binding=self._state_db.get_project_runtime_binding(
+                project.project_id
+            ),
         )

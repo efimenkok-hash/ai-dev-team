@@ -17,18 +17,19 @@ Design goals:
 CONTRACTS:
 1. StateDB(path) requires a Path; constructor creates parent directories and
    initializes/migrates the schema eagerly.
-2. Current schema version is 3. Unknown future versions raise ValueError.
+2. Current schema version is 4. Unknown future versions raise ValueError.
 3. Every public method validates arguments via isinstance/ValueError.
 4. Writes are serialized with a process-local lock; reads use independent
    SQLite connections and remain safe under concurrent access.
 5. task_history keeps an append-only audit log. get_task(task_id) returns the
    newest record for that task_id; recent_tasks(n) returns newest-last order.
-6. schema migration supports v1 -> v2 -> v3:
+6. schema migration supports v1 -> v2 -> v3 -> v4:
    - v1 -> v2: tier_sessions.tier_name -> active_tier
    - v1 -> v2: task_history gains AUTOINCREMENT id for stable append-order
      semantics
    - v2 -> v3: adds projects, project_policies, project_members,
      project_chat_bindings
+   - v3 -> v4: adds project_runtime_bindings
 7. Identity model is explicit:
    - Project.owner_user_id is a positive Telegram owner user id stored in
      projects.owner_user_id.
@@ -41,6 +42,7 @@ CONTRACTS:
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -49,6 +51,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
 
+from core.adapter import ProjectCommand, ProjectRule
 from core.project_models import (
     VALID_CHAT_PROVIDERS,
     Project,
@@ -56,9 +59,10 @@ from core.project_models import (
     ProjectMembership,
     ProjectPolicy,
 )
+from core.project_runtime import ProjectRuntimeBinding
 from core.task_history import TaskSummary
 
-_CURRENT_SCHEMA_VERSION = 3
+_CURRENT_SCHEMA_VERSION = 4
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -137,6 +141,22 @@ CREATE TABLE IF NOT EXISTS project_chat_bindings (
     chat_provider TEXT NOT NULL,
     chat_id INTEGER NOT NULL CHECK(chat_id != 0),
     UNIQUE(chat_provider, chat_id)
+)
+"""
+
+_CREATE_PROJECT_RUNTIME_BINDINGS = """
+CREATE TABLE IF NOT EXISTS project_runtime_bindings (
+    project_id TEXT PRIMARY KEY,
+    adapter_name TEXT NOT NULL,
+    repo_path TEXT NOT NULL,
+    worktree_root TEXT,
+    base_branch TEXT NOT NULL,
+    branch_prefix TEXT NOT NULL,
+    language TEXT NOT NULL,
+    rules_json TEXT NOT NULL,
+    commands_json TEXT NOT NULL,
+    forbidden_paths_json TEXT NOT NULL,
+    forbidden_tokens_json TEXT NOT NULL
 )
 """
 
@@ -542,6 +562,40 @@ class StateDB:
             ).fetchone()
         return self._row_to_project_chat_binding(row)
 
+    def upsert_project_runtime_binding(
+        self,
+        binding: ProjectRuntimeBinding,
+    ) -> None:
+        if not isinstance(binding, ProjectRuntimeBinding):
+            raise ValueError(
+                "invalid_project_runtime_binding_type:"
+                f"{type(binding).__name__}"
+            )
+        self._run_write_transaction(
+            lambda conn: self._upsert_project_runtime_binding_conn(conn, binding)
+        )
+
+    def get_project_runtime_binding(
+        self,
+        project_id: str,
+    ) -> ProjectRuntimeBinding | None:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT project_id, adapter_name, repo_path, worktree_root,
+                       base_branch, branch_prefix, language, rules_json,
+                       commands_json, forbidden_paths_json, forbidden_tokens_json
+                FROM project_runtime_bindings
+                WHERE project_id = ?
+                """,
+                (normalized_project_id,),
+            ).fetchone()
+        return self._row_to_project_runtime_binding(row)
+
     # ------------------------------------------------------------------
     # Schema management
     # ------------------------------------------------------------------
@@ -550,7 +604,7 @@ class StateDB:
         with self._lock, self._connect() as conn:
             version = self._detect_schema_version(conn)
             if version == 0:
-                self._create_v3_schema(conn)
+                self._create_v4_schema(conn)
                 return
             if version > _CURRENT_SCHEMA_VERSION:
                 raise ValueError(
@@ -565,9 +619,13 @@ class StateDB:
                     self._migrate_v2_to_v3(conn)
                     version = 3
                     continue
+                if version == 3:
+                    self._migrate_v3_to_v4(conn)
+                    version = 4
+                    continue
                 raise ValueError(f"unsupported_schema_version:{version}")
 
-    def _create_v3_schema(self, conn: sqlite3.Connection) -> None:
+    def _create_v4_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE_SCHEMA_META)
         conn.execute(_CREATE_TIER_SESSIONS)
         conn.execute(_CREATE_TASK_HISTORY)
@@ -576,6 +634,7 @@ class StateDB:
         conn.execute(_CREATE_PROJECT_POLICIES)
         conn.execute(_CREATE_PROJECT_MEMBERS)
         conn.execute(_CREATE_PROJECT_CHAT_BINDINGS)
+        conn.execute(_CREATE_PROJECT_RUNTIME_BINDINGS)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_TASK_ID)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_FINISHED)
         self._set_schema_version(conn, _CURRENT_SCHEMA_VERSION)
@@ -595,6 +654,10 @@ class StateDB:
         conn.execute(_CREATE_PROJECT_MEMBERS)
         conn.execute(_CREATE_PROJECT_CHAT_BINDINGS)
         self._set_schema_version(conn, 3)
+
+    def _migrate_v3_to_v4(self, conn: sqlite3.Connection) -> None:
+        conn.execute(_CREATE_PROJECT_RUNTIME_BINDINGS)
+        self._set_schema_version(conn, 4)
 
     def _migrate_tier_sessions_to_v2(self, conn: sqlite3.Connection) -> None:
         columns = self._table_columns(conn, "tier_sessions")
@@ -813,6 +876,52 @@ class StateDB:
             chat_id=int(row["chat_id"]),
         )
 
+    @staticmethod
+    def _row_to_project_runtime_binding(
+        row: sqlite3.Row | None,
+    ) -> ProjectRuntimeBinding | None:
+        if row is None:
+            return None
+        try:
+            rules_data = json.loads(str(row["rules_json"]))
+            commands_data = json.loads(str(row["commands_json"]))
+            forbidden_paths_data = json.loads(str(row["forbidden_paths_json"]))
+            forbidden_tokens_data = json.loads(str(row["forbidden_tokens_json"]))
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid_project_runtime_binding_json") from exc
+
+        return ProjectRuntimeBinding(
+            project_id=str(row["project_id"]),
+            adapter_name=str(row["adapter_name"]),
+            repo_path=Path(str(row["repo_path"])),
+            worktree_root=(
+                Path(str(row["worktree_root"]))
+                if row["worktree_root"] is not None
+                else None
+            ),
+            base_branch=str(row["base_branch"]),
+            branch_prefix=str(row["branch_prefix"]),
+            language=str(row["language"]),
+            rules=tuple(
+                ProjectRule(
+                    name=str(item["name"]),
+                    description=str(item["description"]),
+                    severity=str(item.get("severity", "error")),
+                )
+                for item in rules_data
+            ),
+            commands=tuple(
+                ProjectCommand(
+                    name=str(item["name"]),
+                    cmd=tuple(str(token) for token in item["cmd"]),
+                    timeout_seconds=int(item.get("timeout_seconds", 120)),
+                )
+                for item in commands_data
+            ),
+            forbidden_paths=tuple(str(item) for item in forbidden_paths_data),
+            forbidden_tokens=tuple(str(item) for item in forbidden_tokens_data),
+        )
+
     def _upsert_project_conn(
         self,
         conn: sqlite3.Connection,
@@ -950,6 +1059,75 @@ class StateDB:
             raise ValueError(
                 f"chat_binding_conflict:{binding.chat_provider}:{binding.chat_id}"
             ) from exc
+
+    def _upsert_project_runtime_binding_conn(
+        self,
+        conn: sqlite3.Connection,
+        binding: ProjectRuntimeBinding,
+    ) -> None:
+        self._ensure_project_exists(conn, binding.project_id)
+        conn.execute(
+            """
+            INSERT INTO project_runtime_bindings(
+                project_id,
+                adapter_name,
+                repo_path,
+                worktree_root,
+                base_branch,
+                branch_prefix,
+                language,
+                rules_json,
+                commands_json,
+                forbidden_paths_json,
+                forbidden_tokens_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id) DO UPDATE SET
+                adapter_name = excluded.adapter_name,
+                repo_path = excluded.repo_path,
+                worktree_root = excluded.worktree_root,
+                base_branch = excluded.base_branch,
+                branch_prefix = excluded.branch_prefix,
+                language = excluded.language,
+                rules_json = excluded.rules_json,
+                commands_json = excluded.commands_json,
+                forbidden_paths_json = excluded.forbidden_paths_json,
+                forbidden_tokens_json = excluded.forbidden_tokens_json
+            """,
+            (
+                binding.project_id,
+                binding.adapter_name,
+                str(binding.repo_path),
+                str(binding.worktree_root) if binding.worktree_root is not None else None,
+                binding.base_branch,
+                binding.branch_prefix,
+                binding.language,
+                json.dumps(
+                    [
+                        {
+                            "name": rule.name,
+                            "description": rule.description,
+                            "severity": rule.severity,
+                        }
+                        for rule in binding.rules
+                    ],
+                    sort_keys=True,
+                ),
+                json.dumps(
+                    [
+                        {
+                            "name": command.name,
+                            "cmd": list(command.cmd),
+                            "timeout_seconds": command.timeout_seconds,
+                        }
+                        for command in binding.commands
+                    ],
+                    sort_keys=True,
+                ),
+                json.dumps(list(binding.forbidden_paths)),
+                json.dumps(list(binding.forbidden_tokens)),
+            ),
+        )
 
     def _project_exists_conn(
         self,

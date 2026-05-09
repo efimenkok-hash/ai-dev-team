@@ -13,6 +13,7 @@ from core.project_models import (
     ProjectPolicy,
 )
 from core.project_registry import ProjectRegistry, ProjectSnapshot
+from core.project_runtime import ProjectRuntimeBinding
 from core.state_db import StateDB
 
 
@@ -64,6 +65,32 @@ def _binding(**overrides: object) -> ProjectChatBinding:
     }
     data.update(overrides)
     return ProjectChatBinding(**data)
+
+
+def _git_repo(tmp_path: Path, name: str = "repo") -> Path:
+    repo = tmp_path / name
+    repo.mkdir(exist_ok=True)
+    (repo / ".git").mkdir(exist_ok=True)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    return repo
+
+
+def _runtime_binding(repo_path: Path, **overrides: object) -> ProjectRuntimeBinding:
+    data: dict[str, object] = {
+        "project_id": "alpha_project",
+        "adapter_name": "alpha_adapter",
+        "repo_path": repo_path,
+        "worktree_root": repo_path.parent / "worktrees",
+        "base_branch": "main",
+        "branch_prefix": "feature/",
+        "language": "python",
+        "rules": (),
+        "commands": (),
+        "forbidden_paths": ("secrets/",),
+        "forbidden_tokens": ("API_KEY",),
+    }
+    data.update(overrides)
+    return ProjectRuntimeBinding(**data)
 
 
 def _snapshot(**overrides: object) -> ProjectSnapshot:
@@ -125,6 +152,14 @@ def test_project_snapshot_rejects_bad_chat_binding():
         ProjectSnapshot(project=_project(), chat_binding="bad")  # type: ignore[arg-type]
 
 
+def test_project_snapshot_rejects_bad_runtime_binding(tmp_path: Path):
+    with pytest.raises(ValueError, match="invalid_project_runtime_binding_type"):
+        ProjectSnapshot(
+            project=_project(),
+            runtime_binding="bad",  # type: ignore[arg-type]
+        )
+
+
 def test_project_snapshot_rejects_non_tuple_memberships():
     with pytest.raises(ValueError, match="memberships_must_be_tuple"):
         ProjectSnapshot(
@@ -159,6 +194,17 @@ def test_project_snapshot_rejects_chat_binding_project_id_mismatch():
         ProjectSnapshot(
             project=_project(project_id="alpha_project", slug="alpha-project"),
             chat_binding=_binding(project_id="beta_project"),
+        )
+
+
+def test_project_snapshot_rejects_runtime_binding_project_id_mismatch(tmp_path: Path):
+    with pytest.raises(ValueError, match="project_runtime_binding_project_id_mismatch"):
+        ProjectSnapshot(
+            project=_project(project_id="alpha_project", slug="alpha-project"),
+            runtime_binding=_runtime_binding(
+                _git_repo(tmp_path),
+                project_id="beta_project",
+            ),
         )
 
 
@@ -205,7 +251,7 @@ def test_project_snapshot_memberships_order_is_stable():
 
 def test_register_project_saves_full_snapshot(tmp_path: Path):
     registry = ProjectRegistry(_make_db(tmp_path))
-    snapshot = _snapshot()
+    snapshot = _snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path)))
 
     registry.register_project(snapshot)
 
@@ -262,7 +308,7 @@ def test_register_project_saves_snapshot_without_memberships(tmp_path: Path):
 
 def test_register_project_rejects_duplicate_project_id(tmp_path: Path):
     registry = ProjectRegistry(_make_db(tmp_path))
-    snapshot = _snapshot()
+    snapshot = _snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path)))
 
     registry.register_project(snapshot)
 
@@ -272,7 +318,7 @@ def test_register_project_rejects_duplicate_project_id(tmp_path: Path):
 
 def test_register_project_rejects_duplicate_slug(tmp_path: Path):
     registry = ProjectRegistry(_make_db(tmp_path))
-    registry.register_project(_snapshot())
+    registry.register_project(_snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path, "alpha-repo"))))
 
     with pytest.raises(ValueError, match="project_slug_already_exists:alpha-project"):
         registry.register_project(
@@ -289,13 +335,17 @@ def test_register_project_rejects_duplicate_slug(tmp_path: Path):
                     _membership(project_id="beta_project", member_id="beta_member"),
                 ),
                 chat_binding=_binding(project_id="beta_project", chat_id=-100222),
+                runtime_binding=_runtime_binding(
+                    _git_repo(tmp_path, "beta-repo"),
+                    project_id="beta_project",
+                ),
             )
         )
 
 
 def test_register_project_rejects_conflicting_chat_binding(tmp_path: Path):
     registry = ProjectRegistry(_make_db(tmp_path))
-    registry.register_project(_snapshot())
+    registry.register_project(_snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path, "alpha-repo"))))
 
     with pytest.raises(ValueError, match="chat_binding_conflict:telegram:-1001234567890"):
         registry.register_project(
@@ -312,6 +362,10 @@ def test_register_project_rejects_conflicting_chat_binding(tmp_path: Path):
                     _membership(project_id="beta_project", member_id="beta_member"),
                 ),
                 chat_binding=_binding(project_id="beta_project"),
+                runtime_binding=_runtime_binding(
+                    _git_repo(tmp_path, "beta-repo"),
+                    project_id="beta_project",
+                ),
             )
         )
 
@@ -330,7 +384,7 @@ def test_register_project_rejects_bad_snapshot_type(tmp_path: Path):
 def test_register_project_does_not_leave_partial_state_on_failure(tmp_path: Path):
     db = _make_db(tmp_path)
     registry = ProjectRegistry(db)
-    registry.register_project(_snapshot())
+    registry.register_project(_snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path, "alpha-repo"))))
 
     with pytest.raises(ValueError, match="chat_binding_conflict:telegram:-1001234567890"):
         registry.register_project(
@@ -354,6 +408,10 @@ def test_register_project_does_not_leave_partial_state_on_failure(tmp_path: Path
                     project_id="beta_project",
                     chat_id=-1001234567890,
                 ),
+                runtime_binding=_runtime_binding(
+                    _git_repo(tmp_path, "beta-repo"),
+                    project_id="beta_project",
+                ),
             )
         )
 
@@ -362,6 +420,7 @@ def test_register_project_does_not_leave_partial_state_on_failure(tmp_path: Path
     assert db.get_project_policy("beta_project") is None
     assert db.list_project_memberships("beta_project") == []
     assert db.get_project_chat_binding("beta_project") is None
+    assert db.get_project_runtime_binding("beta_project") is None
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +430,7 @@ def test_register_project_does_not_leave_partial_state_on_failure(tmp_path: Path
 
 def test_get_project_snapshot_round_trip(tmp_path: Path):
     registry = ProjectRegistry(_make_db(tmp_path))
-    snapshot = _snapshot()
+    snapshot = _snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path)))
     registry.register_project(snapshot)
 
     assert registry.get_project_snapshot("alpha_project") == snapshot
@@ -379,7 +438,7 @@ def test_get_project_snapshot_round_trip(tmp_path: Path):
 
 def test_get_project_snapshot_by_slug_round_trip(tmp_path: Path):
     registry = ProjectRegistry(_make_db(tmp_path))
-    snapshot = _snapshot()
+    snapshot = _snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path)))
     registry.register_project(snapshot)
 
     assert registry.get_project_snapshot_by_slug("  Alpha-Project  ") == snapshot
@@ -387,7 +446,7 @@ def test_get_project_snapshot_by_slug_round_trip(tmp_path: Path):
 
 def test_get_project_snapshot_for_chat_round_trip(tmp_path: Path):
     registry = ProjectRegistry(_make_db(tmp_path))
-    snapshot = _snapshot()
+    snapshot = _snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path)))
     registry.register_project(snapshot)
 
     assert registry.get_project_snapshot_for_chat("telegram", -1001234567890) == snapshot
@@ -462,6 +521,7 @@ def test_list_project_snapshots_order_is_stable_and_collects_optional_fields(
             policy=_policy(),
             memberships=(_membership(),),
             chat_binding=_binding(),
+            runtime_binding=_runtime_binding(_git_repo(tmp_path)),
         )
     )
 
@@ -474,9 +534,11 @@ def test_list_project_snapshots_order_is_stable_and_collects_optional_fields(
     assert snapshots[0].policy is not None
     assert snapshots[0].chat_binding is not None
     assert snapshots[0].memberships == (_membership(),)
+    assert snapshots[0].runtime_binding == _runtime_binding(_git_repo(tmp_path))
     assert snapshots[1].policy is None
     assert snapshots[1].chat_binding is None
     assert snapshots[1].memberships == ()
+    assert snapshots[1].runtime_binding is None
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +583,46 @@ def test_bind_project_chat_reflects_in_snapshot(tmp_path: Path):
     assert snapshot.chat_binding == _binding(chat_id=-1009876543210)
 
 
+def test_set_project_runtime_binding_reflects_in_snapshot(tmp_path: Path):
+    registry = ProjectRegistry(_make_db(tmp_path))
+    registry.register_project(ProjectSnapshot(project=_project()))
+    binding = _runtime_binding(_git_repo(tmp_path), branch_prefix="task/")
+
+    registry.set_project_runtime_binding(binding)
+
+    snapshot = registry.get_project_snapshot("alpha_project")
+    assert snapshot is not None
+    assert snapshot.runtime_binding == binding
+
+
+def test_get_project_runtime_binding_round_trip(tmp_path: Path):
+    registry = ProjectRegistry(_make_db(tmp_path))
+    registry.register_project(ProjectSnapshot(project=_project()))
+    binding = _runtime_binding(_git_repo(tmp_path))
+    registry.set_project_runtime_binding(binding)
+
+    assert registry.get_project_runtime_binding("alpha_project") == binding
+
+
+def test_full_aggregate_round_trip_with_runtime_binding(tmp_path: Path):
+    registry = ProjectRegistry(_make_db(tmp_path))
+    binding = _runtime_binding(_git_repo(tmp_path))
+    snapshot = ProjectSnapshot(
+        project=_project(),
+        policy=_policy(allow_agent_dm=True),
+        memberships=(
+            _membership(member_id="writer_01", role_name="writer_agent"),
+            _membership(member_id="architect_01", role_name="architect_agent"),
+        ),
+        chat_binding=_binding(chat_id=-1009876543210),
+        runtime_binding=binding,
+    )
+
+    registry.register_project(snapshot)
+
+    assert registry.get_project_snapshot("alpha_project") == snapshot
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -546,3 +648,5 @@ def test_registry_mutation_methods_reject_bad_public_input_types(tmp_path: Path)
         registry.upsert_project_membership("bad")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="invalid_project_chat_binding_type"):
         registry.bind_project_chat("bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="invalid_project_runtime_binding_type"):
+        registry.set_project_runtime_binding("bad")  # type: ignore[arg-type]
