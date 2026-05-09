@@ -43,10 +43,16 @@ def test_session_is_frozen():
         s.chat_id = 2  # type: ignore[misc]
 
 
-@pytest.mark.parametrize("bad", [0, -1, True, False, "1", 1.5, None])
+@pytest.mark.parametrize("bad", [0, True, False, "1", 1.5, None])
 def test_session_rejects_invalid_chat_id(bad):
     with pytest.raises(ValueError, match="invalid_chat_id"):
         TierSession(chat_id=bad)  # type: ignore[arg-type]
+
+
+def test_session_allows_negative_transport_chat_id():
+    s = TierSession(chat_id=-1001234567890)
+
+    assert s.chat_id == -1001234567890
 
 
 @pytest.mark.parametrize("bad", ["", "   "])
@@ -119,7 +125,7 @@ def test_get_or_create_returns_same_session_on_repeat():
     assert len(store) == 1
 
 
-@pytest.mark.parametrize("bad", [0, -1, True, "x", 1.5, None])
+@pytest.mark.parametrize("bad", [0, True, "x", 1.5, None])
 def test_get_or_create_rejects_invalid_chat_id(bad):
     store = TierSessionStore(default_registry())
     with pytest.raises(ValueError, match="invalid_chat_id"):
@@ -175,11 +181,20 @@ def test_set_active_rejects_non_string_tier():
         store.set_active(1, 42)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("bad", [0, -1, True])
+@pytest.mark.parametrize("bad", [0, True])
 def test_set_active_rejects_invalid_chat_id(bad):
     store = TierSessionStore(default_registry())
     with pytest.raises(ValueError, match="invalid_chat_id"):
         store.set_active(bad, "STANDARD")  # type: ignore[arg-type]
+
+
+def test_set_active_allows_negative_transport_chat_id():
+    store = TierSessionStore(default_registry())
+
+    session = store.set_active(-1001234567890, "STANDARD")
+
+    assert session.chat_id == -1001234567890
+    assert store.active_tier_name(-1001234567890) == "STANDARD"
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +216,7 @@ def test_reset_idempotent_for_unknown_chat():
     store.reset(999)
 
 
-@pytest.mark.parametrize("bad", [0, -1, True])
+@pytest.mark.parametrize("bad", [0, True])
 def test_reset_rejects_invalid_chat_id(bad):
     store = TierSessionStore(default_registry())
     with pytest.raises(ValueError, match="invalid_chat_id"):

@@ -17,19 +17,20 @@ Design goals:
 CONTRACTS:
 1. StateDB(path) requires a Path; constructor creates parent directories and
    initializes/migrates the schema eagerly.
-2. Current schema version is 4. Unknown future versions raise ValueError.
+2. Current schema version is 5. Unknown future versions raise ValueError.
 3. Every public method validates arguments via isinstance/ValueError.
 4. Writes are serialized with a process-local lock; reads use independent
    SQLite connections and remain safe under concurrent access.
 5. task_history keeps an append-only audit log. get_task(task_id) returns the
    newest record for that task_id; recent_tasks(n) returns newest-last order.
-6. schema migration supports v1 -> v2 -> v3 -> v4:
+6. schema migration supports v1 -> v2 -> v3 -> v4 -> v5:
    - v1 -> v2: tier_sessions.tier_name -> active_tier
    - v1 -> v2: task_history gains AUTOINCREMENT id for stable append-order
      semantics
    - v2 -> v3: adds projects, project_policies, project_members,
      project_chat_bindings
    - v3 -> v4: adds project_runtime_bindings
+   - v4 -> v5: adds task_history.project_id for project-aware task identity
 7. Identity model is explicit:
    - Project.owner_user_id is a positive Telegram owner user id stored in
      projects.owner_user_id.
@@ -62,7 +63,7 @@ from core.project_models import (
 from core.project_runtime import ProjectRuntimeBinding
 from core.task_history import TaskSummary
 
-_CURRENT_SCHEMA_VERSION = 4
+_CURRENT_SCHEMA_VERSION = 5
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -92,7 +93,8 @@ CREATE TABLE IF NOT EXISTS task_history (
     final_state TEXT NOT NULL,
     failure_reason TEXT,
     tier_name TEXT NOT NULL,
-    finished_at REAL NOT NULL
+    finished_at REAL NOT NULL,
+    project_id TEXT
 )
 """
 
@@ -280,9 +282,10 @@ class StateDB:
                     final_state,
                     failure_reason,
                     tier_name,
-                    finished_at
+                    finished_at,
+                    project_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     summary.task_id,
@@ -292,6 +295,7 @@ class StateDB:
                     summary.failure_reason,
                     summary.tier_name,
                     float(summary.finished_at),
+                    summary.project_id,
                 ),
             )
 
@@ -301,7 +305,7 @@ class StateDB:
             row = conn.execute(
                 """
                 SELECT task_id, branch, commit_sha, final_state,
-                       failure_reason, tier_name, finished_at
+                       failure_reason, tier_name, finished_at, project_id
                 FROM task_history
                 WHERE task_id = ?
                 ORDER BY id DESC
@@ -317,7 +321,7 @@ class StateDB:
             rows = conn.execute(
                 """
                 SELECT task_id, branch, commit_sha, final_state,
-                       failure_reason, tier_name, finished_at
+                       failure_reason, tier_name, finished_at, project_id
                 FROM task_history
                 ORDER BY id DESC
                 LIMIT ?
@@ -604,7 +608,7 @@ class StateDB:
         with self._lock, self._connect() as conn:
             version = self._detect_schema_version(conn)
             if version == 0:
-                self._create_v4_schema(conn)
+                self._create_v5_schema(conn)
                 return
             if version > _CURRENT_SCHEMA_VERSION:
                 raise ValueError(
@@ -623,9 +627,13 @@ class StateDB:
                     self._migrate_v3_to_v4(conn)
                     version = 4
                     continue
+                if version == 4:
+                    self._migrate_v4_to_v5(conn)
+                    version = 5
+                    continue
                 raise ValueError(f"unsupported_schema_version:{version}")
 
-    def _create_v4_schema(self, conn: sqlite3.Connection) -> None:
+    def _create_v5_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE_SCHEMA_META)
         conn.execute(_CREATE_TIER_SESSIONS)
         conn.execute(_CREATE_TASK_HISTORY)
@@ -659,6 +667,12 @@ class StateDB:
         conn.execute(_CREATE_PROJECT_RUNTIME_BINDINGS)
         self._set_schema_version(conn, 4)
 
+    def _migrate_v4_to_v5(self, conn: sqlite3.Connection) -> None:
+        columns = self._table_columns(conn, "task_history")
+        if "project_id" not in columns:
+            conn.execute("ALTER TABLE task_history ADD COLUMN project_id TEXT")
+        self._set_schema_version(conn, 5)
+
     def _migrate_tier_sessions_to_v2(self, conn: sqlite3.Connection) -> None:
         columns = self._table_columns(conn, "tier_sessions")
         if columns == ("chat_id", "active_tier", "last_changed_at"):
@@ -691,8 +705,12 @@ class StateDB:
             "failure_reason",
             "tier_name",
             "finished_at",
+            "project_id",
         )
         if columns == desired:
+            conn.execute(_CREATE_TASK_HISTORY)
+            return
+        if columns == desired[:-1]:
             conn.execute(_CREATE_TASK_HISTORY)
             return
         required_v1 = (
@@ -814,6 +832,10 @@ class StateDB:
     def _row_to_task_summary(row: sqlite3.Row | None) -> TaskSummary | None:
         if row is None:
             return None
+        try:
+            project_id = row["project_id"]
+        except IndexError:
+            project_id = None
         return TaskSummary(
             task_id=str(row["task_id"]),
             branch=str(row["branch"]),
@@ -822,6 +844,7 @@ class StateDB:
             failure_reason=row["failure_reason"],
             tier_name=str(row["tier_name"]),
             finished_at=float(row["finished_at"]),
+            project_id=str(project_id) if project_id is not None else None,
         )
 
     @staticmethod
@@ -1204,7 +1227,7 @@ class StateDB:
         if (
             isinstance(chat_id, bool)
             or not isinstance(chat_id, int)
-            or chat_id <= 0
+            or chat_id == 0
         ):
             raise ValueError(f"invalid_chat_id:{chat_id!r}")
 

@@ -21,6 +21,7 @@ def _summary(
     failure_reason: str | None = None,
     tier_name: str = "ECONOMY",
     finished_at: float | None = None,
+    project_id: str | None = None,
 ) -> TaskSummary:
     return TaskSummary(
         task_id=task_id,
@@ -30,6 +31,7 @@ def _summary(
         failure_reason=failure_reason,
         tier_name=tier_name,
         finished_at=finished_at if finished_at is not None else time.time(),
+        project_id=project_id,
     )
 
 
@@ -52,6 +54,12 @@ def test_summary_none_commit_sha_allowed():
 def test_summary_none_failure_reason_allowed():
     s = _summary(failure_reason=None)
     assert s.failure_reason is None
+
+
+def test_summary_project_id_round_trip():
+    s = _summary(project_id="alpha_project")
+
+    assert s.project_id == "alpha_project"
 
 
 @pytest.mark.parametrize("bad", ["", "   "])
@@ -97,6 +105,11 @@ def test_summary_is_frozen():
     s = _summary()
     with pytest.raises(Exception):
         s.task_id = "mutated"  # type: ignore[misc]
+
+
+def test_summary_rejects_invalid_project_id():
+    with pytest.raises(ValueError, match="invalid_project_id"):
+        _summary(project_id="bad-id")
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +210,7 @@ def test_record_rejects_non_summary():
 def test_record_persists_to_state_db(tmp_path):
     db = StateDB(tmp_path / "state.db")
     h = TaskHistory(state_db=db)
-    summary = _summary(task_id="task-db")
+    summary = _summary(task_id="task-db", project_id="alpha_project")
 
     h.record(summary)
 

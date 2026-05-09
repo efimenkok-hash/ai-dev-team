@@ -28,6 +28,7 @@ def _summary(
     failure_reason: str | None = None,
     tier_name: str = "ECONOMY",
     finished_at: float | None = None,
+    project_id: str | None = None,
 ) -> TaskSummary:
     return TaskSummary(
         task_id=task_id,
@@ -37,6 +38,7 @@ def _summary(
         failure_reason=failure_reason,
         tier_name=tier_name,
         finished_at=finished_at if finished_at is not None else time.time(),
+        project_id=project_id,
     )
 
 
@@ -457,6 +459,157 @@ def _build_v3_db(path: Path) -> None:
         conn.close()
 
 
+def _build_v4_db(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO schema_meta(key, value) VALUES ('schema_version', '4')"
+        )
+        conn.execute(
+            """
+            CREATE TABLE tier_sessions (
+                chat_id INTEGER PRIMARY KEY,
+                active_tier TEXT NOT NULL,
+                last_changed_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE task_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                commit_sha TEXT,
+                final_state TEXT NOT NULL,
+                failure_reason TEXT,
+                tier_name TEXT NOT NULL,
+                finished_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE budget (
+                chat_id INTEGER PRIMARY KEY,
+                usd REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                owner_user_id INTEGER NOT NULL,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE project_policies (
+                project_id TEXT PRIMARY KEY,
+                allow_hiring INTEGER NOT NULL,
+                allow_agent_dm INTEGER NOT NULL,
+                require_owner_approval_for_hires INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE project_members (
+                project_id TEXT NOT NULL,
+                member_id TEXT NOT NULL,
+                member_type TEXT NOT NULL,
+                role_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY(project_id, member_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE project_chat_bindings (
+                project_id TEXT PRIMARY KEY,
+                chat_provider TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                UNIQUE(chat_provider, chat_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE project_runtime_bindings (
+                project_id TEXT PRIMARY KEY,
+                adapter_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                worktree_root TEXT,
+                base_branch TEXT NOT NULL,
+                branch_prefix TEXT NOT NULL,
+                language TEXT NOT NULL,
+                rules_json TEXT NOT NULL,
+                commands_json TEXT NOT NULL,
+                forbidden_paths_json TEXT NOT NULL,
+                forbidden_tokens_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO tier_sessions(chat_id, active_tier, last_changed_at)
+            VALUES (1, 'STANDARD', 1234.5)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO task_history(
+                task_id, branch, commit_sha, final_state,
+                failure_reason, tier_name, finished_at
+            )
+            VALUES (
+                'task-v4',
+                'feature/task-v4',
+                'abbaabba',
+                'SUCCESS',
+                NULL,
+                'STANDARD',
+                5555.5
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO budget(chat_id, usd)
+            VALUES (1, 10.5)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects(
+                project_id, slug, name, description, owner_user_id, status
+            )
+            VALUES (
+                'alpha_project',
+                'alpha-project',
+                'Alpha Project',
+                'Primary AI Office project.',
+                101,
+                'active'
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Construction / schema
 # ---------------------------------------------------------------------------
@@ -486,12 +639,12 @@ def test_constructor_creates_database_file(tmp_path: Path):
 
 def test_schema_version_is_current(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 4
+    assert db.schema_version() == 5
 
 
 def test_fresh_schema_creates_project_tables(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 4
+    assert db.schema_version() == 5
     assert _table_names(db.path) >= {
         "schema_meta",
         "tier_sessions",
@@ -503,6 +656,17 @@ def test_fresh_schema_creates_project_tables(tmp_path: Path):
         "project_chat_bindings",
         "project_runtime_bindings",
     }
+    assert _table_columns(db.path, "task_history") == [
+        "id",
+        "task_id",
+        "branch",
+        "commit_sha",
+        "final_state",
+        "failure_reason",
+        "tier_name",
+        "finished_at",
+        "project_id",
+    ]
     assert _table_columns(db.path, "projects") == [
         "project_id",
         "slug",
@@ -666,7 +830,7 @@ def test_reset_tier_is_idempotent(tmp_path: Path):
     assert db.get_tier(123) is None
 
 
-@pytest.mark.parametrize("bad", [0, -1, True, "1"])
+@pytest.mark.parametrize("bad", [0, True, "1"])
 def test_tier_methods_reject_invalid_chat_id(tmp_path: Path, bad):
     db = _make_db(tmp_path)
     with pytest.raises(ValueError, match="invalid_chat_id"):
@@ -675,6 +839,14 @@ def test_tier_methods_reject_invalid_chat_id(tmp_path: Path, bad):
         db.set_tier(bad, "STANDARD")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="invalid_chat_id"):
         db.reset_tier(bad)  # type: ignore[arg-type]
+
+
+def test_tier_methods_allow_negative_transport_chat_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+
+    db.set_tier(-1001234567890, "STANDARD", last_changed_at=7.0)
+
+    assert db.get_tier(-1001234567890) == "STANDARD"
 
 
 @pytest.mark.parametrize("bad", ["", "   ", 123])
@@ -724,6 +896,17 @@ def test_record_task_and_get_task_round_trip(tmp_path: Path):
     summary = _summary(task_id="task-a")
     db.record_task(summary)
     assert db.get_task("task-a") == summary
+
+
+def test_record_task_round_trip_preserves_project_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    summary = _summary(task_id="task-project", project_id="alpha_project")
+
+    db.record_task(summary)
+
+    loaded = db.get_task("task-project")
+    assert loaded is not None
+    assert loaded.project_id == "alpha_project"
 
 
 def test_get_task_returns_none_for_unknown_task(tmp_path: Path):
@@ -868,13 +1051,21 @@ def test_set_budget_allows_zero(tmp_path: Path):
     assert db.get_budget(11) == pytest.approx(0.0)
 
 
-@pytest.mark.parametrize("bad", [0, -1, True, "1"])
+@pytest.mark.parametrize("bad", [0, True, "1"])
 def test_budget_methods_reject_invalid_chat_id(tmp_path: Path, bad):
     db = _make_db(tmp_path)
     with pytest.raises(ValueError, match="invalid_chat_id"):
         db.get_budget(bad)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="invalid_chat_id"):
         db.set_budget(bad, 1.0)  # type: ignore[arg-type]
+
+
+def test_budget_methods_allow_negative_transport_chat_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+
+    db.set_budget(-1001234567890, 12.5)
+
+    assert db.get_budget(-1001234567890) == pytest.approx(12.5)
 
 
 @pytest.mark.parametrize("bad", [-1.0, True, "5"])
@@ -1288,7 +1479,7 @@ def test_get_project_runtime_binding_rejects_invalid_project_id(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v1 -> v4
+# Migration v1 -> v5
 # ---------------------------------------------------------------------------
 
 
@@ -1298,7 +1489,7 @@ def test_migrates_v1_schema_with_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 4
+    assert db.schema_version() == 5
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v1")
     assert task is not None
@@ -1319,7 +1510,7 @@ def test_migrates_v1_schema_without_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 4
+    assert db.schema_version() == 5
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(7.5)
 
@@ -1357,7 +1548,7 @@ def test_v1_migration_adds_autoincrement_id_to_task_history(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v2 -> v4
+# Migration v2 -> v5
 # ---------------------------------------------------------------------------
 
 
@@ -1367,7 +1558,7 @@ def test_migrates_v2_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 4
+    assert db.schema_version() == 5
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v2")
     assert task is not None
@@ -1392,7 +1583,7 @@ def test_v2_migration_adds_project_tables(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v3 -> v4
+# Migration v3 -> v5
 # ---------------------------------------------------------------------------
 
 
@@ -1402,7 +1593,7 @@ def test_migrates_v3_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 4
+    assert db.schema_version() == 5
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(9.5)
     task = db.get_task("task-v3")
@@ -1422,3 +1613,33 @@ def test_v3_migration_adds_project_runtime_bindings_table(tmp_path: Path):
     StateDB(db_path)
 
     assert "project_runtime_bindings" in _table_names(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Migration v4 -> v5
+# ---------------------------------------------------------------------------
+
+
+def test_migrates_v4_schema_to_v5_and_preserves_existing_data(tmp_path: Path):
+    db_path = tmp_path / "v4.db"
+    _build_v4_db(db_path)
+
+    db = StateDB(db_path)
+
+    assert db.schema_version() == 5
+    assert db.get_tier(1) == "STANDARD"
+    assert db.get_budget(1) == pytest.approx(10.5)
+    task = db.get_task("task-v4")
+    assert task is not None
+    assert task.branch == "feature/task-v4"
+    assert task.project_id is None
+    assert db.get_project("alpha_project") == _project()
+
+
+def test_v4_migration_adds_task_history_project_id_column(tmp_path: Path):
+    db_path = tmp_path / "v4-history.db"
+    _build_v4_db(db_path)
+
+    StateDB(db_path)
+
+    assert "project_id" in _table_columns(db_path, "task_history")

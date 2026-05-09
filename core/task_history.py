@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from core.state_db import StateDB
 
 _DEFAULT_MAXLEN = 50
+_PROJECT_ID_MAX_LEN = 64
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ class TaskSummary:
         commit_sha:     full SHA if pipeline reached SUCCESS, else None.
         final_state:    'SUCCESS', 'FAIL', 'BLOCKED', etc.
         failure_reason: human-readable reason string or None on SUCCESS.
+        project_id:     logical project identifier or None for legacy records
+                        created before project-aware history persistence.
         tier_name:      tier used (e.g. 'ECONOMY', 'PREMIUM').
         finished_at:    time.time() at on_complete invocation.
     """
@@ -62,6 +65,7 @@ class TaskSummary:
     failure_reason: str | None
     tier_name: str
     finished_at: float
+    project_id: str | None = None
 
     def __post_init__(self) -> None:
         for field, val in (
@@ -76,6 +80,22 @@ class TaskSummary:
             raise ValueError("commit_sha_must_be_str_or_none")
         if self.failure_reason is not None and not isinstance(self.failure_reason, str):
             raise ValueError("failure_reason_must_be_str_or_none")
+        if self.project_id is not None:
+            if not isinstance(self.project_id, str) or not self.project_id.strip():
+                raise ValueError("project_id_must_be_str_or_none")
+            normalized_project_id = self.project_id.strip().lower()
+            if not normalized_project_id.isascii():
+                raise ValueError(f"non_ascii_project_id:{normalized_project_id}")
+            if (
+                len(normalized_project_id) > _PROJECT_ID_MAX_LEN
+                or not normalized_project_id[0].isalpha()
+                or any(
+                    not (char.islower() or char.isdigit() or char == "_")
+                    for char in normalized_project_id
+                )
+            ):
+                raise ValueError(f"invalid_project_id:{normalized_project_id}")
+            object.__setattr__(self, "project_id", normalized_project_id)
         if (
             isinstance(self.finished_at, bool)
             or not isinstance(self.finished_at, (int, float))

@@ -63,6 +63,10 @@ from core.project_bootstrap import (
 from core.project_context import ProjectContextResolver
 from core.project_registry import ProjectRegistry
 from core.project_runtime import ProjectRuntimeBinding
+from core.project_runtime_router import (
+    ProjectRuntimeRouter,
+    describe_project_runtime_error,
+)
 from core.real_task_handler import RealTaskHandlerConfig, make_real_task_handler
 from core.sandbox_workspace import SandboxWorkspace
 from core.state_db import StateDB
@@ -325,23 +329,48 @@ def _try_build_project_context_resolver(
     )
 
 
+def _try_build_project_runtime_router(
+    state_db: StateDB | None,
+    bootstrap_result: ProjectBootstrapResult | None,
+) -> ProjectRuntimeRouter:
+    if state_db is not None and not isinstance(state_db, StateDB):
+        raise ValueError(f"invalid_state_db:{type(state_db).__name__}")
+    if (
+        bootstrap_result is not None
+        and not isinstance(bootstrap_result, ProjectBootstrapResult)
+    ):
+        raise ValueError("invalid_bootstrap_result")
+    registry = ProjectRegistry(state_db) if state_db is not None else None
+    return ProjectRuntimeRouter(
+        registry,
+        bootstrap_result,
+    )
+
+
 def _pipeline_unavailable_reason(
     env: Mapping[str, str],
     *,
     bootstrap_result: ProjectBootstrapResult,
-    sandbox: SandboxWorkspace | None,
+    runtime_router: ProjectRuntimeRouter | None,
 ) -> str | None:
     if not isinstance(env, Mapping):
         raise ValueError("env_must_be_mapping")
     if not isinstance(bootstrap_result, ProjectBootstrapResult):
         raise ValueError("invalid_bootstrap_result")
+    if runtime_router is not None and not isinstance(
+        runtime_router,
+        ProjectRuntimeRouter,
+    ):
+        raise ValueError("invalid_project_runtime_router")
     if not env.get("OPENROUTER_API_KEY", "").strip():
         return "missing_openrouter_api_key"
+    if runtime_router is not None and runtime_router.has_any_routable_runtime():
+        return None
     if bootstrap_result.active_snapshot is None:
         return bootstrap_result.reason or "active_project_not_available"
     if bootstrap_result.active_snapshot.runtime_binding is None:
         return "active_project_missing_runtime_binding"
-    if sandbox is None:
+    if _sandbox_from_runtime_binding(bootstrap_result.active_snapshot.runtime_binding) is None:
         return "active_project_sandbox_unavailable"
     return None
 
@@ -350,7 +379,7 @@ def _real_pipeline_eligible(
     env: Mapping[str, str],
     *,
     bootstrap_result: ProjectBootstrapResult,
-    sandbox: SandboxWorkspace | None,
+    runtime_router: ProjectRuntimeRouter | None,
 ) -> bool:
     """True iff `build_real_task_handler_from_env` would return a real handler.
 
@@ -366,7 +395,7 @@ def _real_pipeline_eligible(
             _pipeline_unavailable_reason(
                 env,
                 bootstrap_result=bootstrap_result,
-                sandbox=sandbox,
+                runtime_router=runtime_router,
             )
             is None
         )
@@ -384,16 +413,18 @@ def build_real_task_handler_from_env(
     runner: BackgroundTaskRunner | None = None,
     state_db: StateDB | None = None,
     bootstrap_result: ProjectBootstrapResult | None = None,
+    runtime_router: ProjectRuntimeRouter | None = None,
 ) -> TaskHandler | None:
     """Assemble the full pipeline TaskHandler from env when possible.
 
     Required env vars:
       OPENROUTER_API_KEY — passed to LLMDispatcher
 
-    Active project resolution:
-      - first from ProjectRegistry when state_db is supplied and has a single
-        project with a runtime binding
-      - otherwise from legacy REPO_PATH / WORKTREE_ROOT bootstrap
+    Runtime resolution:
+      - preferred per message via ProjectRuntimeRouter using IncomingMessage
+        project context and/or bootstrap fallback
+      - legacy single-project REPO_PATH / WORKTREE_ROOT bootstrap remains the
+        fallback when the message itself does not carry project_id
 
     Optional kwargs:
       sandbox       — pre-built SandboxWorkspace (built from env if None).
@@ -428,6 +459,11 @@ def build_real_task_handler_from_env(
         and not isinstance(bootstrap_result, ProjectBootstrapResult)
     ):
         raise ValueError("invalid_bootstrap_result")
+    if runtime_router is not None and not isinstance(
+        runtime_router,
+        ProjectRuntimeRouter,
+    ):
+        raise ValueError("invalid_project_runtime_router")
 
     obs = _build_observability(env)
     dispatcher = build_dispatcher_from_env(env, observability=obs)
@@ -439,16 +475,16 @@ def build_real_task_handler_from_env(
         if bootstrap_result is not None
         else build_project_bootstrap_result(env, state_db)
     )
-    _sandbox = (
-        sandbox
-        if sandbox is not None
-        else _try_build_sandbox(
-            env,
-            state_db=state_db,
-            bootstrap_result=resolved_bootstrap,
+    resolved_runtime_router = (
+        runtime_router
+        if runtime_router is not None
+        else _try_build_project_runtime_router(
+            state_db,
+            resolved_bootstrap,
         )
     )
-    if _sandbox is None:
+    router_has_routable_runtime = resolved_runtime_router.has_any_routable_runtime()
+    if not router_has_routable_runtime and sandbox is None:
         return None
 
     _runner_owned = runner is None
@@ -457,7 +493,10 @@ def build_real_task_handler_from_env(
         factory = build_dispatcher_agent_registry_factory(dispatcher)
         return make_real_task_handler(
             runner=_runner,
-            sandbox=_sandbox,
+            sandbox=sandbox,
+            runtime_router=(
+                resolved_runtime_router if router_has_routable_runtime else None
+            ),
             tier_store=tier_store,
             send_progress=send_progress,
             agent_registry_factory=factory,
@@ -626,7 +665,7 @@ class _BudgetState:
         if (
             isinstance(chat_id, bool)
             or not isinstance(chat_id, int)
-            or chat_id <= 0
+            or chat_id == 0
         ):
             raise ValueError(f"invalid_chat_id:{chat_id!r}")
 
@@ -639,7 +678,7 @@ def make_budget_handler(state: _BudgetState) -> CommandHandler:
         chat_id = getattr(_ctx, "chat_id", None)
         scoped_chat_id = (
             chat_id
-            if isinstance(chat_id, int) and not isinstance(chat_id, bool) and chat_id > 0
+            if isinstance(chat_id, int) and not isinstance(chat_id, bool) and chat_id != 0
             else None
         )
         try:
@@ -709,9 +748,98 @@ def make_agents_handler(personas: PersonaRegistry) -> CommandHandler:
     return _handle
 
 
+def _resolve_command_sandbox(
+    *,
+    sandbox: SandboxWorkspace | None,
+    runtime_router: ProjectRuntimeRouter | None,
+    ctx: Any,
+) -> tuple[SandboxWorkspace | None, str | None, str | None]:
+    if runtime_router is None:
+        return (sandbox, None, None)
+    if not isinstance(ctx, IncomingMessage):
+        return (None, "message_project_registry_unavailable", None)
+    try:
+        resolved_runtime = runtime_router.resolve_message_runtime(ctx)
+    except ValueError as exc:
+        return (None, str(exc), None)
+    return (
+        resolved_runtime.sandbox,
+        None,
+        resolved_runtime.snapshot.project.project_id,
+    )
+
+
+def _format_command_runtime_unavailable(
+    *,
+    action_title: str,
+    usage: str,
+    reason_code: str,
+) -> str:
+    if not isinstance(action_title, str) or not action_title.strip():
+        raise ValueError("empty_action_title")
+    if not isinstance(usage, str) or not usage.strip():
+        raise ValueError("empty_usage")
+    if not isinstance(reason_code, str) or not reason_code.strip():
+        raise ValueError("empty_reason_code")
+    return (
+        f"{action_title}\n"
+        "\n"
+        f"{describe_project_runtime_error(reason_code)}\n"
+        "\n"
+        f"Использование: {usage}"
+    )
+
+
+def _format_task_project_identity_missing(
+    *,
+    action_title: str,
+    task_id: str,
+) -> str:
+    if not isinstance(action_title, str) or not action_title.strip():
+        raise ValueError("empty_action_title")
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ValueError("empty_task_id")
+    return (
+        f"{action_title}\n"
+        "\n"
+        f"⚠️ task_id `{task_id}` найден, но был записан без project identity.\n"
+        "\n"
+        "Без project_id нельзя безопасно подтвердить, что задача относится "
+        "к текущему проектному контексту."
+    )
+
+
+def _format_task_project_mismatch(
+    *,
+    action_title: str,
+    task_id: str,
+    summary_project_id: str,
+    target_project_id: str,
+) -> str:
+    if not isinstance(action_title, str) or not action_title.strip():
+        raise ValueError("empty_action_title")
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ValueError("empty_task_id")
+    if not isinstance(summary_project_id, str) or not summary_project_id.strip():
+        raise ValueError("empty_summary_project_id")
+    if not isinstance(target_project_id, str) or not target_project_id.strip():
+        raise ValueError("empty_target_project_id")
+    return (
+        f"{action_title}\n"
+        "\n"
+        f"⚠️ task_id `{task_id}` относится к другому проекту.\n"
+        "\n"
+        f"История задачи: `{summary_project_id}`\n"
+        f"Текущий project context: `{target_project_id}`\n"
+        "\n"
+        "Операция остановлена, чтобы не работать с чужим repo/runtime."
+    )
+
+
 def make_push_handler(
     sandbox: SandboxWorkspace | None = None,
     task_history: TaskHistory | None = None,
+    runtime_router: ProjectRuntimeRouter | None = None,
 ) -> CommandHandler:
     """Returns a /push <task_id> handler.
 
@@ -735,15 +863,42 @@ def make_push_handler(
         raise ValueError(f"invalid_sandbox:{type(sandbox).__name__}")
     if task_history is not None and not isinstance(task_history, TaskHistory):
         raise ValueError(f"invalid_task_history:{type(task_history).__name__}")
+    if runtime_router is not None and not isinstance(
+        runtime_router,
+        ProjectRuntimeRouter,
+    ):
+        raise ValueError(
+            f"invalid_runtime_router:{type(runtime_router).__name__}"
+        )
 
     from core.sandbox_workspace import _TASK_ID_RE as _TID_RE
 
     def _handle(cmd: BotCommand, _ctx: Any) -> str:
-        if sandbox is None or task_history is None:
+        if sandbox is None and runtime_router is None:
             return (
                 "🚀 /push <task_id>\n"
                 "\n"
                 "Push недоступен: активный проект с runtime binding не определён."
+            )
+        resolved_sandbox, runtime_error, resolved_project_id = _resolve_command_sandbox(
+            sandbox=sandbox,
+            runtime_router=runtime_router,
+            ctx=_ctx,
+        )
+        if runtime_error is not None or resolved_sandbox is None:
+            return _format_command_runtime_unavailable(
+                action_title="🚀 /push <task_id>",
+                usage="/push <task_id>",
+                reason_code=(
+                    runtime_error
+                    or "bootstrap_active_project_runtime_invalid"
+                ),
+            )
+        if task_history is None:
+            return (
+                "🚀 /push <task_id>\n"
+                "\n"
+                "Push недоступен: история задач для этого запуска не подключена."
             )
         positional = cmd.positional_args()
         if not positional:
@@ -779,8 +934,21 @@ def make_push_handler(
                 f"  state   `{summary.final_state}`\n"
                 f"  reason  `{summary.failure_reason or '?'}`"
             )
+        if resolved_project_id is not None:
+            if summary.project_id is None:
+                return _format_task_project_identity_missing(
+                    action_title="🚀 /push <task_id>",
+                    task_id=task_id,
+                )
+            if summary.project_id != resolved_project_id:
+                return _format_task_project_mismatch(
+                    action_title="🚀 /push <task_id>",
+                    task_id=task_id,
+                    summary_project_id=summary.project_id,
+                    target_project_id=resolved_project_id,
+                )
         try:
-            sandbox.push_named_branch(summary.branch)
+            resolved_sandbox.push_named_branch(summary.branch)
         except Exception as exc:
             return (
                 f"❌ Не удалось запушить\n"
@@ -802,6 +970,7 @@ def make_push_handler(
 def make_pr_handler(
     sandbox: SandboxWorkspace | None = None,
     task_history: TaskHistory | None = None,
+    runtime_router: ProjectRuntimeRouter | None = None,
 ) -> CommandHandler:
     """Returns a /pr <task_id> handler that creates a draft GitHub PR.
 
@@ -820,16 +989,43 @@ def make_pr_handler(
         raise ValueError(f"invalid_sandbox:{type(sandbox).__name__}")
     if task_history is not None and not isinstance(task_history, TaskHistory):
         raise ValueError(f"invalid_task_history:{type(task_history).__name__}")
+    if runtime_router is not None and not isinstance(
+        runtime_router,
+        ProjectRuntimeRouter,
+    ):
+        raise ValueError(
+            f"invalid_runtime_router:{type(runtime_router).__name__}"
+        )
 
     from core.sandbox_workspace import _TASK_ID_RE as _TID_RE
 
     def _handle(cmd: BotCommand, _ctx: Any) -> str:
-        if sandbox is None or task_history is None:
+        if sandbox is None and runtime_router is None:
             return (
                 "🪄 /pr <task_id>\n"
                 "\n"
                 "PR недоступен: активный проект с runtime binding не определён.\n"
                 "Также нужен `gh` CLI с авторизацией: `gh auth login`."
+            )
+        resolved_sandbox, runtime_error, resolved_project_id = _resolve_command_sandbox(
+            sandbox=sandbox,
+            runtime_router=runtime_router,
+            ctx=_ctx,
+        )
+        if runtime_error is not None or resolved_sandbox is None:
+            return _format_command_runtime_unavailable(
+                action_title="🪄 /pr <task_id>",
+                usage="/pr <task_id>",
+                reason_code=(
+                    runtime_error
+                    or "bootstrap_active_project_runtime_invalid"
+                ),
+            )
+        if task_history is None:
+            return (
+                "🪄 /pr <task_id>\n"
+                "\n"
+                "PR недоступен: история задач для этого запуска не подключена."
             )
         positional = cmd.positional_args()
         if not positional:
@@ -862,10 +1058,23 @@ def make_pr_handler(
                 f"  state   `{summary.final_state}`\n"
                 f"  reason  `{summary.failure_reason or '?'}`"
             )
+        if resolved_project_id is not None:
+            if summary.project_id is None:
+                return _format_task_project_identity_missing(
+                    action_title="🪄 /pr <task_id>",
+                    task_id=task_id,
+                )
+            if summary.project_id != resolved_project_id:
+                return _format_task_project_mismatch(
+                    action_title="🪄 /pr <task_id>",
+                    task_id=task_id,
+                    summary_project_id=summary.project_id,
+                    target_project_id=resolved_project_id,
+                )
 
         # 1. Idempotent push first — `gh pr create` requires the branch on remote.
         try:
-            sandbox.push_named_branch(summary.branch)
+            resolved_sandbox.push_named_branch(summary.branch)
         except Exception as exc:
             return (
                 f"❌ Push перед PR не удался\n"
@@ -886,7 +1095,7 @@ def make_pr_handler(
             f"\"Ready for review\" в GitHub когда будете готовы.\n"
         )
         try:
-            url = sandbox.gh_pr_create(
+            url = resolved_sandbox.gh_pr_create(
                 summary.branch,
                 title=pr_title,
                 body=pr_body,
@@ -1082,7 +1291,7 @@ def make_tier_handler(store: TierSessionStore) -> CommandHandler:
             chat_id is None
             or isinstance(chat_id, bool)
             or not isinstance(chat_id, int)
-            or chat_id <= 0
+            or chat_id == 0
         ):
             return no_chat_hint
 
@@ -1154,6 +1363,7 @@ def build_command_registry(
     sandbox: SandboxWorkspace | None = None,
     task_history: TaskHistory | None = None,
     runner: BackgroundTaskRunner | None = None,
+    runtime_router: ProjectRuntimeRouter | None = None,
 ) -> CommandRegistry:
     """Build a CommandRegistry pre-populated with all 10 default handlers.
 
@@ -1185,6 +1395,11 @@ def build_command_registry(
         tier_store = TierSessionStore(default_tier_registry())
     elif not isinstance(tier_store, TierSessionStore):
         raise ValueError("invalid_tier_store")
+    if runtime_router is not None and not isinstance(
+        runtime_router,
+        ProjectRuntimeRouter,
+    ):
+        raise ValueError("invalid_project_runtime_router")
 
     reg = CommandRegistry()
     budget_state = _BudgetState(
@@ -1201,8 +1416,14 @@ def build_command_registry(
     reg.register(CommandName.LOG, make_log_handler(task_history))
     reg.register(CommandName.STOP, make_stop_handler(runner))
     reg.register(CommandName.RETRY, make_retry_handler())
-    reg.register(CommandName.PUSH, make_push_handler(sandbox, task_history))
-    reg.register(CommandName.PR, make_pr_handler(sandbox, task_history))
+    reg.register(
+        CommandName.PUSH,
+        make_push_handler(sandbox, task_history, runtime_router),
+    )
+    reg.register(
+        CommandName.PR,
+        make_pr_handler(sandbox, task_history, runtime_router),
+    )
     # /help is registered LAST so it can list everything else.
     reg.register(
         CommandName.HELP,
@@ -1225,8 +1446,9 @@ def _describe_pipeline_unavailable_reason(reason: str | None) -> str:
         )
     if reason == "multiple_projects_require_explicit_binding":
         return (
-            "В registry найдено несколько проектов, а явный выбор активного "
-            "проекта для single-project runtime ещё не включён."
+            "В registry найдено несколько проектов. Полный pipeline теперь "
+            "выбирает runtime по project context сообщения, а глобальный "
+            "single-project выбор больше не применяется."
         )
     if reason == "active_project_missing_runtime_binding":
         return (
@@ -1282,8 +1504,9 @@ def _describe_pipeline_recovery_hint(reason: str | None) -> str:
         "active_project_sandbox_unavailable",
     }:
         return (
-            "Чтобы включить полный режим, нужен один активный проект с "
-            "валидным runtime binding в registry."
+            "Чтобы включить полный режим, нужен хотя бы один проект с "
+            "валидным runtime binding в registry и корректный project "
+            "context сообщения, либо single-project owner DM fallback."
         )
     return (
         "Чтобы включить полный режим, нужен `OPENROUTER_API_KEY` и активный "
@@ -1402,15 +1625,12 @@ def build_bridge_from_env(
             persistence_path=legacy_tier_path,
         )
 
-    # Build sandbox once so it can be shared between the task handler
-    # (acquire/release worktrees) and the /push command handler (push_branch_from_main).
     bootstrap_result = build_project_bootstrap_result(env, state_db)
-    sandbox = _try_build_sandbox(
-        env,
-        state_db=state_db,
-        bootstrap_result=bootstrap_result,
+    runtime_router = _try_build_project_runtime_router(
+        state_db,
+        bootstrap_result,
     )
-    if sandbox is not None:
+    if runtime_router.has_any_routable_runtime():
         task_history = (
             TaskHistory(state_db=state_db)
             if state_db is not None
@@ -1428,7 +1648,7 @@ def build_bridge_from_env(
         if _real_pipeline_eligible(
             env,
             bootstrap_result=bootstrap_result,
-            sandbox=sandbox,
+            runtime_router=runtime_router,
         )
         else None
     )
@@ -1444,9 +1664,9 @@ def build_bridge_from_env(
         active_project=active_project_name,
         state_db=state_db,
         tier_store=tier_store,
-        sandbox=sandbox,
         task_history=task_history,
         runner=runner,
+        runtime_router=runtime_router,
     )
 
     # Attempt to build the full dispatcher-backed pipeline; fall back to stub.
@@ -1458,7 +1678,7 @@ def build_bridge_from_env(
     pipeline_unavailable_reason = _pipeline_unavailable_reason(
         env,
         bootstrap_result=bootstrap_result,
-        sandbox=sandbox,
+        runtime_router=runtime_router,
     )
     if pipeline_unavailable_reason is None and send_progress_callable is None:
         raise ValueError("send_progress_required_for_real_pipeline")
@@ -1471,11 +1691,11 @@ def build_bridge_from_env(
         env,
         tier_store=tier_store,
         send_progress=_send_progress,
-        sandbox=sandbox,
         task_history=task_history,
         runner=runner,
         state_db=state_db,
         bootstrap_result=bootstrap_result,
+        runtime_router=runtime_router,
     )
     task_handler: TaskHandler = (
         real_task_handler

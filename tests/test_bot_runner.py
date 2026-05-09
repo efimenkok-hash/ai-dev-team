@@ -37,9 +37,10 @@ from core.bot_runner import (
 )
 from core.confirmation_gate import ConfirmationGate
 from core.model_tier import default_registry as default_tier_registry
-from core.project_models import Project, ProjectPolicy
+from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
+from core.project_runtime_router import ProjectRuntimeRouter
 from core.state_db import StateDB
 from core.task_history import TaskHistory
 from core.telegram_bridge import (
@@ -100,6 +101,16 @@ def _runtime_binding(repo_path, **overrides):
     }
     data.update(overrides)
     return ProjectRuntimeBinding(**data)
+
+
+def _chat_binding(**overrides):
+    data = {
+        "project_id": "alpha_project",
+        "chat_provider": "telegram",
+        "chat_id": -100123450001,
+    }
+    data.update(overrides)
+    return ProjectChatBinding(**data)
 
 
 def _project_snapshot(repo_path, **overrides):
@@ -396,6 +407,130 @@ def test_build_real_task_handler_works_from_registry_backed_project(tmp_path):
     )
 
     assert callable(result)
+
+
+def test_build_real_task_handler_works_for_multi_project_registry(tmp_path):
+    alpha_repo = _git_repo(tmp_path, "registry-alpha")
+    beta_repo = _git_repo(tmp_path, "registry-beta")
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    store = TierSessionStore(default_tier_registry())
+
+    result = build_real_task_handler_from_env(
+        {"OPENROUTER_API_KEY": "sk-or-test"},
+        tier_store=store,
+        send_progress=_noop_progress,
+        state_db=db,
+    )
+
+    assert callable(result)
+
+
+def test_build_real_task_handler_routes_free_text_by_message_project_id(
+    tmp_path,
+    monkeypatch,
+):
+    from core.background_runner import BackgroundTaskRunner
+    from core.sandbox_workspace import SandboxError
+
+    alpha_repo = _git_repo(tmp_path, "runtime-alpha")
+    beta_repo = _git_repo(tmp_path, "runtime-beta")
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    store = TierSessionStore(default_tier_registry())
+    store.set_active(-100123450199, "STANDARD")
+    captured = {}
+    used_repos = []
+    runner = BackgroundTaskRunner()
+
+    def _fake_submit(*, task_id, raw_task, run_fn, on_complete):
+        captured["run_fn"] = run_fn
+
+    def _fake_acquire(self, task_id):
+        used_repos.append(self.config.main_repo_path)
+        raise SandboxError("worktree_exists", "forced")
+
+    monkeypatch.setattr(runner, "submit", _fake_submit)
+    monkeypatch.setattr(
+        "core.sandbox_workspace.SandboxWorkspace.acquire",
+        _fake_acquire,
+    )
+
+    try:
+        handler = build_real_task_handler_from_env(
+            {"OPENROUTER_API_KEY": "sk-or-test"},
+            tier_store=store,
+            send_progress=_noop_progress,
+            runner=runner,
+            state_db=db,
+        )
+
+        assert callable(handler)
+
+        reply = handler(
+            "build me a CLI",
+            IncomingMessage(
+                chat_id=-100123450199,
+                user_id=999,
+                message_id=1,
+                text="build me a CLI",
+                project_id="beta_project",
+                project_slug="beta-project",
+                project_context_source="bound_chat",
+            ),
+        )
+
+        assert reply is not None
+        assert "Принял в работу" in reply.body
+        assert callable(captured["run_fn"])
+
+        class _Token:
+            @staticmethod
+            def is_set():
+                return False
+
+        with pytest.raises(SandboxError, match="worktree_exists"):
+            captured["run_fn"](_Token())
+
+        assert used_repos == [beta_repo.resolve()]
+    finally:
+        runner.shutdown(wait=False)
 
 
 def test_build_real_task_handler_rejects_non_mapping():
@@ -1456,7 +1591,11 @@ def test_build_bridge_from_env_multiple_registry_projects_do_not_auto_select(
     )
     send, captured = _captured_send()
 
-    bridge = build_bridge_from_env(env, send_callable=send)
+    bridge = build_bridge_from_env(
+        env,
+        send_callable=send,
+        send_progress_callable=lambda _cid, _txt: None,
+    )
 
     msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="hello task")
     bridge.handle(msg)
@@ -1498,12 +1637,76 @@ def test_build_bridge_from_env_wires_project_context_resolver_for_push_gating(
     )
     send, captured = _captured_send()
 
-    bridge = build_bridge_from_env(env, send_callable=send)
+    bridge = build_bridge_from_env(
+        env,
+        send_callable=send,
+        send_progress_callable=lambda _cid, _txt: None,
+    )
 
     msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="/push task-001")
     bridge.handle(msg)
     assert len(captured) == 1
     assert "явный проектный чат" in captured[0].text.lower()
+
+
+def test_build_bridge_from_env_multi_project_bound_chat_uses_real_handler(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    alpha_repo = _git_repo(tmp_path, "bound-alpha")
+    beta_repo = _git_repo(tmp_path, "bound-beta")
+    registry.register_project(
+        _project_snapshot(
+            alpha_repo,
+            chat_binding=_chat_binding(chat_id=-100123450099),
+        )
+    )
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+            chat_binding=_chat_binding(
+                project_id="beta_project",
+                chat_id=-100123450199,
+            ),
+        )
+    )
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
+    send, captured = _captured_send()
+
+    bridge = build_bridge_from_env(
+        env,
+        send_callable=send,
+        send_progress_callable=lambda _cid, _txt: None,
+    )
+
+    bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450099,
+            user_id=999,
+            message_id=1,
+            text="build me a CLI",
+        )
+    )
+
+    assert len(captured) == 1
+    assert "тариф" in captured[0].text.lower() or "/tier" in captured[0].text
 
 
 def test_build_bridge_from_env_missing_runtime_binding_falls_back_truthfully(
@@ -1793,7 +1996,12 @@ def _make_sandbox_for_push(tmp_path):
     return SandboxWorkspace(cfg, runner=runner), runner
 
 
-def _make_push_summary(task_id="task-push-001", commit_sha="deadbeef12345678"):
+def _make_push_summary(
+    task_id="task-push-001",
+    commit_sha="deadbeef12345678",
+    *,
+    project_id="alpha_project",
+):
     import time
 
     from core.task_history import TaskHistory, TaskSummary
@@ -1807,6 +2015,7 @@ def _make_push_summary(task_id="task-push-001", commit_sha="deadbeef12345678"):
         failure_reason=None,
         tier_name="ECONOMY",
         finished_at=time.time(),
+        project_id=project_id,
     ))
     return h
 
@@ -1907,7 +2116,7 @@ def test_push_handler_refuses_failed_task(tmp_path):
 def test_push_handler_success_calls_push_named_branch(tmp_path):
     """Happy path: SUCCESS task in history → push_named_branch called."""
     sandbox, runner = _make_sandbox_for_push(tmp_path)
-    history = _make_push_summary()
+    history = _make_push_summary(project_id="beta_project")
     handler = make_push_handler(sandbox=sandbox, task_history=history)
     result = handler(parse_command("/push task-push-001"), None)
     assert "✅" in result
@@ -1941,7 +2150,7 @@ def test_push_handler_git_failure_returns_error_message(tmp_path):
     (repo / ".git").mkdir()
     cfg = SandboxConfig(main_repo_path=repo, worktree_root=tmp_path / "wt")
     sandbox = SandboxWorkspace(cfg, runner=_FailRunner())
-    history = _make_push_summary()
+    history = _make_push_summary(project_id="beta_project")
     handler = make_push_handler(sandbox=sandbox, task_history=history)
     result = handler(parse_command("/push task-push-001"), None)
     assert "❌" in result
@@ -1951,12 +2160,148 @@ def test_push_handler_git_failure_returns_error_message(tmp_path):
 def test_build_command_registry_with_sandbox_wires_push(tmp_path):
     """When sandbox+task_history are passed, /push performs real push for SUCCESS tasks."""
     sandbox, runner = _make_sandbox_for_push(tmp_path)
-    history = _make_push_summary()
+    history = _make_push_summary(project_id="beta_project")
     personas = default_registry()
     reg = build_command_registry(personas, sandbox=sandbox, task_history=history)
     result = reg.dispatch(parse_command("/push task-push-001"))
     assert "✅" in result
     assert len(runner.calls) == 1
+
+
+def test_push_handler_uses_message_project_runtime_from_router(
+    tmp_path,
+    monkeypatch,
+):
+    alpha_repo = _git_repo(tmp_path, "push-alpha")
+    beta_repo = _git_repo(tmp_path, "push-beta")
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    router = ProjectRuntimeRouter(registry, None)
+    history = _make_push_summary(project_id="beta_project")
+    used_repos = []
+
+    def _fake_push(self, branch_name, *, remote="origin"):
+        used_repos.append(self.config.main_repo_path)
+
+    monkeypatch.setattr(
+        "core.sandbox_workspace.SandboxWorkspace.push_named_branch",
+        _fake_push,
+    )
+
+    handler = make_push_handler(task_history=history, runtime_router=router)
+    msg = IncomingMessage(
+        chat_id=1,
+        user_id=1,
+        message_id=1,
+        text="/push task-push-001",
+        project_id="beta_project",
+        project_slug="beta-project",
+        project_context_source="bound_chat",
+    )
+
+    result = handler(parse_command("/push task-push-001"), msg)
+
+    assert "✅" in result
+    assert used_repos == [beta_repo.resolve()]
+
+
+def test_push_handler_project_missing_runtime_binding_returns_truthful_error(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(ProjectSnapshot(project=_project(), policy=_policy()))
+    router = ProjectRuntimeRouter(registry, None)
+    history = TaskHistory()
+    handler = make_push_handler(task_history=history, runtime_router=router)
+    msg = IncomingMessage(
+        chat_id=1,
+        user_id=1,
+        message_id=1,
+        text="/push task-001",
+        project_id="alpha_project",
+        project_slug="alpha-project",
+        project_context_source="bound_chat",
+    )
+
+    result = handler(parse_command("/push task-001"), msg)
+
+    assert "runtime binding" in result.lower()
+
+
+def test_push_handler_blocks_cross_project_task_id_from_other_project(
+    tmp_path,
+    monkeypatch,
+):
+    alpha_repo = _git_repo(tmp_path, "push-guard-alpha")
+    beta_repo = _git_repo(tmp_path, "push-guard-beta")
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    router = ProjectRuntimeRouter(registry, None)
+    history = _make_push_summary(project_id="alpha_project")
+    calls = []
+
+    def _fake_push(self, branch_name, *, remote="origin"):
+        calls.append((self.config.main_repo_path, branch_name))
+
+    monkeypatch.setattr(
+        "core.sandbox_workspace.SandboxWorkspace.push_named_branch",
+        _fake_push,
+    )
+
+    handler = make_push_handler(task_history=history, runtime_router=router)
+    msg = IncomingMessage(
+        chat_id=1,
+        user_id=1,
+        message_id=1,
+        text="/push task-push-001",
+        project_id="beta_project",
+        project_slug="beta-project",
+        project_context_source="bound_chat",
+    )
+
+    result = handler(parse_command("/push task-push-001"), msg)
+
+    assert "относится к другому проекту" in result.lower()
+    assert "alpha_project" in result
+    assert "beta_project" in result
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -2023,7 +2368,7 @@ def test_pr_handler_rejects_invalid_task_history():
 
 def test_pr_handler_no_args(tmp_path):
     sandbox, _ = _make_sandbox_for_pr(tmp_path)
-    history = _make_push_summary()
+    history = _make_push_summary(project_id="beta_project")
     handler = make_pr_handler(sandbox=sandbox, task_history=history)
     result = handler(parse_command("/pr"), None)
     assert "укажи task_id" in result.lower() or "task_id" in result.lower()
@@ -2031,7 +2376,7 @@ def test_pr_handler_no_args(tmp_path):
 
 def test_pr_handler_rejects_invalid_task_id(tmp_path):
     sandbox, _ = _make_sandbox_for_pr(tmp_path)
-    history = _make_push_summary()
+    history = _make_push_summary(project_id="beta_project")
     handler = make_pr_handler(sandbox=sandbox, task_history=history)
     # Uppercase, semicolons, traversal — must all be rejected
     for bad in ["FOO", "task-id;rm-rf", "../etc"]:
@@ -2078,7 +2423,7 @@ def test_pr_handler_happy_path(tmp_path):
     sandbox, runner = _make_sandbox_for_pr(
         tmp_path, gh_returns=(0, gh_stdout, ""),
     )
-    history = _make_push_summary()
+    history = _make_push_summary(project_id="beta_project")
     handler = make_pr_handler(sandbox=sandbox, task_history=history)
     result = handler(parse_command("/pr task-push-001"), None)
     assert "🪄" in result or "Draft PR" in result
@@ -2159,3 +2504,134 @@ def test_build_command_registry_with_sandbox_wires_pr(tmp_path):
     reg = build_command_registry(personas, sandbox=sandbox, task_history=history)
     result = reg.dispatch(parse_command("/pr task-push-001"))
     assert "🪄" in result or "Draft PR" in result
+
+
+def test_pr_handler_uses_message_project_runtime_from_router(
+    tmp_path,
+    monkeypatch,
+):
+    alpha_repo = _git_repo(tmp_path, "pr-alpha")
+    beta_repo = _git_repo(tmp_path, "pr-beta")
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    router = ProjectRuntimeRouter(registry, None)
+    history = _make_push_summary(project_id="beta_project")
+    used_repos = []
+
+    def _fake_push(self, branch_name, *, remote="origin"):
+        used_repos.append(("push", self.config.main_repo_path))
+
+    def _fake_pr(self, branch_name, *, title, body, base="main"):
+        used_repos.append(("pr", self.config.main_repo_path))
+        return "https://github.com/example/repo/pull/42"
+
+    monkeypatch.setattr(
+        "core.sandbox_workspace.SandboxWorkspace.push_named_branch",
+        _fake_push,
+    )
+    monkeypatch.setattr(
+        "core.sandbox_workspace.SandboxWorkspace.gh_pr_create",
+        _fake_pr,
+    )
+
+    handler = make_pr_handler(task_history=history, runtime_router=router)
+    msg = IncomingMessage(
+        chat_id=1,
+        user_id=1,
+        message_id=1,
+        text="/pr task-push-001",
+        project_id="beta_project",
+        project_slug="beta-project",
+        project_context_source="bound_chat",
+    )
+
+    result = handler(parse_command("/pr task-push-001"), msg)
+
+    assert "pull/42" in result
+    assert used_repos == [
+        ("push", beta_repo.resolve()),
+        ("pr", beta_repo.resolve()),
+    ]
+
+
+def test_pr_handler_blocks_cross_project_task_id_from_other_project(
+    tmp_path,
+    monkeypatch,
+):
+    alpha_repo = _git_repo(tmp_path, "pr-guard-alpha")
+    beta_repo = _git_repo(tmp_path, "pr-guard-beta")
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    router = ProjectRuntimeRouter(registry, None)
+    history = _make_push_summary(project_id="alpha_project")
+    calls = []
+
+    def _fake_push(self, branch_name, *, remote="origin"):
+        calls.append(("push", self.config.main_repo_path, branch_name))
+
+    def _fake_pr(self, branch_name, *, title, body, base="main"):
+        calls.append(("pr", self.config.main_repo_path, branch_name))
+        return "https://github.com/example/repo/pull/42"
+
+    monkeypatch.setattr(
+        "core.sandbox_workspace.SandboxWorkspace.push_named_branch",
+        _fake_push,
+    )
+    monkeypatch.setattr(
+        "core.sandbox_workspace.SandboxWorkspace.gh_pr_create",
+        _fake_pr,
+    )
+
+    handler = make_pr_handler(task_history=history, runtime_router=router)
+    msg = IncomingMessage(
+        chat_id=1,
+        user_id=1,
+        message_id=1,
+        text="/pr task-push-001",
+        project_id="beta_project",
+        project_slug="beta-project",
+        project_context_source="bound_chat",
+    )
+
+    result = handler(parse_command("/pr task-push-001"), msg)
+
+    assert "относится к другому проекту" in result.lower()
+    assert "alpha_project" in result
+    assert "beta_project" in result
+    assert calls == []

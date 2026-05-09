@@ -80,6 +80,10 @@ from core.progress_emitter import (
     ProgressEvent,
     wrap_registry_with_progress,
 )
+from core.project_runtime_router import (
+    ProjectRuntimeRouter,
+    describe_project_runtime_error,
+)
 from core.runtime_validator import RuntimeValidator, ValidationStrategy
 from core.sandbox_runtime_hook import make_sandbox_hook
 from core.sandbox_workspace import (
@@ -190,7 +194,8 @@ def _default_agent_registry_factory(_tier: TierConfig) -> AgentRegistry:
 def make_real_task_handler(
     *,
     runner: BackgroundTaskRunner,
-    sandbox: SandboxWorkspace,
+    sandbox: SandboxWorkspace | None = None,
+    runtime_router: ProjectRuntimeRouter | None = None,
     tier_store: TierSessionStore,
     send_progress: SendProgress,
     agent_registry_factory: AgentRegistryFactory = _default_agent_registry_factory,
@@ -216,8 +221,17 @@ def make_real_task_handler(
     """
     if not isinstance(runner, BackgroundTaskRunner):
         raise ValueError(f"invalid_runner:{type(runner).__name__}")
-    if not isinstance(sandbox, SandboxWorkspace):
+    if sandbox is not None and not isinstance(sandbox, SandboxWorkspace):
         raise ValueError(f"invalid_sandbox:{type(sandbox).__name__}")
+    if runtime_router is not None and not isinstance(
+        runtime_router,
+        ProjectRuntimeRouter,
+    ):
+        raise ValueError(
+            f"invalid_runtime_router:{type(runtime_router).__name__}"
+        )
+    if sandbox is None and runtime_router is None:
+        raise ValueError("sandbox_or_runtime_router_required")
     if not isinstance(tier_store, TierSessionStore):
         raise ValueError(f"invalid_tier_store:{type(tier_store).__name__}")
     if not callable(send_progress):
@@ -250,6 +264,7 @@ def make_real_task_handler(
         task_id: str,
         text: str,
         tier_name: str,
+        sandbox_workspace: SandboxWorkspace,
     ) -> Callable[[CancellationToken], dict]:
         """Builds the closure that the runner will execute in a worker thread.
 
@@ -281,7 +296,7 @@ def make_real_task_handler(
             tier = tier_store.registry.get(tier_name)
 
             try:
-                handle = sandbox.acquire(task_id)
+                handle = sandbox_workspace.acquire(task_id)
             except (SandboxError, ValueError) as exc:
                 emitter.emit_task_failed(
                     reason=(
@@ -381,7 +396,7 @@ def make_real_task_handler(
                     pass
                 elif final_state == State.SUCCESS:
                     try:
-                        summary["commit_sha"] = sandbox.commit_in_worktree(
+                        summary["commit_sha"] = sandbox_workspace.commit_in_worktree(
                             handle,
                             message=f"AI Dev Team: {text[:60]}",
                             author_name=config.author_name,
@@ -420,11 +435,40 @@ def make_real_task_handler(
             finally:
                 if handle is not None:
                     with contextlib.suppress(Exception):
-                        sandbox.release(handle, delete_branch=False)
+                        sandbox_workspace.release(handle, delete_branch=False)
 
         return _run
 
-    def _build_on_complete(chat_id: int) -> Callable[..., None]:
+    def _resolve_runtime_for_message(
+        msg: IncomingMessage,
+    ) -> tuple[SandboxWorkspace | None, str | None, str | None]:
+        if runtime_router is None:
+            return (sandbox, None, None)
+        try:
+            resolved_runtime = runtime_router.resolve_message_runtime(msg)
+        except ValueError as exc:
+            return (None, str(exc), None)
+        return (
+            resolved_runtime.sandbox,
+            None,
+            resolved_runtime.snapshot.project.project_id,
+        )
+
+    def _runtime_error_reply(reason_code: str) -> BridgeReply:
+        return BridgeReply(
+            persona_role="pm_agent",
+            body=(
+                "⚠️ Не удалось определить runtime проекта для этой задачи.\n"
+                "\n"
+                f"{describe_project_runtime_error(reason_code)}"
+            ),
+        )
+
+    def _build_on_complete(
+        chat_id: int,
+        *,
+        project_id: str | None,
+    ) -> Callable[..., None]:
         def _on_complete(handle: TaskHandle, result, error) -> None:
             if error is not None:
                 _safe_send(
@@ -464,6 +508,7 @@ def make_real_task_handler(
                             failure_reason=result.get("failure_reason"),
                             tier_name=tier_name,
                             finished_at=time.time(),
+                            project_id=project_id,
                         )
                     )
 
@@ -544,6 +589,14 @@ def make_real_task_handler(
                 ),
             )
 
+        sandbox_workspace, runtime_error, project_id = _resolve_runtime_for_message(
+            msg
+        )
+        if runtime_error is not None or sandbox_workspace is None:
+            return _runtime_error_reply(
+                runtime_error or "bootstrap_active_project_runtime_invalid"
+            )
+
         # 3. Generate task_id BEFORE submission so we can show it in the ack.
         try:
             task_id = task_id_factory()
@@ -562,8 +615,14 @@ def make_real_task_handler(
             )
 
         # 4. Submit. RunnerBusyError is a USER-FACING outcome, not a bug.
-        run_fn = _build_run_fn(chat_id, task_id, text, tier_name)
-        on_complete = _build_on_complete(chat_id)
+        run_fn = _build_run_fn(
+            chat_id,
+            task_id,
+            text,
+            tier_name,
+            sandbox_workspace,
+        )
+        on_complete = _build_on_complete(chat_id, project_id=project_id)
         try:
             runner.submit(
                 task_id=task_id,

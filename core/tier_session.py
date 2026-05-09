@@ -55,7 +55,7 @@ class TierSession:
         if (
             isinstance(self.chat_id, bool)
             or not isinstance(self.chat_id, int)
-            or self.chat_id <= 0
+            or self.chat_id == 0
         ):
             raise ValueError(f"invalid_chat_id:{self.chat_id!r}")
         if self.active_tier is not None and (
@@ -223,7 +223,7 @@ class TierSessionStore:
         if (
             isinstance(chat_id, bool)
             or not isinstance(chat_id, int)
-            or chat_id <= 0
+            or chat_id == 0
         ):
             raise ValueError(f"invalid_chat_id:{chat_id!r}")
         with self._lock:
@@ -238,7 +238,7 @@ class TierSessionStore:
         if (
             isinstance(chat_id, bool)
             or not isinstance(chat_id, int)
-            or chat_id <= 0
+            or chat_id == 0
         ):
             raise ValueError(f"invalid_chat_id:{chat_id!r}")
         if not isinstance(tier_name, str) or not tier_name.strip():
@@ -268,7 +268,7 @@ class TierSessionStore:
         if (
             isinstance(chat_id, bool)
             or not isinstance(chat_id, int)
-            or chat_id <= 0
+            or chat_id == 0
         ):
             raise ValueError(f"invalid_chat_id:{chat_id!r}")
         with self._lock:

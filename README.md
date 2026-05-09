@@ -2,7 +2,7 @@
 
 AI Dev Team is a Telegram-driven multi-agent engineering bot for autonomous work on real git repositories. It runs a fixed FSM pipeline over specialised agents, writes changes into isolated git worktrees, validates them with `ruff` and `pytest`, and can commit, push, and open draft PRs.
 
-Current production scope: one Telegram bot, one active worker, real OpenRouter pipeline, SQLite-backed state, and single-project execution resolved from the project registry or a legacy `REPO_PATH` bootstrap.
+Current production scope: one Telegram bot, one active worker, real OpenRouter pipeline, SQLite-backed state, and project-aware execution resolved from bound project chats or the single-project owner-DM/bootstrap fallback.
 
 ## Status
 
@@ -11,7 +11,7 @@ Current production scope: one Telegram bot, one active worker, real OpenRouter p
 | Tests | 2006 passed, 5 skipped |
 | Ruff | clean |
 | Python | >= 3.10 |
-| Real pipeline | OpenRouter + git worktree + commit + `/push` + `/pr` |
+| Real pipeline | OpenRouter + git worktree + commit + project-aware `/push` + project-aware `/pr` |
 | Persistence | SQLite (`STATE_DB_PATH`) with legacy fallback |
 
 ## What Works Today
@@ -91,7 +91,7 @@ Run the Telegram bot:
 .venv/bin/python scripts/run_telegram_bot.py
 ```
 
-If `OPENROUTER_API_KEY` is missing, or if the bot cannot resolve one active project with a valid runtime binding, it still starts, but only in the simple acknowledgement mode rather than the full multi-agent pipeline.
+If `OPENROUTER_API_KEY` is missing, or if the bot cannot resolve any routable project runtime, it still starts, but only in the simple acknowledgement mode rather than the full multi-agent pipeline.
 
 ## Environment
 
@@ -101,16 +101,18 @@ Required for the full pipeline:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_OWNER_CHAT_ID`
 
-Active project resolution for the full pipeline:
+Project runtime resolution for the full pipeline:
 
-- Preferred: one persisted project in `StateDB` with a valid runtime binding.
-- Legacy fallback: `REPO_PATH` (and optional `WORKTREE_ROOT`) bootstrap a single project when the registry is empty.
-- Current limit: if the registry contains multiple projects, the bot does not auto-select one yet and stays in simple mode.
+- Preferred: a Telegram message resolves to a persisted project snapshot in `StateDB`, then `ProjectRuntimeRouter` materializes the matching runtime binding into a sandbox.
+- Bound project chats are first-class: if a chat is explicitly bound to a project, free-text tasks plus `/push` and `/pr` run in that project's repo/worktree context, even when the registry contains multiple projects.
+- Owner DM fallback remains only for the single-project case: if the registry contains exactly one project, owner DM can still resolve that project without an explicit chat binding.
+- Legacy fallback: `REPO_PATH` (and optional `WORKTREE_ROOT`) are now bootstrap-only. They seed or provide a single-project runtime when the registry is empty or unavailable.
+- Current limit: when the registry contains multiple projects and the message itself is not bound to a project, the bot does not auto-select one.
 
 Optional:
 
 - `OPENAI_API_KEY` - enables Whisper voice transcription.
-- `REPO_PATH` - legacy bootstrap/fallback for single-project compatibility. Once `StateDB` already has one project with a runtime binding, `REPO_PATH` is no longer required for startup.
+- `REPO_PATH` - legacy bootstrap/fallback for single-project compatibility. It is no longer the sole source of runtime selection once projects with runtime bindings already exist in `StateDB`.
 - `WORKTREE_ROOT` - optional legacy bootstrap override for the worktree root.
 - `STATE_DB_PATH` - SQLite path for tier sessions, task history, budget state, and the project registry/runtime bindings.
 - `BOT_STATE_DIR` - legacy compatibility directory. If `STATE_DB_PATH` is unset, the bot uses `BOT_STATE_DIR/state.db`.
@@ -133,6 +135,14 @@ Available Telegram commands:
 - `/push`
 - `/pr`
 - `/help`
+
+Project context requirements today:
+
+- free-text tasks require a resolved project runtime
+- `/push` requires a resolved project runtime
+- `/pr` requires a resolved project runtime
+- owner DM without explicit chat binding works only when the registry has exactly one project
+- unbound chats with multiple projects do not get an implicit runtime
 
 ## Quality Gates
 
