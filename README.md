@@ -124,6 +124,7 @@ Optional:
 
 Available Telegram commands:
 
+- `/project` - show the current project context for this chat/owner-DM fallback; does not change routing
 - `/projects` - list registered projects, runtime binding state, and explicit chat bindings
 - `/projects here` - show explicit binding status for the current chat
 - `/projects bind <project_id_or_slug>` - bind the current Telegram group/supergroup chat to an existing runtime-bound project (owner only)
@@ -141,11 +142,13 @@ Available Telegram commands:
 
 Project context requirements today:
 
+- `/project` shows the current resolved project context, including whether it came from an explicit project chat or owner-DM fallback
 - free-text tasks require a resolved project runtime
 - `/push` requires a resolved project runtime
 - `/pr` requires a resolved project runtime
 - explicit project chat bindings are managed through `/projects bind` and `/projects unbind`
 - explicit project chats are group/supergroup chats only (`chat_id < 0`)
+- `/project` is read-only and never changes project resolution or runtime routing
 - `/switch` is navigation/status only and never changes project resolution or runtime routing
 - owner DM without explicit chat binding works only when the registry has exactly one project
 - unbound chats with multiple projects do not get an implicit runtime

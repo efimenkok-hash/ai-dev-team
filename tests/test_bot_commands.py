@@ -18,8 +18,9 @@ from core.bot_commands import (
 
 
 def test_command_name_enum_complete():
-    """All 11 commands must be in the enum."""
+    """All 12 commands must be in the enum."""
     expected = {
+        "project",
         "projects", "switch", "budget", "agents", "tier",
         "log", "stop", "retry", "push", "pr", "help",
     }
@@ -174,7 +175,7 @@ def test_parse_command_with_botname_and_args():
 @pytest.mark.parametrize(
     "cmd_text",
     [
-        "/projects", "/switch", "/budget", "/agents", "/tier",
+        "/project", "/projects", "/switch", "/budget", "/agents", "/tier",
         "/log", "/stop", "/retry", "/help",
     ],
 )

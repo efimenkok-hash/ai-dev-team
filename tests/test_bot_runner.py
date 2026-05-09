@@ -43,6 +43,7 @@ from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
 from core.project_runtime_router import ProjectRuntimeRouter
+from core.project_summary_service import ProjectSummaryService
 from core.state_db import StateDB
 from core.task_history import TaskHistory
 from core.telegram_bridge import (
@@ -939,6 +940,139 @@ def test_projects_bind_owner_group_chat_can_bind_current_chat(tmp_path):
     assert registry.get_project_snapshot_for_chat("telegram", -100123450504) is not None
 
 
+def test_project_handler_bound_project_chat_shows_summary(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "project-bound")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            chat_binding=_chat_binding(chat_id=-100123450507),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    reg = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+        project_summary_service=ProjectSummaryService(registry, resolver),
+    )
+
+    text = reg.dispatch(
+        parse_command("/project"),
+        ctx=IncomingMessage(
+            chat_id=-100123450507,
+            user_id=999,
+            message_id=1,
+            text="/project",
+        ),
+    )
+
+    assert "alpha-project" in text
+    assert "alpha_project" in text
+    assert "repo path" in text.lower()
+    assert "explicit project chat" in text.lower()
+
+
+def test_project_handler_owner_dm_single_project_shows_fallback_summary(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "project-fallback")
+    registry.register_project(_project_snapshot(repo))
+    resolver = ProjectContextResolver(registry, (777,))
+    reg = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+        project_summary_service=ProjectSummaryService(registry, resolver),
+    )
+
+    text = reg.dispatch(
+        parse_command("/project"),
+        ctx=IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=1,
+            text="/project",
+        ),
+    )
+
+    assert "fallback" in text.lower()
+    assert "owner dm fallback" in text.lower()
+
+
+def test_project_handler_unbound_group_chat_says_not_bound(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "project-unbound")
+    registry.register_project(_project_snapshot(repo))
+    resolver = ProjectContextResolver(registry, (777,))
+    reg = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+        project_summary_service=ProjectSummaryService(registry, resolver),
+    )
+
+    text = reg.dispatch(
+        parse_command("/project"),
+        ctx=IncomingMessage(
+            chat_id=-100123450508,
+            user_id=999,
+            message_id=1,
+            text="/project",
+        ),
+    )
+
+    assert "не привязан" in text.lower()
+    assert "/projects bind" in text
+
+
+def test_project_handler_owner_dm_multi_project_requires_explicit_chat(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    alpha_repo = _git_repo(tmp_path, "project-owner-multi-alpha")
+    beta_repo = _git_repo(tmp_path, "project-owner-multi-beta")
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    reg = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+        project_summary_service=ProjectSummaryService(registry, resolver),
+    )
+
+    text = reg.dispatch(
+        parse_command("/project"),
+        ctx=IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=1,
+            text="/project",
+        ),
+    )
+
+    assert "явный project chat" in text.lower()
+    assert "не выбирает проект сам" in text.lower()
+
+
 def test_projects_bind_non_owner_cannot_bind(tmp_path):
     db = StateDB(tmp_path / "state.db")
     registry = ProjectRegistry(db)
@@ -1221,6 +1355,117 @@ def test_switch_handler_owner_dm_multi_project_requires_explicit_project_chat(
 
     assert "явный project chat" in text.lower()
     assert "не выбирает runtime-проект" in text.lower()
+
+
+def test_project_command_does_not_change_bound_chat_routing(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "project-routing-bound")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            chat_binding=_chat_binding(chat_id=-100123450709),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+        project_summary_service=ProjectSummaryService(registry, resolver),
+    )
+    send, captured = _captured_send()
+    task_calls = []
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: task_calls.append(
+            (
+                text,
+                msg.project_id,
+                msg.project_context_source,
+            )
+        )
+        or BridgeReply(persona_role="architect_agent", body="task ok"),
+        project_context_resolver=resolver,
+    )
+
+    project_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450709,
+            user_id=999,
+            message_id=1,
+            text="/project",
+        )
+    )
+    task_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450709,
+            user_id=999,
+            message_id=2,
+            text="bound task after project",
+        )
+    )
+
+    assert project_result.handled is True
+    assert project_result.reason == "command"
+    assert "alpha-project" in captured[0].text
+    assert task_result.handled is True
+    assert task_result.reason == "task"
+    assert task_calls == [
+        (
+            "bound task after project",
+            "alpha_project",
+            "bound_chat",
+        )
+    ]
+
+
+def test_project_command_does_not_change_unbound_chat_routing(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "project-routing-unbound")
+    registry.register_project(_project_snapshot(repo))
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+        project_summary_service=ProjectSummaryService(registry, resolver),
+    )
+    send, captured = _captured_send()
+    task_calls = []
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: task_calls.append((text, msg.project_id))
+        or BridgeReply(persona_role="architect_agent", body="task ok"),
+        project_context_resolver=resolver,
+    )
+
+    project_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450713,
+            user_id=999,
+            message_id=1,
+            text="/project",
+        )
+    )
+    blocked_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450713,
+            user_id=999,
+            message_id=2,
+            text="unbound task after project",
+        )
+    )
+
+    assert project_result.handled is True
+    assert project_result.reason == "command"
+    assert "/projects bind" in captured[0].text
+    assert blocked_result.handled is False
+    assert blocked_result.reason == "project_context_missing"
+    assert task_calls == []
 
 
 def test_budget_handler_show_default():
@@ -1613,10 +1858,10 @@ def test_tier_handler_marks_active_in_summary():
 # ---------------------------------------------------------------------------
 
 
-def test_build_command_registry_has_all_eleven():
+def test_build_command_registry_has_all_twelve():
     personas = default_registry()
     reg = build_command_registry(personas)
-    assert len(reg) == 11
+    assert len(reg) == 12
     for cmd_name in CommandName:
         assert cmd_name in reg
 

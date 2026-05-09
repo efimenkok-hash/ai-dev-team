@@ -30,6 +30,7 @@ from typing import Any
 
 
 class CommandName(str, Enum):
+    PROJECT = "project"
     PROJECTS = "projects"
     SWITCH = "switch"
     BUDGET = "budget"
@@ -46,6 +47,7 @@ class CommandName(str, Enum):
 # Russian-language descriptions; these match what we registered in BotFather
 # and what /help renders.
 COMMAND_DESCRIPTIONS: dict[CommandName, str] = {
+    CommandName.PROJECT: "текущий project context (/project)",
     CommandName.PROJECTS: "проекты и binding чата (/projects [here|bind|unbind])",
     CommandName.SWITCH: "статус project context (/switch [project])",
     CommandName.BUDGET: "бюджет (/budget [сумма])",
@@ -62,6 +64,7 @@ COMMAND_DESCRIPTIONS: dict[CommandName, str] = {
 # Thematic emojis for /help rendering. Decoupled from descriptions so
 # BotFather command list (which doesn't allow emoji prefixes) stays clean.
 COMMAND_EMOJIS: dict[CommandName, str] = {
+    CommandName.PROJECT: "📌",
     CommandName.PROJECTS: "📋",
     CommandName.SWITCH: "🔄",
     CommandName.BUDGET: "💰",

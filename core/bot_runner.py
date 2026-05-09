@@ -70,6 +70,7 @@ from core.project_runtime_router import (
     ProjectRuntimeRouter,
     describe_project_runtime_error,
 )
+from core.project_summary_service import ProjectSummaryService
 from core.real_task_handler import RealTaskHandlerConfig, make_real_task_handler
 from core.sandbox_workspace import SandboxWorkspace
 from core.state_db import StateDB
@@ -346,6 +347,18 @@ def _try_build_project_chat_binding_service(
     )
 
 
+def _try_build_project_summary_service(
+    state_db: StateDB | None,
+    project_context_resolver: ProjectContextResolver | None,
+) -> ProjectSummaryService | None:
+    if state_db is None or project_context_resolver is None:
+        return None
+    return ProjectSummaryService(
+        ProjectRegistry(state_db),
+        project_context_resolver,
+    )
+
+
 def _try_build_project_runtime_router(
     state_db: StateDB | None,
     bootstrap_result: ProjectBootstrapResult | None,
@@ -604,6 +617,46 @@ def _format_projects_usage() -> str:
         "  /projects bind <project_id_or_slug>\n"
         "  /projects unbind"
     )
+
+
+def make_project_handler(
+    project_summary_service: ProjectSummaryService | None = None,
+) -> CommandHandler:
+    if (
+        project_summary_service is not None
+        and not isinstance(project_summary_service, ProjectSummaryService)
+    ):
+        raise ValueError("invalid_project_summary_service")
+
+    def _handle(_cmd: BotCommand, ctx: Any) -> str:
+        if project_summary_service is None:
+            return (
+                "📌 /project\n"
+                "\n"
+                "Project context summary сейчас недоступен: registry/resolver "
+                "не подключены."
+            )
+        if not isinstance(ctx, IncomingMessage):
+            return (
+                "📌 /project\n"
+                "\n"
+                "Не удалось определить текущий chat context для этой команды."
+            )
+        try:
+            return project_summary_service.format_current_project_summary(
+                ctx.chat_id,
+                ctx.user_id,
+            )
+        except ValueError as exc:
+            return (
+                "📌 /project\n"
+                "\n"
+                "Не удалось собрать текущий project context.\n"
+                "\n"
+                f"Техническая причина: `{exc!s}`"
+            )
+
+    return _handle
 
 
 def make_projects_handler(
@@ -1703,6 +1756,7 @@ def build_command_registry(
     runtime_router: ProjectRuntimeRouter | None = None,
     project_chat_binding_service: ProjectChatBindingService | None = None,
     project_context_resolver: ProjectContextResolver | None = None,
+    project_summary_service: ProjectSummaryService | None = None,
 ) -> CommandRegistry:
     """Build a CommandRegistry pre-populated with all 10 default handlers.
 
@@ -1755,6 +1809,14 @@ def build_command_registry(
         )
     ):
         raise ValueError("invalid_project_context_resolver")
+    if (
+        project_summary_service is not None
+        and not isinstance(
+            project_summary_service,
+            ProjectSummaryService,
+        )
+    ):
+        raise ValueError("invalid_project_summary_service")
 
     reg = CommandRegistry()
     budget_state = _BudgetState(
@@ -1763,6 +1825,10 @@ def build_command_registry(
     )
 
     # Register in enum order so /help output is consistent.
+    reg.register(
+        CommandName.PROJECT,
+        make_project_handler(project_summary_service),
+    )
     reg.register(
         CommandName.PROJECTS,
         make_projects_handler(
@@ -2030,6 +2096,10 @@ def build_bridge_from_env(
         state_db,
         owner_chat_ids,
     )
+    project_summary_service = _try_build_project_summary_service(
+        state_db,
+        project_context_resolver,
+    )
 
     commands = build_command_registry(
         personas,
@@ -2041,6 +2111,7 @@ def build_bridge_from_env(
         runtime_router=runtime_router,
         project_chat_binding_service=project_chat_binding_service,
         project_context_resolver=project_context_resolver,
+        project_summary_service=project_summary_service,
     )
 
     # Attempt to build the full dispatcher-backed pipeline; fall back to stub.
