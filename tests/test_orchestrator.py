@@ -161,6 +161,7 @@ def test_run_seeds_initial_artifacts_before_planning():
 
     def _planning_agent(*args):
         seen["project_brief"] = memory.get_artifact("T1", "project_brief")
+        seen["team_proposal"] = memory.get_artifact("T1", "team_proposal")
         return _PLANNING_OK
 
     orch = Orchestrator(
@@ -171,12 +172,17 @@ def test_run_seeds_initial_artifacts_before_planning():
     result = orch.run(
         "T1",
         "build x",
-        initial_artifacts={"project_brief": "Coordinator project brief"},
+        initial_artifacts={
+            "project_brief": "Coordinator project brief",
+            "team_proposal": "Coordinator team proposal",
+        },
     )
 
     assert result.final_state == State.SUCCESS
     assert seen["project_brief"] == "Coordinator project brief"
+    assert seen["team_proposal"] == "Coordinator team proposal"
     assert result.snapshot.artifacts["project_brief"] == "Coordinator project brief"
+    assert result.snapshot.artifacts["team_proposal"] == "Coordinator team proposal"
 
 
 def test_run_without_initial_artifacts_keeps_old_behavior():

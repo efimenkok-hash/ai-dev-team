@@ -56,10 +56,20 @@ def test_project_brief_is_valid_artifact_kind():
     assert "project_brief" in VALID_ARTIFACT_KINDS
 
 
+def test_team_proposal_is_valid_artifact_kind():
+    assert "team_proposal" in VALID_ARTIFACT_KINDS
+
+
 def test_set_and_get_project_brief_artifact():
     m = _seeded()
     m.set_artifact("T1", "project_brief", "Coordinator project brief")
     assert m.get_artifact("T1", "project_brief") == "Coordinator project brief"
+
+
+def test_set_and_get_team_proposal_artifact():
+    m = _seeded()
+    m.set_artifact("T1", "team_proposal", "Coordinator team proposal")
+    assert m.get_artifact("T1", "team_proposal") == "Coordinator team proposal"
 
 
 def test_project_brief_artifact_is_immutable():
@@ -67,6 +77,13 @@ def test_project_brief_artifact_is_immutable():
     m.set_artifact("T1", "project_brief", "first brief")
     with pytest.raises(ValueError, match="artifact_already_set:project_brief"):
         m.set_artifact("T1", "project_brief", "second brief")
+
+
+def test_team_proposal_artifact_is_immutable():
+    m = _seeded()
+    m.set_artifact("T1", "team_proposal", "first proposal")
+    with pytest.raises(ValueError, match="artifact_already_set:team_proposal"):
+        m.set_artifact("T1", "team_proposal", "second proposal")
 
 
 def test_all_artifact_kinds_round_trip():
@@ -272,6 +289,7 @@ def test_dump_task_round_trips_through_restore():
     src = PipelineMemory()
     src.new_task("T1", "raw text here")
     src.set_artifact("T1", "project_brief", "Coordinator brief")
+    src.set_artifact("T1", "team_proposal", "Coordinator team")
     src.set_artifact("T1", "pm", '{"plan_id":"x"}')
     src.set_artifact("T1", "architect", '{"arch_id":"a"}')
     src.record_transition("T1", State.IDLE, State.PLANNING)
@@ -309,6 +327,17 @@ def test_restore_preserves_project_brief_artifact():
     dst.restore_task(src.dump_task("T1"))
 
     assert dst.get_artifact("T1", "project_brief") == "Coordinator project brief"
+
+
+def test_restore_preserves_team_proposal_artifact():
+    src = PipelineMemory()
+    src.new_task("T1", "raw task")
+    src.set_artifact("T1", "team_proposal", "Coordinator team proposal")
+
+    dst = PipelineMemory()
+    dst.restore_task(src.dump_task("T1"))
+
+    assert dst.get_artifact("T1", "team_proposal") == "Coordinator team proposal"
 
 
 def test_dump_task_includes_schema_version():

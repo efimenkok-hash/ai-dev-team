@@ -57,6 +57,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from core.adapter import ProjectAdapter, ProjectCommand
+from core.agent_personas import default_registry
 from core.background_runner import (
     BackgroundTaskRunner,
     CancellationToken,
@@ -68,6 +69,10 @@ from core.coordinator_onboarding import (
     ProjectCaptainOnboardingService,
 )
 from core.coordinator_role import COORDINATOR_ROLE
+from core.coordinator_team_proposal import (
+    CoordinatorTeamProposalContext,
+    CoordinatorTeamProposalService,
+)
 from core.fsm import State
 from core.memory import PipelineMemory
 from core.model_tier import TierConfig
@@ -269,6 +274,8 @@ def make_real_task_handler(
             "invalid_onboarding_service:"
             f"{type(onboarding_service).__name__}"
         )
+    personas = default_registry()
+    team_proposal_service = CoordinatorTeamProposalService()
 
     available_tiers = ", ".join(tier_store.registry.list_names())
 
@@ -526,10 +533,19 @@ def make_real_task_handler(
     ) -> dict[str, str] | None:
         if onboarding_context is None:
             return None
+        team_proposal_context = CoordinatorTeamProposalContext(
+            snapshot=onboarding_context.snapshot,
+            owner_task_text=onboarding_context.owner_task_text,
+            context_source=onboarding_context.context_source,
+            personas=personas,
+        )
         return {
             "project_brief": onboarding_service.build_project_brief_artifact(
                 onboarding_context
-            )
+            ),
+            "team_proposal": team_proposal_service.build_team_proposal_artifact(
+                team_proposal_context
+            ),
         }
 
     def _runtime_error_reply(reason_code: str) -> BridgeReply:
@@ -692,7 +708,7 @@ def make_real_task_handler(
             return BridgeReply(
                 persona_role=COORDINATOR_ROLE,
                 body=(
-                    "⚠️ Не удалось подготовить Coordinator onboarding "
+                    "⚠️ Не удалось подготовить Coordinator artifacts "
                     f"для pipeline: {str(exc)[:200]}"
                 ),
             )

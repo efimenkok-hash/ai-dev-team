@@ -717,7 +717,7 @@ def test_owner_dm_single_project_pipeline_gets_enriched_onboarding_prompt(
     assert owner_task_text in prompt
 
 
-def test_bound_project_chat_seeds_project_brief_before_planning(
+def test_bound_project_chat_seeds_coordinator_artifacts_before_planning(
     runner,
     sandbox,
     tier_store,
@@ -745,6 +745,7 @@ def test_bound_project_chat_seeds_project_brief_before_planning(
 
     def _planning_agent(task_prompt: str) -> str:
         seen["brief"] = memory.get_artifact(task_id, "project_brief")
+        seen["proposal"] = memory.get_artifact(task_id, "team_proposal")
         seen["prompt"] = task_prompt
         return '{"plan": "ok"}'
 
@@ -786,9 +787,14 @@ def test_bound_project_chat_seeds_project_brief_before_planning(
     assert "explicit project chat" in seen["brief"]
     assert "Build the deployment checker." in seen["brief"]
     assert memory.get_artifact(task_id, "project_brief") == seen["brief"]
+    assert seen["proposal"] is not None
+    assert "Coordinator team proposal" in seen["proposal"]
+    assert "coordinator_agent" in seen["proposal"]
+    assert "project captain" in seen["proposal"].lower()
+    assert memory.get_artifact(task_id, "team_proposal") == seen["proposal"]
 
 
-def test_owner_dm_single_project_seeds_project_brief_before_planning(
+def test_owner_dm_single_project_seeds_coordinator_artifacts_before_planning(
     runner,
     sandbox,
     tier_store,
@@ -813,6 +819,7 @@ def test_owner_dm_single_project_seeds_project_brief_before_planning(
 
     def _planning_agent(task_prompt: str) -> str:
         seen["brief"] = memory.get_artifact(task_id, "project_brief")
+        seen["proposal"] = memory.get_artifact(task_id, "team_proposal")
         seen["prompt"] = task_prompt
         return '{"plan": "ok"}'
 
@@ -853,9 +860,13 @@ def test_owner_dm_single_project_seeds_project_brief_before_planning(
     assert "Coordinator project brief" in seen["brief"]
     assert "owner DM fallback" in seen["brief"]
     assert "Prepare the release branch." in seen["brief"]
+    assert seen["proposal"] is not None
+    assert "Coordinator team proposal" in seen["proposal"]
+    assert "owner DM fallback" in seen["proposal"]
+    assert "Prepare the release branch." in seen["proposal"]
 
 
-def test_legacy_non_context_path_does_not_seed_fake_project_brief(
+def test_legacy_non_context_path_does_not_seed_fake_coordinator_artifacts(
     runner,
     sandbox,
     tier_store,
@@ -872,6 +883,7 @@ def test_legacy_non_context_path_does_not_seed_fake_project_brief(
 
     def _planning_agent(task_prompt: str) -> str:
         seen["brief"] = memory.get_artifact(task_id, "project_brief")
+        seen["proposal"] = memory.get_artifact(task_id, "team_proposal")
         seen["prompt"] = task_prompt
         return '{"plan": "ok"}'
 
@@ -897,7 +909,9 @@ def test_legacy_non_context_path_does_not_seed_fake_project_brief(
         _wait_until_idle(runner)
 
     assert seen["brief"] is None
+    assert seen["proposal"] is None
     assert memory.get_artifact(task_id, "project_brief") is None
+    assert memory.get_artifact(task_id, "team_proposal") is None
     assert seen["prompt"] == "Legacy build task."
 
 
