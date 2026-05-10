@@ -39,6 +39,7 @@ from core.confirmation_gate import ConfirmationGate
 from core.model_tier import default_registry as default_tier_registry
 from core.project_chat_binding_service import ProjectChatBindingService
 from core.project_context import ProjectContextResolver
+from core.project_migration_service import ProjectMigrationService
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
@@ -916,6 +917,44 @@ def test_projects_here_shows_unbound_chat_status(tmp_path):
     assert "chat_not_bound" in text
 
 
+def test_projects_here_owner_group_shows_migration_path(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "projects-here-migration")
+    registry.register_project(_project_snapshot(repo))
+    resolver = ProjectContextResolver(registry, (777,))
+    migration_service = ProjectMigrationService(
+        registry,
+        ProjectChatBindingService(registry, (777,)),
+        (777,),
+    )
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+        project_context_resolver=resolver,
+        project_summary_service=ProjectSummaryService(
+            registry,
+            resolver,
+            migration_service=migration_service,
+        ),
+        project_migration_service=migration_service,
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects here"),
+        ctx=IncomingMessage(
+            chat_id=-100123450803,
+            user_id=777,
+            message_id=1,
+            text="/projects here",
+        ),
+    )
+
+    assert "не привязан" in text.lower()
+    assert "alpha-project" in text
+    assert "/projects migrate here" in text
+
+
 def test_projects_bind_owner_group_chat_can_bind_current_chat(tmp_path):
     db = StateDB(tmp_path / "state.db")
     registry = ProjectRegistry(db)
@@ -1025,6 +1064,43 @@ def test_project_handler_unbound_group_chat_says_not_bound(tmp_path):
 
     assert "не привязан" in text.lower()
     assert "/projects bind" in text
+
+
+def test_project_handler_owner_group_shows_migration_path(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "project-migration-path")
+    registry.register_project(_project_snapshot(repo))
+    resolver = ProjectContextResolver(registry, (777,))
+    migration_service = ProjectMigrationService(
+        registry,
+        ProjectChatBindingService(registry, (777,)),
+        (777,),
+    )
+    reg = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+        project_summary_service=ProjectSummaryService(
+            registry,
+            resolver,
+            migration_service=migration_service,
+        ),
+        project_migration_service=migration_service,
+    )
+
+    text = reg.dispatch(
+        parse_command("/project"),
+        ctx=IncomingMessage(
+            chat_id=-100123450804,
+            user_id=777,
+            message_id=1,
+            text="/project",
+        ),
+    )
+
+    assert "не определён" in text.lower()
+    assert "alpha-project" in text
+    assert "/projects migrate here" in text
 
 
 def test_project_handler_owner_dm_multi_project_requires_explicit_chat(
@@ -1146,6 +1222,271 @@ def test_projects_unbind_owner_can_unbind(tmp_path):
 
     assert "отвязан" in text.lower()
     assert registry.get_project_snapshot_for_chat("telegram", -100123450506) is None
+
+
+def test_projects_migrate_here_owner_group_chat_succeeds_and_updates_routing(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "projects-migrate-flow")
+    registry.register_project(_project_snapshot(repo))
+    resolver = ProjectContextResolver(registry, (777,))
+    binding_service = ProjectChatBindingService(registry, (777,))
+    migration_service = ProjectMigrationService(
+        registry,
+        binding_service,
+        (777,),
+    )
+    commands = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=binding_service,
+        project_migration_service=migration_service,
+        project_context_resolver=resolver,
+        project_summary_service=ProjectSummaryService(
+            registry,
+            resolver,
+            migration_service=migration_service,
+        ),
+    )
+    send, captured = _captured_send()
+    task_calls = []
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: task_calls.append(
+            (
+                text,
+                msg.project_id,
+                msg.project_context_source,
+            )
+        )
+        or BridgeReply(persona_role="architect_agent", body="task ok"),
+        project_context_resolver=resolver,
+    )
+
+    pre_project = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450805,
+            user_id=777,
+            message_id=1,
+            text="/project",
+        )
+    )
+    migrate_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450805,
+            user_id=777,
+            message_id=2,
+            text="/projects migrate here",
+        )
+    )
+    post_project = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450805,
+            user_id=777,
+            message_id=3,
+            text="/project",
+        )
+    )
+    task_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450805,
+            user_id=999,
+            message_id=4,
+            text="task after migrate",
+        )
+    )
+    second_migrate = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450805,
+            user_id=777,
+            message_id=5,
+            text="/projects migrate here",
+        )
+    )
+
+    assert pre_project.handled is True
+    assert "/projects migrate here" in captured[0].text
+    assert migrate_result.handled is True
+    assert "explicit project chat" in captured[1].text.lower()
+    assert post_project.handled is True
+    assert "explicit project chat" in captured[2].text.lower()
+    assert task_result.handled is True
+    assert task_result.reason == "task"
+    assert task_calls == [
+        (
+            "task after migrate",
+            "alpha_project",
+            "bound_chat",
+        )
+    ]
+    assert second_migrate.handled is True
+    assert "миграция не требуется" in captured[4].text.lower()
+
+
+def test_projects_migrate_here_non_owner_is_rejected(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "projects-migrate-non-owner")
+    registry.register_project(_project_snapshot(repo))
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+        project_migration_service=ProjectMigrationService(
+            registry,
+            ProjectChatBindingService(registry, (777,)),
+            (777,),
+        ),
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects migrate here"),
+        ctx=IncomingMessage(
+            chat_id=-100123450806,
+            user_id=999,
+            message_id=1,
+            text="/projects migrate here",
+        ),
+    )
+
+    assert "owner user" in text.lower()
+
+
+def test_projects_migrate_here_owner_dm_is_rejected(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "projects-migrate-dm")
+    registry.register_project(_project_snapshot(repo))
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+        project_migration_service=ProjectMigrationService(
+            registry,
+            ProjectChatBindingService(registry, (777,)),
+            (777,),
+        ),
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects migrate here"),
+        ctx=IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=1,
+            text="/projects migrate here",
+        ),
+    )
+
+    assert "group/supergroup" in text.lower()
+
+
+def test_projects_migrate_here_multiple_projects_requires_bind(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    alpha_repo = _git_repo(tmp_path, "projects-migrate-multi-alpha")
+    beta_repo = _git_repo(tmp_path, "projects-migrate-multi-beta")
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+        project_migration_service=ProjectMigrationService(
+            registry,
+            ProjectChatBindingService(registry, (777,)),
+            (777,),
+        ),
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects migrate here"),
+        ctx=IncomingMessage(
+            chat_id=-100123450807,
+            user_id=777,
+            message_id=1,
+            text="/projects migrate here",
+        ),
+    )
+
+    assert "/projects bind" in text
+
+
+def test_projects_migrate_here_already_bound_chat_reports_no_migration_needed(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "projects-migrate-already-bound")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            chat_binding=_chat_binding(chat_id=-100123450808),
+        )
+    )
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+        project_migration_service=ProjectMigrationService(
+            registry,
+            ProjectChatBindingService(registry, (777,)),
+            (777,),
+        ),
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects migrate here"),
+        ctx=IncomingMessage(
+            chat_id=-100123450808,
+            user_id=777,
+            message_id=1,
+            text="/projects migrate here",
+        ),
+    )
+
+    assert "миграция не требуется" in text.lower()
+
+
+def test_projects_migrate_here_unbound_group_without_project_is_rejected(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    reg = build_command_registry(
+        default_registry(),
+        project_chat_binding_service=ProjectChatBindingService(registry, (777,)),
+        project_migration_service=ProjectMigrationService(
+            registry,
+            ProjectChatBindingService(registry, (777,)),
+            (777,),
+        ),
+    )
+
+    text = reg.dispatch(
+        parse_command("/projects migrate here"),
+        ctx=IncomingMessage(
+            chat_id=-100123450809,
+            user_id=777,
+            message_id=1,
+            text="/projects migrate here",
+        ),
+    )
+
+    assert "нет единственного legacy-проекта" in text.lower()
 
 
 def test_switch_handler_bound_project_chat_reports_no_switching(tmp_path):

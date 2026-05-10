@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from core.project_chat_binding_service import ProjectChatBindingService
 from core.project_context import ProjectContextResolver
+from core.project_migration_service import ProjectMigrationService
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
@@ -136,6 +138,18 @@ def test_project_summary_service_rejects_bad_resolver(tmp_path: Path):
 
     with pytest.raises(ValueError, match="invalid_project_context_resolver_type"):
         ProjectSummaryService(registry, "bad")  # type: ignore[arg-type]
+
+
+def test_project_summary_service_rejects_bad_migration_service(tmp_path: Path):
+    registry = ProjectRegistry(_make_db(tmp_path))
+    resolver = ProjectContextResolver(registry, (101,))
+
+    with pytest.raises(ValueError, match="invalid_project_migration_service_type"):
+        ProjectSummaryService(
+            registry,
+            resolver,
+            migration_service="bad",  # type: ignore[arg-type]
+        )
 
 
 def test_project_summary_view_happy_path_for_bound_chat(tmp_path: Path):
@@ -478,6 +492,31 @@ def test_format_current_project_summary_unbound_points_to_projects_bind(
 
     assert "не привязан" in text.lower()
     assert "/projects bind" in text
+
+
+def test_format_current_project_summary_unbound_owner_group_shows_migration_path(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "format-unbound-migration")
+    _register(registry, _snapshot(repo))
+    migration_service = ProjectMigrationService(
+        registry,
+        ProjectChatBindingService(registry, (101,)),
+        (101,),
+    )
+    service = ProjectSummaryService(
+        registry,
+        ProjectContextResolver(registry, (101,)),
+        migration_service=migration_service,
+    )
+
+    text = service.format_current_project_summary(-1001234567999, 101)
+
+    assert "не определён" in text.lower()
+    assert "alpha-project" in text
+    assert "/projects migrate here" in text
 
 
 def test_format_current_project_summary_owner_dm_multi_project_requires_explicit_chat(

@@ -64,6 +64,7 @@ from core.project_chat_binding_service import (
     ProjectChatBindingService,
 )
 from core.project_context import ProjectContextResolver
+from core.project_migration_service import ProjectMigrationService
 from core.project_registry import ProjectRegistry
 from core.project_runtime import ProjectRuntimeBinding
 from core.project_runtime_router import (
@@ -350,12 +351,29 @@ def _try_build_project_chat_binding_service(
 def _try_build_project_summary_service(
     state_db: StateDB | None,
     project_context_resolver: ProjectContextResolver | None,
+    project_migration_service: ProjectMigrationService | None = None,
 ) -> ProjectSummaryService | None:
     if state_db is None or project_context_resolver is None:
         return None
     return ProjectSummaryService(
         ProjectRegistry(state_db),
         project_context_resolver,
+        migration_service=project_migration_service,
+    )
+
+
+def _try_build_project_migration_service(
+    project_chat_binding_service: ProjectChatBindingService | None,
+    owner_chat_ids: frozenset[int],
+) -> ProjectMigrationService | None:
+    if project_chat_binding_service is None:
+        return None
+    if not isinstance(owner_chat_ids, frozenset):
+        raise ValueError("owner_chat_ids_must_be_frozenset")
+    return ProjectMigrationService(
+        project_chat_binding_service.registry,
+        project_chat_binding_service,
+        tuple(sorted(owner_chat_ids)),
     )
 
 
@@ -592,18 +610,31 @@ def _format_projects_service_error(code: str) -> str:
         raise ValueError("empty_projects_error_code")
     if code == "binding_requires_owner_user":
         return "Эта операция доступна только owner user."
+    if code == "migration_requires_owner_user":
+        return "Эта операция доступна только owner user."
     if code == "explicit_project_chat_must_be_group":
         return "Project chat должен быть group/supergroup, а не личным чатом."
+    if code == "migration_requires_group_chat":
+        return "Миграция выполняется только в group/supergroup chat."
     if code == "project_not_found":
         return "Проект не найден."
     if code == "project_missing_runtime_binding":
         return "Проект существует, но у него ещё нет runtime binding."
     if code == "chat_already_bound_to_other_project":
         return "Этот чат уже привязан к другому проекту."
+    if code == "chat_already_bound":
+        return "Этот чат уже привязан к проекту; миграция не требуется."
     if code == "project_already_bound_to_other_chat":
         return "Этот проект уже привязан к другому чату."
     if code == "chat_not_bound":
         return "Этот чат сейчас не привязан к проекту."
+    if code == "no_migratable_project":
+        return (
+            "Нет единственного legacy-проекта, который можно мигрировать "
+            "в этот чат."
+        )
+    if code == "multiple_projects_require_projects_bind":
+        return "Проектов несколько; используй `/projects bind <project_id_or_slug>`."
     return f"Операция не выполнена. Техническая причина: `{code}`."
 
 
@@ -615,8 +646,42 @@ def _format_projects_usage() -> str:
         "  /projects\n"
         "  /projects here\n"
         "  /projects bind <project_id_or_slug>\n"
+        "  /projects migrate here\n"
         "  /projects unbind"
     )
+
+
+def _format_projects_here_unbound(
+    *,
+    chat_id: int,
+    actor_user_id: int,
+    project_migration_service: ProjectMigrationService | None,
+) -> str:
+    lines = [
+        "📍 Текущий project chat",
+        "",
+        "Этот чат сейчас не привязан к проекту.",
+    ]
+    if project_migration_service is not None:
+        migration_status = project_migration_service.get_migration_status(
+            chat_provider="telegram",
+            chat_id=chat_id,
+            actor_user_id=actor_user_id,
+        )
+        if migration_status.can_migrate_here and migration_status.snapshot is not None:
+            lines.extend(
+                [
+                    "",
+                    "Доступна миграция единственного legacy-проекта "
+                    f"`{migration_status.snapshot.project.slug}` "
+                    f"(`{migration_status.snapshot.project.project_id}`).",
+                    "",
+                    "Используй `/projects migrate here`.",
+                ]
+            )
+            return "\n".join(lines)
+    lines.extend(["", "Причина: `chat_not_bound`"])
+    return "\n".join(lines)
 
 
 def make_project_handler(
@@ -662,6 +727,7 @@ def make_project_handler(
 def make_projects_handler(
     active_project: str = "ai-dev-team",
     project_chat_binding_service: ProjectChatBindingService | None = None,
+    project_migration_service: ProjectMigrationService | None = None,
 ) -> CommandHandler:
     if not isinstance(active_project, str) or not active_project.strip():
         raise ValueError("empty_active_project")
@@ -673,6 +739,14 @@ def make_projects_handler(
         )
     ):
         raise ValueError("invalid_project_chat_binding_service")
+    if (
+        project_migration_service is not None
+        and not isinstance(
+            project_migration_service,
+            ProjectMigrationService,
+        )
+    ):
+        raise ValueError("invalid_project_migration_service")
 
     def _handle(cmd: BotCommand, ctx: Any) -> str:
         if project_chat_binding_service is None:
@@ -745,12 +819,10 @@ def make_projects_handler(
                 ctx_ids[0],
             )
             if status.snapshot is None:
-                return (
-                    "📍 Текущий project chat\n"
-                    "\n"
-                    "Этот чат сейчас не привязан к проекту.\n"
-                    "\n"
-                    f"Причина: `{status.reason}`"
+                return _format_projects_here_unbound(
+                    chat_id=ctx_ids[0],
+                    actor_user_id=ctx_ids[1],
+                    project_migration_service=project_migration_service,
                 )
             return (
                 "📍 Текущий project chat\n"
@@ -792,6 +864,44 @@ def make_projects_handler(
                 f"chat_id: `{ctx_ids[0]}`\n"
                 "\n"
                 "Теперь этот чат является project chat."
+            )
+
+        if action == "migrate":
+            if positional != ("migrate", "here"):
+                return _format_projects_usage()
+            if ctx_ids is None:
+                return (
+                    "📋 /projects migrate here\n"
+                    "\n"
+                    "Не удалось определить текущий чат для этой команды."
+                )
+            if project_migration_service is None:
+                return (
+                    "📋 /projects migrate here\n"
+                    "\n"
+                    "Project migration сейчас недоступна: registry/state_db "
+                    "не подключены."
+                )
+            try:
+                snapshot = project_migration_service.migrate_current_chat(
+                    chat_provider="telegram",
+                    chat_id=ctx_ids[0],
+                    actor_user_id=ctx_ids[1],
+                )
+            except ValueError as exc:
+                return (
+                    "⚠️ Не удалось мигрировать текущий чат в explicit project chat.\n"
+                    "\n"
+                    f"{_format_projects_service_error(str(exc))}"
+                )
+            return (
+                "✅ Project chat мигрирован\n"
+                "\n"
+                f"project: `{snapshot.project.slug}` "
+                f"(`{snapshot.project.project_id}`)\n"
+                f"chat_id: `{ctx_ids[0]}`\n"
+                "\n"
+                "Теперь этот чат является explicit project chat."
             )
 
         if action == "unbind":
@@ -1755,6 +1865,7 @@ def build_command_registry(
     runner: BackgroundTaskRunner | None = None,
     runtime_router: ProjectRuntimeRouter | None = None,
     project_chat_binding_service: ProjectChatBindingService | None = None,
+    project_migration_service: ProjectMigrationService | None = None,
     project_context_resolver: ProjectContextResolver | None = None,
     project_summary_service: ProjectSummaryService | None = None,
 ) -> CommandRegistry:
@@ -1802,6 +1913,14 @@ def build_command_registry(
     ):
         raise ValueError("invalid_project_chat_binding_service")
     if (
+        project_migration_service is not None
+        and not isinstance(
+            project_migration_service,
+            ProjectMigrationService,
+        )
+    ):
+        raise ValueError("invalid_project_migration_service")
+    if (
         project_context_resolver is not None
         and not isinstance(
             project_context_resolver,
@@ -1834,6 +1953,7 @@ def build_command_registry(
         make_projects_handler(
             active_project,
             project_chat_binding_service=project_chat_binding_service,
+            project_migration_service=project_migration_service,
         ),
     )
     reg.register(
@@ -2096,9 +2216,14 @@ def build_bridge_from_env(
         state_db,
         owner_chat_ids,
     )
+    project_migration_service = _try_build_project_migration_service(
+        project_chat_binding_service,
+        owner_chat_ids,
+    )
     project_summary_service = _try_build_project_summary_service(
         state_db,
         project_context_resolver,
+        project_migration_service,
     )
 
     commands = build_command_registry(
@@ -2110,6 +2235,7 @@ def build_bridge_from_env(
         runner=runner,
         runtime_router=runtime_router,
         project_chat_binding_service=project_chat_binding_service,
+        project_migration_service=project_migration_service,
         project_context_resolver=project_context_resolver,
         project_summary_service=project_summary_service,
     )

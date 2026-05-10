@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from core.project_context import ProjectContextResolver
+from core.project_migration_service import ProjectMigrationService
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 
 _VALID_PROJECT_SUMMARY_SOURCES = frozenset(
@@ -89,6 +90,7 @@ class ProjectSummaryService:
         self,
         registry: ProjectRegistry,
         resolver: ProjectContextResolver,
+        migration_service: ProjectMigrationService | None = None,
     ) -> None:
         if not isinstance(registry, ProjectRegistry):
             raise ValueError(
@@ -99,8 +101,17 @@ class ProjectSummaryService:
                 "invalid_project_context_resolver_type:"
                 f"{type(resolver).__name__}"
             )
+        if (
+            migration_service is not None
+            and not isinstance(migration_service, ProjectMigrationService)
+        ):
+            raise ValueError(
+                "invalid_project_migration_service_type:"
+                f"{type(migration_service).__name__}"
+            )
         self._registry = registry
         self._resolver = resolver
+        self._migration_service = migration_service
 
     @property
     def registry(self) -> ProjectRegistry:
@@ -109,6 +120,10 @@ class ProjectSummaryService:
     @property
     def resolver(self) -> ProjectContextResolver:
         return self._resolver
+
+    @property
+    def migration_service(self) -> ProjectMigrationService | None:
+        return self._migration_service
 
     def get_current_project_summary(
         self,
@@ -141,6 +156,28 @@ class ProjectSummaryService:
         except ValueError as exc:
             code = str(exc)
             if code == "project_context_not_resolved:project_chat_not_bound":
+                if self._migration_service is not None:
+                    migration_status = self._migration_service.get_migration_status(
+                        chat_provider="telegram",
+                        chat_id=chat_id,
+                        actor_user_id=user_id,
+                    )
+                    if (
+                        migration_status.can_migrate_here
+                        and migration_status.snapshot is not None
+                    ):
+                        return (
+                            "📌 Текущий project context\n"
+                            "\n"
+                            "Проект для этого чата ещё не определён: explicit "
+                            "project chat ещё не создан.\n"
+                            "\n"
+                            "Есть один мигрируемый проект "
+                            f"`{migration_status.snapshot.project.slug}` "
+                            f"(`{migration_status.snapshot.project.project_id}`).\n"
+                            "\n"
+                            "Используй `/projects migrate here`."
+                        )
                 return (
                     "📌 Текущий project context\n"
                     "\n"

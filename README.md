@@ -128,6 +128,7 @@ Available Telegram commands:
 - `/projects` - list registered projects, runtime binding state, and explicit chat bindings
 - `/projects here` - show explicit binding status for the current chat
 - `/projects bind <project_id_or_slug>` - bind the current Telegram group/supergroup chat to an existing runtime-bound project (owner only)
+- `/projects migrate here` - migrate the current Telegram group/supergroup chat from legacy single-project bootstrap/fallback into an explicit project chat when exactly one migratable project exists (owner only)
 - `/projects unbind` - remove the explicit project binding from the current chat (owner only)
 - `/switch` - read-only project-context helper; it does not select or switch runtime-projects
 - `/budget`
@@ -147,6 +148,8 @@ Project context requirements today:
 - `/push` requires a resolved project runtime
 - `/pr` requires a resolved project runtime
 - explicit project chat bindings are managed through `/projects bind` and `/projects unbind`
+- `/projects migrate here` is the migration path from legacy single-project bootstrap to an explicit project chat; it works only in group/supergroup chats and only when exactly one runtime-bound project exists without an explicit chat binding
+- if multiple projects already exist, migration here is not used; bind the target chat explicitly with `/projects bind <project_id_or_slug>`
 - explicit project chats are group/supergroup chats only (`chat_id < 0`)
 - `/project` is read-only and never changes project resolution or runtime routing
 - `/switch` is navigation/status only and never changes project resolution or runtime routing
