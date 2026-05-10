@@ -151,6 +151,52 @@ def test_run_rejects_empty_task_id():
 
 
 # ---------------------------------------------------------------------------
+# initial artifacts
+# ---------------------------------------------------------------------------
+
+
+def test_run_seeds_initial_artifacts_before_planning():
+    memory = PipelineMemory()
+    seen: dict[str, str | None] = {}
+
+    def _planning_agent(*args):
+        seen["project_brief"] = memory.get_artifact("T1", "project_brief")
+        return _PLANNING_OK
+
+    orch = Orchestrator(
+        memory=memory,
+        agents=_registry(planning_agent=_planning_agent),
+    )
+
+    result = orch.run(
+        "T1",
+        "build x",
+        initial_artifacts={"project_brief": "Coordinator project brief"},
+    )
+
+    assert result.final_state == State.SUCCESS
+    assert seen["project_brief"] == "Coordinator project brief"
+    assert result.snapshot.artifacts["project_brief"] == "Coordinator project brief"
+
+
+def test_run_without_initial_artifacts_keeps_old_behavior():
+    result = _orch().run("T1", "build x")
+
+    assert result.final_state == State.SUCCESS
+    assert "project_brief" not in result.snapshot.artifacts
+
+
+def test_invalid_initial_artifacts_do_not_leave_partial_task_state():
+    memory = PipelineMemory()
+    orch = Orchestrator(memory=memory, agents=_registry())
+
+    with pytest.raises(ValueError, match="unknown_artifact_kind:bad"):
+        orch.run("T1", "build x", initial_artifacts={"bad": "payload"})
+
+    assert memory.list_tasks() == []
+
+
+# ---------------------------------------------------------------------------
 # happy path
 # ---------------------------------------------------------------------------
 

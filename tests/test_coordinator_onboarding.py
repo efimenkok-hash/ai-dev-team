@@ -274,3 +274,61 @@ def test_build_pipeline_task_prompt_for_owner_dm_explicitly_marks_fallback(
 
     assert "owner DM fallback" in prompt
     assert "Prepare the release branch." in prompt
+
+
+def test_build_project_brief_artifact_for_bound_chat(tmp_path):
+    repo = _git_repo(tmp_path)
+    snapshot = _snapshot(repo, chat_binding=_chat_binding())
+    context = ProjectCaptainOnboardingContext(
+        snapshot=snapshot,
+        chat_provider="telegram",
+        chat_id=-100123,
+        user_id=101,
+        context_source="bound_chat",
+        owner_task_text="Implement the project bootstrap audit.",
+    )
+    service = ProjectCaptainOnboardingService()
+
+    artifact = service.build_project_brief_artifact(context)
+    prompt = service.build_pipeline_task_prompt(context)
+
+    assert "Coordinator project brief" in artifact
+    assert "alpha_project" in artifact
+    assert "alpha-project" in artifact
+    assert "Alpha Project" in artifact
+    assert "active" in artifact
+    assert "101" in artifact
+    assert "alpha_adapter" in artifact
+    assert str(repo.resolve()) in artifact
+    assert str((repo.parent / "worktrees").resolve()) in artifact
+    assert "main" in artifact
+    assert "feature/" in artifact
+    assert "python" in artifact
+    assert "explicit project chat" in artifact
+    assert "Implement the project bootstrap audit." in artifact
+    assert "authoritative" in artifact.lower()
+    assert artifact != prompt
+    assert "\n- chat_id:" not in artifact
+    assert "\n- user_id:" not in artifact
+
+
+def test_build_project_brief_artifact_for_owner_dm_fallback(tmp_path):
+    repo = _git_repo(tmp_path)
+    snapshot = _snapshot(repo)
+    context = ProjectCaptainOnboardingContext(
+        snapshot=snapshot,
+        chat_provider="telegram",
+        chat_id=101,
+        user_id=101,
+        context_source="owner_dm_single_project",
+        owner_task_text="Prepare the release branch.",
+    )
+
+    artifact = ProjectCaptainOnboardingService().build_project_brief_artifact(
+        context
+    )
+
+    assert "owner DM fallback" in artifact
+    assert "Prepare the release branch." in artifact
+    assert "\n- chat_id:" not in artifact
+    assert "\n- user_id:" not in artifact

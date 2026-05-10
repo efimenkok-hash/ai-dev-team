@@ -52,6 +52,23 @@ def test_set_and_get_artifact_happy_path():
     assert m.get_artifact("T1", "pm") == '{"plan_id":"x"}'
 
 
+def test_project_brief_is_valid_artifact_kind():
+    assert "project_brief" in VALID_ARTIFACT_KINDS
+
+
+def test_set_and_get_project_brief_artifact():
+    m = _seeded()
+    m.set_artifact("T1", "project_brief", "Coordinator project brief")
+    assert m.get_artifact("T1", "project_brief") == "Coordinator project brief"
+
+
+def test_project_brief_artifact_is_immutable():
+    m = _seeded()
+    m.set_artifact("T1", "project_brief", "first brief")
+    with pytest.raises(ValueError, match="artifact_already_set:project_brief"):
+        m.set_artifact("T1", "project_brief", "second brief")
+
+
 def test_all_artifact_kinds_round_trip():
     m = _seeded()
     for kind in VALID_ARTIFACT_KINDS:
@@ -254,6 +271,7 @@ def test_transitions_count_tracks_history():
 def test_dump_task_round_trips_through_restore():
     src = PipelineMemory()
     src.new_task("T1", "raw text here")
+    src.set_artifact("T1", "project_brief", "Coordinator brief")
     src.set_artifact("T1", "pm", '{"plan_id":"x"}')
     src.set_artifact("T1", "architect", '{"arch_id":"a"}')
     src.record_transition("T1", State.IDLE, State.PLANNING)
@@ -280,6 +298,17 @@ def test_dump_task_round_trips_through_restore():
     assert s_src.transitions == s_dst.transitions
     assert s_src.agent_calls == s_dst.agent_calls
     assert dict(s_src.loop_counters) == dict(s_dst.loop_counters)
+
+
+def test_restore_preserves_project_brief_artifact():
+    src = PipelineMemory()
+    src.new_task("T1", "raw task")
+    src.set_artifact("T1", "project_brief", "Coordinator project brief")
+
+    dst = PipelineMemory()
+    dst.restore_task(src.dump_task("T1"))
+
+    assert dst.get_artifact("T1", "project_brief") == "Coordinator project brief"
 
 
 def test_dump_task_includes_schema_version():

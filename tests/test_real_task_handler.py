@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from core.background_runner import BackgroundTaskRunner
+from core.memory import PipelineMemory
 from core.model_tier import default_registry as default_tier_registry
 from core.observability import Observability
 from core.progress_emitter import ProgressEvent
@@ -641,6 +642,8 @@ def test_bound_project_chat_pipeline_gets_enriched_onboarding_prompt(
             ),
         )
         assert isinstance(reply, BridgeReply)
+        assert owner_task_text in reply.body
+        assert "Coordinator project captain onboarding" not in reply.body
         _wait_until_idle(runner)
 
     assert captured_prompts, "planning_agent must receive a pipeline task prompt"
@@ -702,6 +705,8 @@ def test_owner_dm_single_project_pipeline_gets_enriched_onboarding_prompt(
             ),
         )
         assert isinstance(reply, BridgeReply)
+        assert owner_task_text in reply.body
+        assert "Coordinator project captain onboarding" not in reply.body
         _wait_until_idle(runner)
 
     assert captured_prompts, "planning_agent must receive a pipeline task prompt"
@@ -710,6 +715,190 @@ def test_owner_dm_single_project_pipeline_gets_enriched_onboarding_prompt(
     assert "Coordinator role: project captain" in prompt
     assert "source: owner DM fallback" in prompt
     assert owner_task_text in prompt
+
+
+def test_bound_project_chat_seeds_project_brief_before_planning(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send, _captured = _make_progress_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="bound-brief.db",
+    )
+    task_id = "task-bound-brief-001"
+    memory = PipelineMemory()
+    seen: dict[str, str | None] = {}
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    def _planning_agent(task_prompt: str) -> str:
+        seen["brief"] = memory.get_artifact(task_id, "project_brief")
+        seen["prompt"] = task_prompt
+        return '{"plan": "ok"}'
+
+    def _agents(_tier):
+        agents = happy_agents(None)
+        agents["planning_agent"] = _planning_agent
+        return agents
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=_agents,
+            memory_factory=lambda: memory,
+            task_id_factory=lambda: task_id,
+        )
+        handler(
+            "Build the deployment checker.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Build the deployment checker.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        _wait_until_idle(runner)
+
+    assert seen["brief"] is not None
+    assert "Coordinator project brief" in seen["brief"]
+    assert "explicit project chat" in seen["brief"]
+    assert "Build the deployment checker." in seen["brief"]
+    assert memory.get_artifact(task_id, "project_brief") == seen["brief"]
+
+
+def test_owner_dm_single_project_seeds_project_brief_before_planning(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(101, "STANDARD")
+    send, _captured = _make_progress_capture()
+    snapshot = _project_snapshot(fake_repo)
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="owner-dm-brief.db",
+    )
+    task_id = "task-owner-dm-brief-001"
+    memory = PipelineMemory()
+    seen: dict[str, str | None] = {}
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    def _planning_agent(task_prompt: str) -> str:
+        seen["brief"] = memory.get_artifact(task_id, "project_brief")
+        seen["prompt"] = task_prompt
+        return '{"plan": "ok"}'
+
+    def _agents(_tier):
+        agents = happy_agents(None)
+        agents["planning_agent"] = _planning_agent
+        return agents
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=_agents,
+            memory_factory=lambda: memory,
+            task_id_factory=lambda: task_id,
+        )
+        handler(
+            "Prepare the release branch.",
+            IncomingMessage(
+                chat_id=101,
+                user_id=101,
+                message_id=1,
+                text="Prepare the release branch.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="owner_dm_single_project",
+            ),
+        )
+        _wait_until_idle(runner)
+
+    assert seen["brief"] is not None
+    assert "Coordinator project brief" in seen["brief"]
+    assert "owner DM fallback" in seen["brief"]
+    assert "Prepare the release branch." in seen["brief"]
+
+
+def test_legacy_non_context_path_does_not_seed_fake_project_brief(
+    runner,
+    sandbox,
+    tier_store,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(42, "STANDARD")
+    send, _captured = _make_progress_capture()
+    task_id = "task-no-brief-001"
+    memory = PipelineMemory()
+    seen: dict[str, str | None] = {}
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    def _planning_agent(task_prompt: str) -> str:
+        seen["brief"] = memory.get_artifact(task_id, "project_brief")
+        seen["prompt"] = task_prompt
+        return '{"plan": "ok"}'
+
+    def _agents(_tier):
+        agents = happy_agents(None)
+        agents["planning_agent"] = _planning_agent
+        return agents
+
+    with (
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=_agents,
+            memory_factory=lambda: memory,
+            task_id_factory=lambda: task_id,
+        )
+        handler("Legacy build task.", _msg(chat_id=42, text="Legacy build task."))
+        _wait_until_idle(runner)
+
+    assert seen["brief"] is None
+    assert memory.get_artifact(task_id, "project_brief") is None
+    assert seen["prompt"] == "Legacy build task."
 
 
 def test_busy_message_keeps_original_owner_task_text_for_project_aware_tasks(

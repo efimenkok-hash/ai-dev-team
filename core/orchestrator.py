@@ -6,8 +6,9 @@ records every transition and agent call into PipelineMemory, and applies the
 FAIL_SAFE rules from docs/fsm_spec.md.
 
 CONTRACTS:
-1. run(task_id, raw_task) идемпотентен по task_id — повторный запуск с тем же
-   id поднимет ValueError (через PipelineMemory.new_task).
+1. run(task_id, raw_task, initial_artifacts=...) идемпотентен по task_id —
+   повторный запуск с тем же id поднимет ValueError. initial_artifacts
+   полностью валидируются до new_task, чтобы не оставлять partial state.
 2. Orchestrator не делает I/O на файловой системе и не выходит в сеть напрямую —
    все вызовы LLM проходят через AgentRegistry.
 3. Любая необработанная Exception агента -> терминальное состояние
@@ -38,7 +39,7 @@ CONTRACTS:
 import contextlib
 import json
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -53,7 +54,11 @@ from core.fsm import (
     is_terminal,
 )
 from core.json_extractor import extract_json_object
-from core.memory import PipelineMemory, Snapshot
+from core.memory import (
+    PipelineMemory,
+    Snapshot,
+    normalize_artifact_seed_mapping,
+)
 from core.observability import Observability
 
 if TYPE_CHECKING:
@@ -220,10 +225,21 @@ class Orchestrator:
         self._cost_budget = cost_budget_usd
         self._runtime_validator = runtime_validator
 
-    def run(self, task_id: str, raw_task: str) -> RunResult:
+    def run(
+        self,
+        task_id: str,
+        raw_task: str,
+        *,
+        initial_artifacts: Mapping[str, str] | None = None,
+    ) -> RunResult:
         for validator in self._task_validators:
             validator(raw_task)  # may raise ValueError -> caller handles
+        normalized_initial_artifacts = normalize_artifact_seed_mapping(
+            initial_artifacts
+        )
         self._memory.new_task(task_id, raw_task)
+        for kind, payload in normalized_initial_artifacts.items():
+            self._memory.set_artifact(task_id, kind, payload)
         return self._drive(task_id)
 
     def _drive(self, task_id: str) -> RunResult:

@@ -88,20 +88,59 @@ class ProjectCaptainOnboardingContext:
 
 
 class ProjectCaptainOnboardingService:
-    def build_pipeline_task_prompt(
+    def _require_context(
         self,
         context: ProjectCaptainOnboardingContext,
-    ) -> str:
+    ) -> ProjectCaptainOnboardingContext:
         if not isinstance(context, ProjectCaptainOnboardingContext):
             raise ValueError(
                 "invalid_project_captain_onboarding_context_type:"
                 f"{type(context).__name__}"
             )
+        if context.snapshot.runtime_binding is None:
+            raise ValueError("snapshot_missing_runtime_binding")
+        return context
 
+    @staticmethod
+    def _project_identity_lines(context: ProjectCaptainOnboardingContext) -> list[str]:
         snapshot = context.snapshot
-        runtime_binding = snapshot.runtime_binding
+        return [
+            "Project identity:",
+            f"- project_id: {snapshot.project.project_id}",
+            f"- slug: {snapshot.project.slug}",
+            f"- name: {snapshot.project.name}",
+            f"- status: {snapshot.project.status}",
+            f"- owner_user_id: {snapshot.project.owner_user_id}",
+        ]
+
+    @staticmethod
+    def _runtime_binding_lines(
+        context: ProjectCaptainOnboardingContext,
+    ) -> list[str]:
+        runtime_binding = context.snapshot.runtime_binding
         if runtime_binding is None:
             raise ValueError("snapshot_missing_runtime_binding")
+        lines = [
+            "Runtime binding:",
+            f"- adapter_name: {runtime_binding.adapter_name}",
+            f"- repo_path: {runtime_binding.repo_path}",
+        ]
+        if runtime_binding.worktree_root is not None:
+            lines.append(f"- worktree_root: {runtime_binding.worktree_root}")
+        lines.extend(
+            [
+                f"- base_branch: {runtime_binding.base_branch}",
+                f"- branch_prefix: {runtime_binding.branch_prefix}",
+                f"- language: {runtime_binding.language}",
+            ]
+        )
+        return lines
+
+    def build_pipeline_task_prompt(
+        self,
+        context: ProjectCaptainOnboardingContext,
+    ) -> str:
+        context = self._require_context(context)
 
         lines = [
             "Coordinator project captain onboarding",
@@ -114,12 +153,7 @@ class ProjectCaptainOnboardingService:
             ),
             "Do not expand scope beyond the owner's task.",
             "",
-            "Project identity:",
-            f"- project_id: {snapshot.project.project_id}",
-            f"- slug: {snapshot.project.slug}",
-            f"- name: {snapshot.project.name}",
-            f"- status: {snapshot.project.status}",
-            f"- owner_user_id: {snapshot.project.owner_user_id}",
+            *self._project_identity_lines(context),
             "",
             "Project context source:",
             f"- source: {describe_context_source(context.context_source)}",
@@ -127,27 +161,53 @@ class ProjectCaptainOnboardingService:
             f"- chat_id: {context.chat_id}",
             f"- user_id: {context.user_id}",
             "",
-            "Runtime binding:",
-            f"- adapter_name: {runtime_binding.adapter_name}",
-            f"- repo_path: {runtime_binding.repo_path}",
+            *self._runtime_binding_lines(context),
+            "",
+            "Coordinator instruction:",
+            (
+                "Treat the project context above as authoritative for all "
+                "downstream planning and execution."
+            ),
+            "Do not invent another project scope, repo, or runtime.",
+            "Do not expand scope beyond the owner's task.",
+            "",
+            "Original owner task:",
+            "<<<OWNER_TASK",
+            context.owner_task_text,
+            "OWNER_TASK",
         ]
-        if runtime_binding.worktree_root is not None:
-            lines.append(f"- worktree_root: {runtime_binding.worktree_root}")
+        return "\n".join(lines)
+
+    def build_project_brief_artifact(
+        self,
+        context: ProjectCaptainOnboardingContext,
+    ) -> str:
+        context = self._require_context(context)
+        lines = [
+            "Coordinator project brief",
+            "",
+            *self._project_identity_lines(context),
+            "",
+            "Project context mode:",
+            f"- mode: {describe_context_source(context.context_source)}",
+        ]
+        if context.context_source == "bound_chat":
+            lines.append("- explicit_project_chat: configured")
+        else:
+            lines.append("- explicit_project_chat: not required for this fallback")
         lines.extend(
             [
-                f"- base_branch: {runtime_binding.base_branch}",
-                f"- branch_prefix: {runtime_binding.branch_prefix}",
-                f"- language: {runtime_binding.language}",
                 "",
-                "Coordinator instruction:",
+                *self._runtime_binding_lines(context),
+                "",
+                "Coordinator mandate:",
                 (
-                    "Treat the project context above as authoritative for all "
-                    "downstream planning and execution."
+                    "This project contour is authoritative for the current task."
                 ),
                 "Do not invent another project scope, repo, or runtime.",
                 "Do not expand scope beyond the owner's task.",
                 "",
-                "Original owner task:",
+                "Current owner task:",
                 "<<<OWNER_TASK",
                 context.owner_task_text,
                 "OWNER_TASK",

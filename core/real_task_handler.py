@@ -281,6 +281,7 @@ def make_real_task_handler(
         task_id: str,
         owner_task_text: str,
         pipeline_task_prompt: str,
+        initial_artifacts: dict[str, str] | None,
         tier_name: str,
         sandbox_workspace: SandboxWorkspace,
     ) -> Callable[[CancellationToken], dict]:
@@ -393,7 +394,11 @@ def make_real_task_handler(
                     runtime_validator=runtime_hook,
                 )
 
-                result: RunResult = orch.run(task_id, pipeline_task_prompt)
+                result: RunResult = orch.run(
+                    task_id,
+                    pipeline_task_prompt,
+                    initial_artifacts=initial_artifacts,
+                )
 
                 # /stop pressed while pipeline was running?  Orchestrator
                 # cannot be interrupted mid-flight (it runs all agents to
@@ -485,20 +490,20 @@ def make_real_task_handler(
             resolved_runtime,
         )
 
-    def _build_pipeline_task_prompt(
+    def _build_project_onboarding_context(
         *,
         owner_task_text: str,
         msg: IncomingMessage,
         resolved_runtime: ResolvedProjectRuntime | None,
-    ) -> str:
+    ) -> ProjectCaptainOnboardingContext | None:
         if resolved_runtime is None:
-            return owner_task_text
+            return None
         if msg.project_context_source not in {
             "bound_chat",
             "owner_dm_single_project",
         }:
-            return owner_task_text
-        context = ProjectCaptainOnboardingContext(
+            return None
+        return ProjectCaptainOnboardingContext(
             snapshot=resolved_runtime.snapshot,
             chat_provider="telegram",
             chat_id=msg.chat_id,
@@ -506,7 +511,26 @@ def make_real_task_handler(
             context_source=msg.project_context_source,
             owner_task_text=owner_task_text,
         )
-        return onboarding_service.build_pipeline_task_prompt(context)
+
+    def _build_pipeline_task_prompt(
+        onboarding_context: ProjectCaptainOnboardingContext | None,
+        *,
+        owner_task_text: str,
+    ) -> str:
+        if onboarding_context is None:
+            return owner_task_text
+        return onboarding_service.build_pipeline_task_prompt(onboarding_context)
+
+    def _build_initial_artifacts(
+        onboarding_context: ProjectCaptainOnboardingContext | None,
+    ) -> dict[str, str] | None:
+        if onboarding_context is None:
+            return None
+        return {
+            "project_brief": onboarding_service.build_project_brief_artifact(
+                onboarding_context
+            )
+        }
 
     def _runtime_error_reply(reason_code: str) -> BridgeReply:
         return BridgeReply(
@@ -654,11 +678,16 @@ def make_real_task_handler(
                 runtime_error or "bootstrap_active_project_runtime_invalid"
             )
         try:
-            pipeline_task_prompt = _build_pipeline_task_prompt(
+            onboarding_context = _build_project_onboarding_context(
                 owner_task_text=text,
                 msg=msg,
                 resolved_runtime=resolved_runtime,
             )
+            pipeline_task_prompt = _build_pipeline_task_prompt(
+                onboarding_context,
+                owner_task_text=text,
+            )
+            initial_artifacts = _build_initial_artifacts(onboarding_context)
         except ValueError as exc:
             return BridgeReply(
                 persona_role=COORDINATOR_ROLE,
@@ -691,6 +720,7 @@ def make_real_task_handler(
             task_id,
             text,
             pipeline_task_prompt,
+            initial_artifacts,
             tier_name,
             sandbox_workspace,
         )

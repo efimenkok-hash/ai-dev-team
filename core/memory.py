@@ -23,6 +23,7 @@ from core.contracts import validate_non_empty_text
 from core.fsm import State, can_transition
 
 VALID_ARTIFACT_KINDS: frozenset[str] = frozenset({
+    "project_brief",
     "planning",
     "pm",
     "architect",
@@ -65,6 +66,38 @@ class _TaskState:
     loop_counters: dict[str, int] = field(default_factory=dict)
 
 
+def _normalize_artifact_kind(kind: str) -> str:
+    if not isinstance(kind, str):
+        raise ValueError(f"invalid_artifact_kind_type:{type(kind).__name__}")
+    if kind not in VALID_ARTIFACT_KINDS:
+        raise ValueError(f"unknown_artifact_kind:{kind}")
+    return kind
+
+
+def _normalize_artifact_payload(payload: str) -> str:
+    validation = validate_non_empty_text(payload, "payload")
+    if not validation.ok:
+        raise ValueError(";".join(validation.violations))
+    return payload
+
+
+def normalize_artifact_seed_mapping(
+    artifacts: Mapping[str, str] | None,
+) -> dict[str, str]:
+    if artifacts is None:
+        return {}
+    if not isinstance(artifacts, Mapping):
+        raise ValueError(
+            f"invalid_initial_artifacts_type:{type(artifacts).__name__}"
+        )
+    normalized: dict[str, str] = {}
+    for kind, payload in artifacts.items():
+        normalized[_normalize_artifact_kind(kind)] = _normalize_artifact_payload(
+            payload
+        )
+    return normalized
+
+
 class PipelineMemory:
     def __init__(self) -> None:
         self._tasks: dict[str, _TaskState] = {}
@@ -83,12 +116,8 @@ class PipelineMemory:
         self._tasks[task_id] = _TaskState(raw_task=raw_task)
 
     def set_artifact(self, task_id: str, kind: str, payload: str) -> None:
-        if kind not in VALID_ARTIFACT_KINDS:
-            raise ValueError(f"unknown_artifact_kind:{kind}")
-
-        validation = validate_non_empty_text(payload, "payload")
-        if not validation.ok:
-            raise ValueError(";".join(validation.violations))
+        kind = _normalize_artifact_kind(kind)
+        payload = _normalize_artifact_payload(payload)
 
         task = self._require_task(task_id)
 
@@ -98,8 +127,7 @@ class PipelineMemory:
         task.artifacts[kind] = payload
 
     def get_artifact(self, task_id: str, kind: str) -> str | None:
-        if kind not in VALID_ARTIFACT_KINDS:
-            raise ValueError(f"unknown_artifact_kind:{kind}")
+        kind = _normalize_artifact_kind(kind)
 
         task = self._require_task(task_id)
         return task.artifacts.get(kind)
@@ -202,10 +230,7 @@ class PipelineMemory:
         if not validation.ok:
             raise ValueError(";".join(validation.violations))
 
-        artifacts = dict(dump["artifacts"])
-        for kind in artifacts:
-            if kind not in VALID_ARTIFACT_KINDS:
-                raise ValueError(f"unknown_artifact_kind:{kind}")
+        artifacts = normalize_artifact_seed_mapping(dict(dump["artifacts"]))
 
         loop_counters: dict[str, int] = {}
         for k, v in dict(dump["loop_counters"]).items():
