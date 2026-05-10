@@ -1,13 +1,12 @@
 from pathlib import Path
 
-import pytest
-
-from core.agent_personas import DEFAULT_PERSONAS, PersonaRegistry, default_registry
-from core.coordinator_team_proposal import (
-    BASELINE_TEAM_ROLE_ORDER,
-    CoordinatorTeamProposalContext,
-    CoordinatorTeamProposalService,
+from core.agent_personas import default_registry
+from core.coordinator_team_assembly import (
+    BASELINE_INTERNAL_TEAM_ROLE_ORDER,
+    CoordinatorTeamAssemblyContext,
+    CoordinatorTeamAssemblyService,
 )
+from core.coordinator_team_proposal import CoordinatorTeamProposalService
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
@@ -89,119 +88,26 @@ def _snapshot(
     return ProjectSnapshot(**data)
 
 
-def _registry_without(role: str) -> PersonaRegistry:
-    return PersonaRegistry(
-        tuple(persona for persona in DEFAULT_PERSONAS if persona.agent_role != role)
+def _assembly(tmp_path: Path, *, context_source: str, bound: bool):
+    repo = _git_repo(tmp_path)
+    snapshot = _snapshot(repo, chat_binding=_chat_binding() if bound else None)
+    return CoordinatorTeamAssemblyService().assemble_team(
+        CoordinatorTeamAssemblyContext(
+            snapshot=snapshot,
+            owner_task_text="Implement the release workflow.",
+            context_source=context_source,
+            personas=default_registry(),
+        )
     )
-
-
-def test_context_happy_path_for_bound_chat(tmp_path):
-    repo = _git_repo(tmp_path)
-    context = CoordinatorTeamProposalContext(
-        snapshot=_snapshot(repo, chat_binding=_chat_binding()),
-        owner_task_text="Implement the release workflow.",
-        context_source="bound_chat",
-        personas=default_registry(),
-    )
-
-    assert context.context_source == "bound_chat"
-
-
-def test_context_happy_path_for_owner_dm_fallback(tmp_path):
-    repo = _git_repo(tmp_path)
-    context = CoordinatorTeamProposalContext(
-        snapshot=_snapshot(repo),
-        owner_task_text="Prepare the release branch.",
-        context_source="owner_dm_single_project",
-        personas=default_registry(),
-    )
-
-    assert context.context_source == "owner_dm_single_project"
-
-
-def test_context_rejects_bad_snapshot():
-    with pytest.raises(ValueError, match="invalid_project_snapshot_type"):
-        CoordinatorTeamProposalContext(
-            snapshot="bad",  # type: ignore[arg-type]
-            owner_task_text="Task",
-            context_source="bound_chat",
-            personas=default_registry(),
-        )
-
-
-def test_context_rejects_snapshot_without_runtime_binding(tmp_path):
-    with pytest.raises(ValueError, match="snapshot_missing_runtime_binding"):
-        CoordinatorTeamProposalContext(
-            snapshot=_snapshot(None),
-            owner_task_text="Task",
-            context_source="bound_chat",
-            personas=default_registry(),
-        )
-
-
-@pytest.mark.parametrize("bad", ["", "   "])
-def test_context_rejects_empty_owner_task_text(tmp_path, bad):
-    repo = _git_repo(tmp_path)
-
-    with pytest.raises(ValueError, match="empty_owner_task_text"):
-        CoordinatorTeamProposalContext(
-            snapshot=_snapshot(repo),
-            owner_task_text=bad,
-            context_source="bound_chat",
-            personas=default_registry(),
-        )
-
-
-@pytest.mark.parametrize("bad", ["none", "registry", "", "  "])
-def test_context_rejects_bad_context_source(tmp_path, bad):
-    repo = _git_repo(tmp_path)
-
-    with pytest.raises(ValueError, match="invalid_context_source"):
-        CoordinatorTeamProposalContext(
-            snapshot=_snapshot(repo),
-            owner_task_text="Task",
-            context_source=bad,
-            personas=default_registry(),
-        )
-
-
-def test_context_rejects_bad_personas_type(tmp_path):
-    repo = _git_repo(tmp_path)
-
-    with pytest.raises(ValueError, match="invalid_persona_registry_type"):
-        CoordinatorTeamProposalContext(
-            snapshot=_snapshot(repo),
-            owner_task_text="Task",
-            context_source="bound_chat",
-            personas="bad",  # type: ignore[arg-type]
-        )
-
-
-def test_context_rejects_missing_required_roles(tmp_path):
-    repo = _git_repo(tmp_path)
-
-    with pytest.raises(ValueError, match="missing_required_persona_roles"):
-        CoordinatorTeamProposalContext(
-            snapshot=_snapshot(repo),
-            owner_task_text="Task",
-            context_source="bound_chat",
-            personas=_registry_without("fixer_agent"),
-        )
 
 
 def test_team_proposal_artifact_includes_project_anchor_context_and_captain(
     tmp_path,
 ):
-    repo = _git_repo(tmp_path)
-    context = CoordinatorTeamProposalContext(
-        snapshot=_snapshot(repo, chat_binding=_chat_binding()),
-        owner_task_text="Implement the release workflow.",
-        context_source="bound_chat",
-        personas=default_registry(),
-    )
+    assembly = _assembly(tmp_path, context_source="bound_chat", bound=True)
 
     artifact = CoordinatorTeamProposalService().build_team_proposal_artifact(
-        context
+        assembly
     )
 
     assert "Coordinator team proposal" in artifact
@@ -215,44 +121,40 @@ def test_team_proposal_artifact_includes_project_anchor_context_and_captain(
     assert "Hiring and external roles are not auto-activated" in artifact
 
 
-def test_team_proposal_artifact_includes_all_baseline_roles_in_stable_order(
-    tmp_path,
-):
-    repo = _git_repo(tmp_path)
-    context = CoordinatorTeamProposalContext(
-        snapshot=_snapshot(repo),
-        owner_task_text="Prepare the release branch.",
+def test_team_proposal_builds_from_assembled_team_in_stable_order(tmp_path):
+    assembly = _assembly(
+        tmp_path,
         context_source="owner_dm_single_project",
-        personas=default_registry(),
+        bound=False,
     )
 
     artifact = CoordinatorTeamProposalService().build_team_proposal_artifact(
-        context
+        assembly
     )
 
+    assert "assembly_mode: baseline_internal_team" in artifact
     last_index = -1
-    for role in BASELINE_TEAM_ROLE_ORDER:
-        persona = context.personas.for_role(role)
-        role_index = artifact.index(f"- role_id: {role}")
+    member_roles = tuple(member.persona.agent_role for member in assembly.members)
+    assert member_roles == BASELINE_INTERNAL_TEAM_ROLE_ORDER
+    for member in assembly.members:
+        role_index = artifact.index(f"- role_id: {member.persona.agent_role}")
         assert role_index > last_index
         last_index = role_index
-        assert f"  human_name: {persona.human_name}" in artifact
-        assert f"  title: {persona.title}" in artifact
-        assert f"  seniority: {persona.seniority}" in artifact
-        assert "  mandate: " in artifact
+        assert f"  human_name: {member.persona.human_name}" in artifact
+        assert f"  title: {member.persona.title}" in artifact
+        assert f"  seniority: {member.persona.seniority}" in artifact
+        assert f"  mandate: {member.mandate}" in artifact
 
 
-def test_team_proposal_artifact_is_deterministic(tmp_path):
-    repo = _git_repo(tmp_path)
-    context = CoordinatorTeamProposalContext(
-        snapshot=_snapshot(repo),
-        owner_task_text="Prepare the release branch.",
+def test_team_proposal_is_deterministic(tmp_path):
+    assembly = _assembly(
+        tmp_path,
         context_source="owner_dm_single_project",
-        personas=default_registry(),
+        bound=False,
     )
     service = CoordinatorTeamProposalService()
 
-    first = service.build_team_proposal_artifact(context)
-    second = service.build_team_proposal_artifact(context)
+    first = service.build_team_proposal_artifact(assembly)
+    second = service.build_team_proposal_artifact(assembly)
 
     assert first == second

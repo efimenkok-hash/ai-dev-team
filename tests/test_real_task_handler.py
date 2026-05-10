@@ -790,6 +790,7 @@ def test_bound_project_chat_seeds_coordinator_artifacts_before_planning(
     assert memory.get_artifact(task_id, "project_brief") == seen["brief"]
     assert seen["proposal"] is not None
     assert "Coordinator team proposal" in seen["proposal"]
+    assert "assembly_mode: baseline_internal_team" in seen["proposal"]
     assert "coordinator_agent" in seen["proposal"]
     assert "project captain" in seen["proposal"].lower()
     assert memory.get_artifact(task_id, "team_proposal") == seen["proposal"]
@@ -864,6 +865,7 @@ def test_owner_dm_single_project_seeds_coordinator_artifacts_before_planning(
     assert "Prepare the release branch." in seen["brief"]
     assert seen["proposal"] is not None
     assert "Coordinator team proposal" in seen["proposal"]
+    assert "assembly_mode: baseline_internal_team" in seen["proposal"]
     assert "owner DM fallback" in seen["proposal"]
     assert "Prepare the release branch." in seen["proposal"]
 

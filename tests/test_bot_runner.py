@@ -1877,50 +1877,309 @@ def test_budget_handler_persists_budget_to_state_db(tmp_path):
     assert restarted.get_budget(303) == pytest.approx(77.0)
 
 
-def test_agents_handler_lists_all_eight():
+def test_agents_handler_without_context_shows_baseline_template():
     personas = default_registry()
     handler = make_agents_handler(personas)
     text = handler(parse_command("/agents"), None)
     for p in personas.all():
         assert p.callsign in text
-    assert "Состав команды" in text
+    assert "Baseline internal team template" in text
+    assert "reference template" in text
 
 
 def test_agents_handler_uses_qualified_name_no_redundancy():
-    """Default personas have callsign == title; output must NOT show
-    'Архитектор (Архитектор)' redundancy."""
     personas = default_registry()
     handler = make_agents_handler(personas)
     text = handler(parse_command("/agents"), None)
+    assert "  human_name: Архитектор" in text
+    assert "  title: Архитектор" in text
     assert "Архитектор (Архитектор)" not in text
-    assert "Программист (Программист)" not in text
 
 
-def test_agents_handler_uses_emojis():
-    """Each agent line should be prefixed by its persona emoji."""
+def test_agents_handler_without_context_orders_by_baseline_team():
     personas = default_registry()
     handler = make_agents_handler(personas)
     text = handler(parse_command("/agents"), None)
-    for p in personas.all():
-        if p.emoji:
-            assert p.emoji in text
-
-
-def test_agents_handler_orders_by_pipeline_flow():
-    """Agents listed in FSM execution order, not alphabetically."""
-    personas = default_registry()
-    handler = make_agents_handler(personas)
-    text = handler(parse_command("/agents"), None)
-    # Planner must appear before Architect, which must appear before Fixer
-    assert text.index("Планировщик") < text.index("Архитектор")
-    assert text.index("Архитектор") < text.index("Программист")
-    assert text.index("Программист") < text.index("Ревьюер")
-    assert text.index("Ревьюер") < text.index("Фиксер")
+    assert text.index("role_id: coordinator_agent") < text.index(
+        "role_id: planning_agent"
+    )
+    assert text.index("role_id: planning_agent") < text.index(
+        "role_id: architect_agent"
+    )
+    assert text.index("role_id: architect_agent") < text.index(
+        "role_id: fixer_agent"
+    )
 
 
 def test_agents_handler_rejects_non_personas():
     with pytest.raises(ValueError, match="invalid_personas"):
         make_agents_handler("not personas")  # type: ignore[arg-type]
+
+
+def test_agents_handler_rejects_invalid_project_context_resolver():
+    with pytest.raises(ValueError, match="invalid_project_context_resolver"):
+        make_agents_handler(
+            default_registry(),
+            project_context_resolver="bad",  # type: ignore[arg-type]
+        )
+
+
+def test_agents_handler_shows_current_assembled_team_for_bound_project_chat(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "agents-bound.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "agents-bound-repo")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            chat_binding=_chat_binding(chat_id=-100123450900),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    handler = make_agents_handler(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+
+    text = handler(
+        parse_command("/agents"),
+        IncomingMessage(
+            chat_id=-100123450900,
+            user_id=999,
+            message_id=1,
+            text="/agents",
+        ),
+    )
+
+    assert "Текущая assembled team" in text
+    assert "alpha_project" in text
+    assert "alpha-project" in text
+    assert "explicit project chat" in text
+    assert "captain_role: coordinator_agent" in text
+
+
+def test_agents_handler_shows_current_assembled_team_for_owner_dm_single_project(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "agents-owner-dm.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "agents-owner-dm-repo")
+    registry.register_project(_project_snapshot(repo))
+    resolver = ProjectContextResolver(registry, (777,))
+    handler = make_agents_handler(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+
+    text = handler(
+        parse_command("/agents"),
+        IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=1,
+            text="/agents",
+        ),
+    )
+
+    assert "Текущая assembled team" in text
+    assert "owner DM fallback" in text
+    assert "captain_role: coordinator_agent" in text
+
+
+def test_agents_handler_unbound_group_chat_does_not_pretend_active_team(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "agents-unbound.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "agents-unbound-repo")
+    registry.register_project(_project_snapshot(repo))
+    resolver = ProjectContextResolver(registry, (777,))
+    handler = make_agents_handler(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+
+    text = handler(
+        parse_command("/agents"),
+        IncomingMessage(
+            chat_id=-100123450901,
+            user_id=999,
+            message_id=1,
+            text="/agents",
+        ),
+    )
+
+    assert "не определена" in text
+    assert "/projects bind" in text
+    assert "Baseline internal team template" in text
+    assert "Текущая assembled team" not in text
+
+
+def test_agents_handler_owner_dm_multi_project_does_not_auto_select(tmp_path):
+    db = StateDB(tmp_path / "agents-owner-multi.db")
+    registry = ProjectRegistry(db)
+    alpha_repo = _git_repo(tmp_path, "agents-alpha")
+    beta_repo = _git_repo(tmp_path, "agents-beta")
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    handler = make_agents_handler(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+
+    text = handler(
+        parse_command("/agents"),
+        IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=1,
+            text="/agents",
+        ),
+    )
+
+    assert "не определена" in text
+    assert "explicit project chat" in text
+    assert "не выбирает runtime-проект" in text
+    assert "Baseline internal team template" in text
+
+
+def test_agents_command_does_not_change_bound_project_routing(tmp_path):
+    db = StateDB(tmp_path / "agents-routing-bound.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "agents-routing-bound-repo")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            chat_binding=_chat_binding(chat_id=-100123450902),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    task_calls = []
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: task_calls.append(
+            (text, msg.project_id, msg.project_context_source)
+        )
+        or BridgeReply(persona_role="architect_agent", body="task ok"),
+        project_context_resolver=resolver,
+    )
+
+    agents_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450902,
+            user_id=999,
+            message_id=1,
+            text="/agents",
+        )
+    )
+    task_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450902,
+            user_id=999,
+            message_id=2,
+            text="bound task after agents",
+        )
+    )
+
+    assert agents_result.handled is True
+    assert agents_result.reason == "command"
+    assert "Текущая assembled team" in captured[0].text
+    assert task_result.handled is True
+    assert task_result.reason == "task"
+    assert task_calls == [
+        ("bound task after agents", "alpha_project", "bound_chat")
+    ]
+
+
+def test_agents_command_does_not_create_hidden_state_for_unresolved_context(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "agents-routing-unresolved.db")
+    registry = ProjectRegistry(db)
+    alpha_repo = _git_repo(tmp_path, "agents-routing-unresolved-alpha")
+    beta_repo = _git_repo(tmp_path, "agents-routing-unresolved-beta")
+    registry.register_project(_project_snapshot(alpha_repo))
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    task_calls = []
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: task_calls.append((text, msg.project_id))
+        or BridgeReply(persona_role="architect_agent", body="task ok"),
+        project_context_resolver=resolver,
+    )
+
+    agents_result = bridge.handle(
+        IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=1,
+            text="/agents",
+        )
+    )
+    blocked_result = bridge.handle(
+        IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=2,
+            text="owner dm task after agents",
+        )
+    )
+
+    assert agents_result.handled is True
+    assert agents_result.reason == "command"
+    assert "не выбирает runtime-проект" in captured[0].text
+    assert blocked_result.handled is False
+    assert blocked_result.reason == "project_context_missing"
+    assert task_calls == []
 
 
 def test_log_handler_no_history_returns_stub():

@@ -53,6 +53,10 @@ from core.bot_commands import (
 )
 from core.confirmation_gate import DEFAULT_COST_THRESHOLD_USD, ConfirmationGate
 from core.coordinator_role import COORDINATOR_ROLE
+from core.coordinator_team_assembly import (
+    CoordinatorTeamAssemblyContext,
+    CoordinatorTeamAssemblyService,
+)
 from core.dispatcher_agents import build_dispatcher_agent_registry_factory
 from core.llm_dispatcher import LLMDispatcher
 from core.model_tier import default_registry as default_tier_registry
@@ -1208,43 +1212,91 @@ def make_budget_handler(state: _BudgetState) -> CommandHandler:
     return _handle
 
 
-def make_agents_handler(personas: PersonaRegistry) -> CommandHandler:
-    """Lists all agents with thematic emojis and clean visual hierarchy.
-
-    Performance metrics will be added in 7b once Observability streams here.
-    """
+def make_agents_handler(
+    personas: PersonaRegistry,
+    project_context_resolver: ProjectContextResolver | None = None,
+    coordinator_team_assembly_service: CoordinatorTeamAssemblyService | None = None,
+) -> CommandHandler:
     if not isinstance(personas, PersonaRegistry):
         raise ValueError("invalid_personas")
+    if (
+        project_context_resolver is not None
+        and not isinstance(project_context_resolver, ProjectContextResolver)
+    ):
+        raise ValueError("invalid_project_context_resolver")
+    if coordinator_team_assembly_service is None:
+        coordinator_team_assembly_service = CoordinatorTeamAssemblyService()
+    elif not isinstance(
+        coordinator_team_assembly_service,
+        CoordinatorTeamAssemblyService,
+    ):
+        raise ValueError("invalid_coordinator_team_assembly_service")
 
-    def _handle(_cmd: BotCommand, _ctx: Any) -> str:
-        lines: list[str] = ["👥 Состав команды", ""]
-        # Stable order: control-plane coordinator first, then FSM flow.
-        flow_order = (
-            COORDINATOR_ROLE,
-            "planning_agent",
-            "pm_agent",
-            "architect_agent",
-            "writer_agent",
-            "reviewer_agent",
-            "tester_agent",
-            "qa_agent",
-            "fixer_agent",
+    def _format_template(prefix: str) -> str:
+        return (
+            "👥 /agents\n"
+            "\n"
+            f"{prefix}\n"
+            "\n"
+            f"{coordinator_team_assembly_service.format_baseline_team_template(personas)}"
         )
-        for role in flow_order:
-            if role not in personas:
-                continue
-            p = personas.for_role(role)
-            icon = p.emoji or "•"
-            traits = " · ".join(p.voice_traits[:2])
-            lines.append(f"{icon} {p.qualified_name} · {p.seniority}")
-            lines.append(f"   {traits}")
-            lines.append("")
-        # Trim trailing blank line
-        while lines and lines[-1] == "":
-            lines.pop()
-        lines.append("")
-        lines.append("📈 Метрики p50/p95/error rate — в Модуле 7b.")
-        return "\n".join(lines)
+
+    def _handle(cmd: BotCommand, ctx: Any) -> str:
+        if (
+            project_context_resolver is None
+            or not isinstance(ctx, IncomingMessage)
+        ):
+            return _format_template(
+                "Текущий project context здесь недоступен, поэтому ниже "
+                "показан baseline internal team template."
+            )
+
+        resolution = project_context_resolver.resolve_telegram_context(
+            chat_id=ctx.chat_id,
+            user_id=ctx.user_id,
+        )
+        if resolution.source in {"bound_chat", "owner_dm_single_project"}:
+            snapshot = resolution.snapshot
+            if snapshot is None:
+                raise ValueError("resolved_agents_context_missing_snapshot")
+            try:
+                assembly = coordinator_team_assembly_service.assemble_team(
+                    CoordinatorTeamAssemblyContext(
+                        snapshot=snapshot,
+                        owner_task_text=cmd.raw_text,
+                        context_source=resolution.source,
+                        personas=personas,
+                    )
+                )
+            except ValueError as exc:
+                return (
+                    "👥 /agents\n"
+                    "\n"
+                    "⚠️ Не удалось собрать текущую команду проекта.\n"
+                    f"\n{exc!s}"
+                )
+            return (
+                "👥 /agents\n"
+                "\n"
+                f"{coordinator_team_assembly_service.format_team_assembly(assembly)}"
+            )
+
+        if resolution.reason == "project_chat_not_bound":
+            return _format_template(
+                "Текущая команда проекта не определена: этот чат ещё не "
+                "привязан к проекту. Используй "
+                "`/projects bind <project_id_or_slug>`, чтобы получить "
+                "explicit project chat."
+            )
+        if resolution.reason == "owner_dm_requires_explicit_project_chat":
+            return _format_template(
+                "Текущая команда проекта не определена: при нескольких "
+                "проектах нужен explicit project chat. `/agents` здесь не "
+                "выбирает runtime-проект сам."
+            )
+        return _format_template(
+            "Текущая команда проекта не определена для этого контекста."
+        )
 
     return _handle
 
@@ -1869,6 +1921,7 @@ def build_command_registry(
     project_migration_service: ProjectMigrationService | None = None,
     project_context_resolver: ProjectContextResolver | None = None,
     project_summary_service: ProjectSummaryService | None = None,
+    coordinator_team_assembly_service: CoordinatorTeamAssemblyService | None = None,
 ) -> CommandRegistry:
     """Build a CommandRegistry pre-populated with all 10 default handlers.
 
@@ -1937,6 +1990,14 @@ def build_command_registry(
         )
     ):
         raise ValueError("invalid_project_summary_service")
+    if (
+        coordinator_team_assembly_service is not None
+        and not isinstance(
+            coordinator_team_assembly_service,
+            CoordinatorTeamAssemblyService,
+        )
+    ):
+        raise ValueError("invalid_coordinator_team_assembly_service")
 
     reg = CommandRegistry()
     budget_state = _BudgetState(
@@ -1962,7 +2023,14 @@ def build_command_registry(
         make_switch_handler(project_context_resolver),
     )
     reg.register(CommandName.BUDGET, make_budget_handler(budget_state))
-    reg.register(CommandName.AGENTS, make_agents_handler(personas))
+    reg.register(
+        CommandName.AGENTS,
+        make_agents_handler(
+            personas,
+            project_context_resolver=project_context_resolver,
+            coordinator_team_assembly_service=coordinator_team_assembly_service,
+        ),
+    )
     reg.register(CommandName.TIER, make_tier_handler(tier_store))
     reg.register(CommandName.LOG, make_log_handler(task_history))
     reg.register(CommandName.STOP, make_stop_handler(runner))

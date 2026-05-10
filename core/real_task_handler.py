@@ -73,8 +73,11 @@ from core.coordinator_owner_escalation import (
     CoordinatorOwnerEscalationService,
 )
 from core.coordinator_role import COORDINATOR_ROLE
+from core.coordinator_team_assembly import (
+    CoordinatorTeamAssemblyContext,
+    CoordinatorTeamAssemblyService,
+)
 from core.coordinator_team_proposal import (
-    CoordinatorTeamProposalContext,
     CoordinatorTeamProposalService,
 )
 from core.fsm import State
@@ -279,6 +282,7 @@ def make_real_task_handler(
             f"{type(onboarding_service).__name__}"
         )
     personas = default_registry()
+    team_assembly_service = CoordinatorTeamAssemblyService()
     owner_escalation_service = CoordinatorOwnerEscalationService()
     team_proposal_service = CoordinatorTeamProposalService()
 
@@ -545,18 +549,21 @@ def make_real_task_handler(
     ) -> dict[str, str] | None:
         if onboarding_context is None:
             return None
-        team_proposal_context = CoordinatorTeamProposalContext(
+        team_assembly_context = CoordinatorTeamAssemblyContext(
             snapshot=onboarding_context.snapshot,
             owner_task_text=onboarding_context.owner_task_text,
             context_source=onboarding_context.context_source,
             personas=personas,
+        )
+        team_assembly = team_assembly_service.assemble_team(
+            team_assembly_context
         )
         return {
             "project_brief": onboarding_service.build_project_brief_artifact(
                 onboarding_context
             ),
             "team_proposal": team_proposal_service.build_team_proposal_artifact(
-                team_proposal_context
+                team_assembly
             ),
         }
 

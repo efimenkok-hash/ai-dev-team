@@ -54,7 +54,7 @@ COMMAND_DESCRIPTIONS: dict[CommandName, str] = {
     ),
     CommandName.SWITCH: "статус project context (/switch [project])",
     CommandName.BUDGET: "бюджет (/budget [сумма])",
-    CommandName.AGENTS: "состав и перфоманс команды",
+    CommandName.AGENTS: "текущая команда проекта или baseline template",
     CommandName.TIER: "тариф моделей (/tier [set <имя>|reset])",
     CommandName.LOG: "лог последней задачи",
     CommandName.STOP: "остановить текущую задачу",
