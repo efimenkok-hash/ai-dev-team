@@ -746,6 +746,7 @@ def test_bound_project_chat_seeds_coordinator_artifacts_before_planning(
     def _planning_agent(task_prompt: str) -> str:
         seen["brief"] = memory.get_artifact(task_id, "project_brief")
         seen["proposal"] = memory.get_artifact(task_id, "team_proposal")
+        seen["escalation"] = memory.get_artifact(task_id, "owner_escalation")
         seen["prompt"] = task_prompt
         return '{"plan": "ok"}'
 
@@ -820,6 +821,7 @@ def test_owner_dm_single_project_seeds_coordinator_artifacts_before_planning(
     def _planning_agent(task_prompt: str) -> str:
         seen["brief"] = memory.get_artifact(task_id, "project_brief")
         seen["proposal"] = memory.get_artifact(task_id, "team_proposal")
+        seen["escalation"] = memory.get_artifact(task_id, "owner_escalation")
         seen["prompt"] = task_prompt
         return '{"plan": "ok"}'
 
@@ -884,6 +886,7 @@ def test_legacy_non_context_path_does_not_seed_fake_coordinator_artifacts(
     def _planning_agent(task_prompt: str) -> str:
         seen["brief"] = memory.get_artifact(task_id, "project_brief")
         seen["proposal"] = memory.get_artifact(task_id, "team_proposal")
+        seen["escalation"] = memory.get_artifact(task_id, "owner_escalation")
         seen["prompt"] = task_prompt
         return '{"plan": "ok"}'
 
@@ -910,9 +913,336 @@ def test_legacy_non_context_path_does_not_seed_fake_coordinator_artifacts(
 
     assert seen["brief"] is None
     assert seen["proposal"] is None
+    assert seen["escalation"] is None
     assert memory.get_artifact(task_id, "project_brief") is None
     assert memory.get_artifact(task_id, "team_proposal") is None
+    assert memory.get_artifact(task_id, "owner_escalation") is None
     assert seen["prompt"] == "Legacy build task."
+
+
+def test_project_aware_fail_path_seeds_owner_escalation_and_uses_reply(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send, captured = _make_progress_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="fail-escalation.db",
+    )
+    task_id = "task-fail-escalation-001"
+    memory = PipelineMemory()
+
+    def _reviewer_boom(*_args):
+        raise RuntimeError("kaboom")
+
+    def _agents(_tier):
+        agents = happy_agents(None)
+        agents["reviewer_agent"] = _reviewer_boom
+        return agents
+
+    with patch("core.project_runtime_router._build_sandbox", return_value=sandbox):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=_agents,
+            memory_factory=lambda: memory,
+            task_id_factory=lambda: task_id,
+        )
+        handler(
+            "Implement the release workflow.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Implement the release workflow.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        _wait_until_idle(runner)
+        _wait_for_count(captured, lambda c: any("Не получилось" in t for _, t in c))
+
+    escalation = memory.get_artifact(task_id, "owner_escalation")
+    assert escalation is not None
+    assert "escalation_type: system_failure" in escalation
+    assert "agent_exception:RuntimeError:kaboom" in escalation
+    assert "Alpha Project" in escalation
+    failure_messages = [text for _, text in captured if "Не получилось" in text]
+    assert failure_messages
+    assert any("внутренним pipeline/system сбоем" in text for text in failure_messages)
+    assert any("agent_exception:RuntimeError:kaboom" in text for text in failure_messages)
+
+
+def test_project_aware_blocked_path_seeds_owner_escalation(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send, captured = _make_progress_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="blocked-escalation.db",
+    )
+    task_id = "task-blocked-escalation-001"
+    memory = PipelineMemory()
+
+    def _writer_blocked(*_args):
+        return "BLOCKED: missing architecture"
+
+    def _agents(_tier):
+        agents = happy_agents(None)
+        agents["writer_agent"] = _writer_blocked
+        return agents
+
+    with patch("core.project_runtime_router._build_sandbox", return_value=sandbox):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=_agents,
+            memory_factory=lambda: memory,
+            task_id_factory=lambda: task_id,
+        )
+        handler(
+            "Implement the release workflow.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Implement the release workflow.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        _wait_until_idle(runner)
+        _wait_for_count(captured, lambda c: any("Не получилось" in t for _, t in c))
+
+    escalation = memory.get_artifact(task_id, "owner_escalation")
+    assert escalation is not None
+    assert "escalation_type: project_blocked" in escalation
+    assert "final_state: BLOCKED" in escalation
+    assert "writer_blocked:BLOCKED: missing architecture" in escalation
+    failure_messages = [text for _, text in captured if "Не получилось" in text]
+    assert failure_messages
+    assert any("заблокирована" in text for text in failure_messages)
+
+
+def test_project_aware_publish_failure_seeds_owner_escalation(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    from core.sandbox_workspace import SandboxError
+
+    tier_store.set_active(-100123, "PREMIUM")
+    send, captured = _make_progress_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="publish-escalation.db",
+    )
+    task_id = "task-publish-escalation-001"
+    memory = PipelineMemory()
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(
+            sandbox,
+            "commit_in_worktree",
+            side_effect=SandboxError("nothing_to_commit"),
+        ),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=happy_agents,
+            memory_factory=lambda: memory,
+            task_id_factory=lambda: task_id,
+        )
+        handler(
+            "Prepare the release branch.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Prepare the release branch.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        _wait_until_idle(runner)
+        _wait_for_count(captured, lambda c: any("Не получилось" in t for _, t in c))
+
+    escalation = memory.get_artifact(task_id, "owner_escalation")
+    assert escalation is not None
+    assert "escalation_type: publish_failure" in escalation
+    assert "commit_failed:SandboxError:nothing_to_commit" in escalation
+    failure_messages = [text for _, text in captured if "Не получилось" in text]
+    assert failure_messages
+    assert any("publish step" in text for text in failure_messages)
+
+
+def test_project_aware_success_path_does_not_seed_owner_escalation(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "PREMIUM")
+    send, _captured = _make_progress_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="success-no-escalation.db",
+    )
+    task_id = "task-success-no-escalation-001"
+    memory = PipelineMemory()
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="deadbeef12345678"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=happy_agents,
+            memory_factory=lambda: memory,
+            task_id_factory=lambda: task_id,
+        )
+        handler(
+            "Ship the notification command.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Ship the notification command.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        _wait_until_idle(runner)
+
+    assert memory.get_artifact(task_id, "owner_escalation") is None
+
+
+def test_project_aware_cancelled_path_does_not_seed_owner_escalation(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    import threading
+    from unittest.mock import patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send, captured = _make_progress_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="cancelled-no-escalation.db",
+    )
+    task_id = "task-cancelled-no-escalation-001"
+    memory = PipelineMemory()
+    agent_in_flight = threading.Event()
+    release_agent = threading.Event()
+
+    def _blocking_planning(*_args):
+        agent_in_flight.set()
+        release_agent.wait(timeout=5.0)
+        return '{"plan": "ok"}'
+
+    def _agents(_tier):
+        agents = happy_agents(_tier)
+        agents["planning_agent"] = _blocking_planning
+        return agents
+
+    with patch("core.project_runtime_router._build_sandbox", return_value=sandbox):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=_agents,
+            memory_factory=lambda: memory,
+            task_id_factory=lambda: task_id,
+        )
+        handler(
+            "Build the deployment checker.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Build the deployment checker.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        assert agent_in_flight.wait(timeout=5.0)
+        runner.cancel()
+        release_agent.set()
+        _wait_until_idle(runner)
+        _wait_for_count(captured, lambda c: any("Отменено" in t for _, t in c))
+
+    assert memory.get_artifact(task_id, "owner_escalation") is None
 
 
 def test_busy_message_keeps_original_owner_task_text_for_project_aware_tasks(

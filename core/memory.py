@@ -25,6 +25,7 @@ from core.fsm import State, can_transition
 VALID_ARTIFACT_KINDS: frozenset[str] = frozenset({
     "project_brief",
     "team_proposal",
+    "owner_escalation",
     "planning",
     "pm",
     "architect",

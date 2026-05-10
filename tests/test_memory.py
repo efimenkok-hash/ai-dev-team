@@ -60,6 +60,10 @@ def test_team_proposal_is_valid_artifact_kind():
     assert "team_proposal" in VALID_ARTIFACT_KINDS
 
 
+def test_owner_escalation_is_valid_artifact_kind():
+    assert "owner_escalation" in VALID_ARTIFACT_KINDS
+
+
 def test_set_and_get_project_brief_artifact():
     m = _seeded()
     m.set_artifact("T1", "project_brief", "Coordinator project brief")
@@ -70,6 +74,15 @@ def test_set_and_get_team_proposal_artifact():
     m = _seeded()
     m.set_artifact("T1", "team_proposal", "Coordinator team proposal")
     assert m.get_artifact("T1", "team_proposal") == "Coordinator team proposal"
+
+
+def test_set_and_get_owner_escalation_artifact():
+    m = _seeded()
+    m.set_artifact("T1", "owner_escalation", "Coordinator owner escalation")
+    assert (
+        m.get_artifact("T1", "owner_escalation")
+        == "Coordinator owner escalation"
+    )
 
 
 def test_project_brief_artifact_is_immutable():
@@ -84,6 +97,13 @@ def test_team_proposal_artifact_is_immutable():
     m.set_artifact("T1", "team_proposal", "first proposal")
     with pytest.raises(ValueError, match="artifact_already_set:team_proposal"):
         m.set_artifact("T1", "team_proposal", "second proposal")
+
+
+def test_owner_escalation_artifact_is_immutable():
+    m = _seeded()
+    m.set_artifact("T1", "owner_escalation", "first escalation")
+    with pytest.raises(ValueError, match="artifact_already_set:owner_escalation"):
+        m.set_artifact("T1", "owner_escalation", "second escalation")
 
 
 def test_all_artifact_kinds_round_trip():
@@ -290,6 +310,7 @@ def test_dump_task_round_trips_through_restore():
     src.new_task("T1", "raw text here")
     src.set_artifact("T1", "project_brief", "Coordinator brief")
     src.set_artifact("T1", "team_proposal", "Coordinator team")
+    src.set_artifact("T1", "owner_escalation", "Coordinator escalation")
     src.set_artifact("T1", "pm", '{"plan_id":"x"}')
     src.set_artifact("T1", "architect", '{"arch_id":"a"}')
     src.record_transition("T1", State.IDLE, State.PLANNING)
@@ -338,6 +359,20 @@ def test_restore_preserves_team_proposal_artifact():
     dst.restore_task(src.dump_task("T1"))
 
     assert dst.get_artifact("T1", "team_proposal") == "Coordinator team proposal"
+
+
+def test_restore_preserves_owner_escalation_artifact():
+    src = PipelineMemory()
+    src.new_task("T1", "raw task")
+    src.set_artifact("T1", "owner_escalation", "Coordinator owner escalation")
+
+    dst = PipelineMemory()
+    dst.restore_task(src.dump_task("T1"))
+
+    assert (
+        dst.get_artifact("T1", "owner_escalation")
+        == "Coordinator owner escalation"
+    )
 
 
 def test_dump_task_includes_schema_version():

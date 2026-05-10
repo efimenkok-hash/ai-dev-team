@@ -68,6 +68,10 @@ from core.coordinator_onboarding import (
     ProjectCaptainOnboardingContext,
     ProjectCaptainOnboardingService,
 )
+from core.coordinator_owner_escalation import (
+    CoordinatorOwnerEscalationContext,
+    CoordinatorOwnerEscalationService,
+)
 from core.coordinator_role import COORDINATOR_ROLE
 from core.coordinator_team_proposal import (
     CoordinatorTeamProposalContext,
@@ -275,6 +279,7 @@ def make_real_task_handler(
             f"{type(onboarding_service).__name__}"
         )
     personas = default_registry()
+    owner_escalation_service = CoordinatorOwnerEscalationService()
     team_proposal_service = CoordinatorTeamProposalService()
 
     available_tiers = ", ".join(tier_store.registry.list_names())
@@ -287,6 +292,7 @@ def make_real_task_handler(
         chat_id: int,
         task_id: str,
         owner_task_text: str,
+        onboarding_context: ProjectCaptainOnboardingContext | None,
         pipeline_task_prompt: str,
         initial_artifacts: dict[str, str] | None,
         tier_name: str,
@@ -468,6 +474,12 @@ def make_real_task_handler(
                             f"{(result.failure_reason or '')[:160]}"
                         ),
                     )
+                _attach_owner_escalation(
+                    summary=summary,
+                    onboarding_context=onboarding_context,
+                    memory=memory,
+                    task_id=task_id,
+                )
                 return summary
             finally:
                 if handle is not None:
@@ -547,6 +559,64 @@ def make_real_task_handler(
                 team_proposal_context
             ),
         }
+
+    def _fallback_owner_escalation_reply(
+        *,
+        onboarding_context: ProjectCaptainOnboardingContext,
+        final_state: str,
+    ) -> str:
+        return (
+            "Координатор: задача по проекту "
+            f"`{onboarding_context.snapshot.project.slug}` завершилась "
+            f"состоянием `{final_state}` и требует owner review причины "
+            "перед следующим запуском."
+        )
+
+    def _attach_owner_escalation(
+        *,
+        summary: dict,
+        onboarding_context: ProjectCaptainOnboardingContext | None,
+        memory: PipelineMemory,
+        task_id: str,
+    ) -> None:
+        if onboarding_context is None:
+            return
+        final_state = summary.get("final_state")
+        failure_reason = summary.get("failure_reason")
+        if final_state not in {"FAIL", "BLOCKED"}:
+            return
+        if not isinstance(failure_reason, str) or not failure_reason.strip():
+            return
+        try:
+            escalation_context = CoordinatorOwnerEscalationContext(
+                snapshot=onboarding_context.snapshot,
+                owner_task_text=onboarding_context.owner_task_text,
+                context_source=onboarding_context.context_source,
+                final_state=final_state,
+                failure_reason=failure_reason,
+            )
+            summary["owner_escalation_type"] = (
+                owner_escalation_service.classify_owner_escalation_type(
+                    escalation_context
+                )
+            )
+            summary["owner_escalation_reply"] = (
+                owner_escalation_service.build_owner_escalation_reply(
+                    escalation_context
+                )
+            )
+            artifact = owner_escalation_service.build_owner_escalation_artifact(
+                escalation_context
+            )
+        except Exception:
+            summary["owner_escalation_type"] = "system_failure"
+            summary["owner_escalation_reply"] = _fallback_owner_escalation_reply(
+                onboarding_context=onboarding_context,
+                final_state=final_state,
+            )
+            return
+        with contextlib.suppress(Exception):
+            memory.set_artifact(task_id, "owner_escalation", artifact)
 
     def _runtime_error_reply(reason_code: str) -> BridgeReply:
         return BridgeReply(
@@ -632,6 +702,7 @@ def make_real_task_handler(
                     ),
                 )
             else:
+                owner_escalation_reply = result.get("owner_escalation_reply")
                 _safe_send(
                     chat_id,
                     (
@@ -640,7 +711,12 @@ def make_real_task_handler(
                         f"  task-id `{handle.task_id}`\n"
                         f"  тариф   `{tier_name}`\n"
                         f"  state   `{final_state}`\n"
-                        f"  reason  `{result.get('failure_reason', '?')}`"
+                        + (
+                            f"\n{owner_escalation_reply}\n\n"
+                            if owner_escalation_reply
+                            else ""
+                        )
+                        + f"  reason  `{result.get('failure_reason', '?')}`"
                     ),
                 )
 
@@ -735,6 +811,7 @@ def make_real_task_handler(
             chat_id,
             task_id,
             text,
+            onboarding_context,
             pipeline_task_prompt,
             initial_artifacts,
             tier_name,
