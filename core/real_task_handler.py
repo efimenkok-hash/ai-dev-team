@@ -63,6 +63,10 @@ from core.background_runner import (
     RunnerBusyError,
     TaskHandle,
 )
+from core.coordinator_onboarding import (
+    ProjectCaptainOnboardingContext,
+    ProjectCaptainOnboardingService,
+)
 from core.coordinator_role import COORDINATOR_ROLE
 from core.fsm import State
 from core.memory import PipelineMemory
@@ -83,6 +87,7 @@ from core.progress_emitter import (
 )
 from core.project_runtime_router import (
     ProjectRuntimeRouter,
+    ResolvedProjectRuntime,
     describe_project_runtime_error,
 )
 from core.runtime_validator import RuntimeValidator, ValidationStrategy
@@ -205,6 +210,7 @@ def make_real_task_handler(
     memory_factory: Callable[[], PipelineMemory] = PipelineMemory,
     task_id_factory: Callable[[], str] = generate_task_id,
     task_history: TaskHistory | None = None,
+    onboarding_service: ProjectCaptainOnboardingService | None = None,
 ) -> TaskHandler:
     """Build a TaskHandler that runs the full agent pipeline asynchronously.
 
@@ -253,6 +259,16 @@ def make_real_task_handler(
         raise ValueError("task_id_factory_not_callable")
     if task_history is not None and not isinstance(task_history, TaskHistory):
         raise ValueError(f"invalid_task_history:{type(task_history).__name__}")
+    if onboarding_service is None:
+        onboarding_service = ProjectCaptainOnboardingService()
+    elif not isinstance(
+        onboarding_service,
+        ProjectCaptainOnboardingService,
+    ):
+        raise ValueError(
+            "invalid_onboarding_service:"
+            f"{type(onboarding_service).__name__}"
+        )
 
     available_tiers = ", ".join(tier_store.registry.list_names())
 
@@ -263,7 +279,8 @@ def make_real_task_handler(
     def _build_run_fn(
         chat_id: int,
         task_id: str,
-        text: str,
+        owner_task_text: str,
+        pipeline_task_prompt: str,
         tier_name: str,
         sandbox_workspace: SandboxWorkspace,
     ) -> Callable[[CancellationToken], dict]:
@@ -356,12 +373,19 @@ def make_real_task_handler(
                     validator=runtime_validator,
                 )
 
+                prompt_overhead = max(
+                    0,
+                    len(pipeline_task_prompt) - len(owner_task_text),
+                )
+
                 orch = Orchestrator(
                     memory=memory,
                     agents=wrapped,
                     observability=observability,
                     task_validators=(
-                        reject_long_task(config.max_task_chars),
+                        reject_long_task(
+                            config.max_task_chars + prompt_overhead
+                        ),
                         reject_injection_markers(),
                     ),
                     cost_estimator=cost_estimator,
@@ -369,7 +393,7 @@ def make_real_task_handler(
                     runtime_validator=runtime_hook,
                 )
 
-                result: RunResult = orch.run(task_id, text)
+                result: RunResult = orch.run(task_id, pipeline_task_prompt)
 
                 # /stop pressed while pipeline was running?  Orchestrator
                 # cannot be interrupted mid-flight (it runs all agents to
@@ -399,7 +423,7 @@ def make_real_task_handler(
                     try:
                         summary["commit_sha"] = sandbox_workspace.commit_in_worktree(
                             handle,
-                            message=f"AI Dev Team: {text[:60]}",
+                            message=f"AI Dev Team: {owner_task_text[:60]}",
                             author_name=config.author_name,
                             author_email=config.author_email,
                         )
@@ -442,18 +466,47 @@ def make_real_task_handler(
 
     def _resolve_runtime_for_message(
         msg: IncomingMessage,
-    ) -> tuple[SandboxWorkspace | None, str | None, str | None]:
+    ) -> tuple[
+        SandboxWorkspace | None,
+        str | None,
+        str | None,
+        ResolvedProjectRuntime | None,
+    ]:
         if runtime_router is None:
-            return (sandbox, None, None)
+            return (sandbox, None, None, None)
         try:
             resolved_runtime = runtime_router.resolve_message_runtime(msg)
         except ValueError as exc:
-            return (None, str(exc), None)
+            return (None, str(exc), None, None)
         return (
             resolved_runtime.sandbox,
             None,
             resolved_runtime.snapshot.project.project_id,
+            resolved_runtime,
         )
+
+    def _build_pipeline_task_prompt(
+        *,
+        owner_task_text: str,
+        msg: IncomingMessage,
+        resolved_runtime: ResolvedProjectRuntime | None,
+    ) -> str:
+        if resolved_runtime is None:
+            return owner_task_text
+        if msg.project_context_source not in {
+            "bound_chat",
+            "owner_dm_single_project",
+        }:
+            return owner_task_text
+        context = ProjectCaptainOnboardingContext(
+            snapshot=resolved_runtime.snapshot,
+            chat_provider="telegram",
+            chat_id=msg.chat_id,
+            user_id=msg.user_id,
+            context_source=msg.project_context_source,
+            owner_task_text=owner_task_text,
+        )
+        return onboarding_service.build_pipeline_task_prompt(context)
 
     def _runtime_error_reply(reason_code: str) -> BridgeReply:
         return BridgeReply(
@@ -590,12 +643,29 @@ def make_real_task_handler(
                 ),
             )
 
-        sandbox_workspace, runtime_error, project_id = _resolve_runtime_for_message(
-            msg
-        )
+        (
+            sandbox_workspace,
+            runtime_error,
+            project_id,
+            resolved_runtime,
+        ) = _resolve_runtime_for_message(msg)
         if runtime_error is not None or sandbox_workspace is None:
             return _runtime_error_reply(
                 runtime_error or "bootstrap_active_project_runtime_invalid"
+            )
+        try:
+            pipeline_task_prompt = _build_pipeline_task_prompt(
+                owner_task_text=text,
+                msg=msg,
+                resolved_runtime=resolved_runtime,
+            )
+        except ValueError as exc:
+            return BridgeReply(
+                persona_role=COORDINATOR_ROLE,
+                body=(
+                    "⚠️ Не удалось подготовить Coordinator onboarding "
+                    f"для pipeline: {str(exc)[:200]}"
+                ),
             )
 
         # 3. Generate task_id BEFORE submission so we can show it in the ack.
@@ -620,6 +690,7 @@ def make_real_task_handler(
             chat_id,
             task_id,
             text,
+            pipeline_task_prompt,
             tier_name,
             sandbox_workspace,
         )

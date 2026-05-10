@@ -435,6 +435,10 @@ def test_build_real_task_handler_works_for_multi_project_registry(tmp_path):
                 project_id="beta_project",
                 adapter_name="beta_adapter",
             ),
+            chat_binding=_chat_binding(
+                project_id="beta_project",
+                chat_id=-100123450199,
+            ),
         )
     )
     store = TierSessionStore(default_tier_registry())
@@ -475,6 +479,10 @@ def test_build_real_task_handler_routes_free_text_by_message_project_id(
                 beta_repo,
                 project_id="beta_project",
                 adapter_name="beta_adapter",
+            ),
+            chat_binding=_chat_binding(
+                project_id="beta_project",
+                chat_id=-100123450199,
             ),
         )
     )

@@ -19,6 +19,10 @@ from core.background_runner import BackgroundTaskRunner
 from core.model_tier import default_registry as default_tier_registry
 from core.observability import Observability
 from core.progress_emitter import ProgressEvent
+from core.project_models import Project, ProjectChatBinding, ProjectPolicy
+from core.project_registry import ProjectRegistry, ProjectSnapshot
+from core.project_runtime import ProjectRuntimeBinding
+from core.project_runtime_router import ProjectRuntimeRouter
 from core.real_task_handler import (
     RealTaskHandlerConfig,
     _format_event,
@@ -31,6 +35,7 @@ from core.sandbox_workspace import (
     _RunResult,
     _SubprocessRunner,
 )
+from core.state_db import StateDB
 from core.telegram_bridge import BridgeReply, IncomingMessage
 from core.tier_session import TierSessionStore
 
@@ -86,6 +91,96 @@ def _msg(chat_id: int = 100, text: str = "build me a thing") -> IncomingMessage:
         message_id=1,
         text=text,
     )
+
+
+def _project(**overrides) -> Project:
+    data = {
+        "project_id": "alpha_project",
+        "slug": "alpha-project",
+        "name": "Alpha Project",
+        "description": "Primary project.",
+        "owner_user_id": 101,
+        "status": "active",
+    }
+    data.update(overrides)
+    return Project(**data)
+
+
+def _policy(**overrides) -> ProjectPolicy:
+    data = {
+        "project_id": "alpha_project",
+        "allow_hiring": True,
+        "allow_agent_dm": False,
+        "require_owner_approval_for_hires": True,
+    }
+    data.update(overrides)
+    return ProjectPolicy(**data)
+
+
+def _chat_binding(**overrides) -> ProjectChatBinding:
+    data = {
+        "project_id": "alpha_project",
+        "chat_provider": "telegram",
+        "chat_id": -100123,
+    }
+    data.update(overrides)
+    return ProjectChatBinding(**data)
+
+
+def _runtime_binding(repo_path: Path, **overrides) -> ProjectRuntimeBinding:
+    data = {
+        "project_id": "alpha_project",
+        "adapter_name": "alpha_adapter",
+        "repo_path": repo_path,
+        "worktree_root": repo_path.parent / "project-worktrees",
+        "base_branch": "main",
+        "branch_prefix": "feature/",
+        "language": "python",
+        "rules": (),
+        "commands": (),
+        "forbidden_paths": (),
+        "forbidden_tokens": (),
+    }
+    data.update(overrides)
+    return ProjectRuntimeBinding(**data)
+
+
+def _project_snapshot(
+    repo_path: Path,
+    *,
+    chat_binding: ProjectChatBinding | None = None,
+    **overrides,
+) -> ProjectSnapshot:
+    data = {
+        "project": _project(),
+        "policy": _policy(),
+        "chat_binding": chat_binding,
+        "runtime_binding": _runtime_binding(repo_path),
+    }
+    data.update(overrides)
+    return ProjectSnapshot(**data)
+
+
+def _runtime_router_for_snapshot(
+    tmp_path: Path,
+    snapshot: ProjectSnapshot,
+    *,
+    db_name: str = "runtime-state.db",
+) -> ProjectRuntimeRouter:
+    db = StateDB(tmp_path / db_name)
+    registry = ProjectRegistry(db)
+    registry.register_project(snapshot)
+    return ProjectRuntimeRouter(registry, None)
+
+
+def _capturing_happy_agents(captured_prompts: list[str]):
+    def _planning_agent(task_prompt: str) -> str:
+        captured_prompts.append(task_prompt)
+        return '{"plan": "ok"}'
+
+    agents = happy_agents(None)
+    agents["planning_agent"] = _planning_agent
+    return lambda _tier: agents
 
 
 def _make_progress_capture():
@@ -488,6 +583,252 @@ def test_handle_returns_ack_when_submitted(runner, sandbox, tier_store):
     assert "task-id" in reply.body.lower()
     assert "STANDARD" in reply.body
     _wait_until_idle(runner)
+
+
+# ---------------------------------------------------------------------------
+# Project-aware coordinator onboarding
+# ---------------------------------------------------------------------------
+
+
+def test_bound_project_chat_pipeline_gets_enriched_onboarding_prompt(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send, _captured = _make_progress_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="bound-chat.db",
+    )
+    captured_prompts: list[str] = []
+    owner_task_text = "Build the deployment checker."
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=_capturing_happy_agents(captured_prompts),
+            task_id_factory=lambda: "task-bound-onboarding-001",
+        )
+        reply = handler(
+            owner_task_text,
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text=owner_task_text,
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        assert isinstance(reply, BridgeReply)
+        _wait_until_idle(runner)
+
+    assert captured_prompts, "planning_agent must receive a pipeline task prompt"
+    prompt = captured_prompts[0]
+    assert prompt != owner_task_text
+    assert "Coordinator role: project captain" in prompt
+    assert "project_id: alpha_project" in prompt
+    assert "slug: alpha-project" in prompt
+    assert "source: explicit project chat" in prompt
+    assert str(fake_repo.resolve()) in prompt
+    assert owner_task_text in prompt
+
+
+def test_owner_dm_single_project_pipeline_gets_enriched_onboarding_prompt(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(101, "STANDARD")
+    send, _captured = _make_progress_capture()
+    snapshot = _project_snapshot(fake_repo)
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="owner-dm.db",
+    )
+    captured_prompts: list[str] = []
+    owner_task_text = "Prepare the release branch."
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=_capturing_happy_agents(captured_prompts),
+            task_id_factory=lambda: "task-owner-dm-onboarding-001",
+        )
+        reply = handler(
+            owner_task_text,
+            IncomingMessage(
+                chat_id=101,
+                user_id=101,
+                message_id=1,
+                text=owner_task_text,
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="owner_dm_single_project",
+            ),
+        )
+        assert isinstance(reply, BridgeReply)
+        _wait_until_idle(runner)
+
+    assert captured_prompts, "planning_agent must receive a pipeline task prompt"
+    prompt = captured_prompts[0]
+    assert prompt != owner_task_text
+    assert "Coordinator role: project captain" in prompt
+    assert "source: owner DM fallback" in prompt
+    assert owner_task_text in prompt
+
+
+def test_busy_message_keeps_original_owner_task_text_for_project_aware_tasks(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    import threading
+    from unittest.mock import patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send, _captured = _make_progress_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="busy-project-aware.db",
+    )
+    block = threading.Event()
+
+    def slow_run(_token):
+        block.wait(timeout=5)
+        return "done"
+
+    runner.submit(
+        raw_task="Original owner task text",
+        run_fn=slow_run,
+        on_complete=lambda *_: None,
+    )
+    try:
+        with patch(
+            "core.project_runtime_router._build_sandbox",
+            return_value=sandbox,
+        ):
+            handler = make_real_task_handler(
+                runner=runner,
+                runtime_router=runtime_router,
+                tier_store=tier_store,
+                send_progress=send,
+            )
+            reply = handler(
+                "Second task text",
+                IncomingMessage(
+                    chat_id=-100123,
+                    user_id=777,
+                    message_id=1,
+                    text="Second task text",
+                    project_id="alpha_project",
+                    project_slug="alpha-project",
+                    project_context_source="bound_chat",
+                ),
+            )
+        assert isinstance(reply, BridgeReply)
+        assert "Original owner task text" in reply.body
+        assert "Coordinator project captain onboarding" not in reply.body
+    finally:
+        block.set()
+        _wait_until_idle(runner)
+
+
+def test_commit_message_keeps_original_owner_task_text_for_project_aware_tasks(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "PREMIUM")
+    send, _captured = _make_progress_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="project-aware-commit.db",
+    )
+    owner_task_text = "Ship the notification command."
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="feedface12345678") as mock_commit,
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=happy_agents,
+            task_id_factory=lambda: "task-project-aware-commit-001",
+        )
+        handler(
+            owner_task_text,
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text=owner_task_text,
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        _wait_until_idle(runner)
+
+    commit_message = mock_commit.call_args.kwargs["message"]
+    assert owner_task_text in commit_message
+    assert "Coordinator project captain onboarding" not in commit_message
 
 
 # ---------------------------------------------------------------------------
