@@ -13,6 +13,7 @@ from core.confirmation_gate import (
     ActionKind,
     ConfirmationGate,
 )
+from core.coordinator_role import COORDINATOR_ROLE
 from core.project_context import ProjectContextResolver
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
@@ -372,7 +373,9 @@ def test_bridge_reply_rejects_non_tuple_actions():
 
 def test_construction_happy_path():
     b = _make_bridge()
-    assert b.manager_persona.human_name == "Менеджер"
+    assert b.coordinator_role == COORDINATOR_ROLE
+    assert b.coordinator_persona.human_name == "Координатор"
+    assert b.manager_persona is b.coordinator_persona
 
 
 def test_construction_rejects_non_frozenset_owners():
@@ -416,13 +419,24 @@ def test_construction_rejects_non_callable_task_handler():
         )
 
 
-def test_construction_rejects_unknown_manager_role():
-    with pytest.raises(ValueError, match="unknown_manager_role"):
+def test_construction_rejects_unknown_coordinator_role():
+    with pytest.raises(ValueError, match="invalid_coordinator_role"):
         TelegramBridge(
             owner_chat_ids=frozenset({1}),
             send=CapturingSender(),
-            manager_role="ceo_agent",
+            coordinator_role="ceo_agent",
         )
+
+
+def test_construction_accepts_legacy_manager_role_alias():
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({1}),
+        send=CapturingSender(),
+        manager_role="pm_agent",
+    )
+
+    assert bridge.coordinator_role == COORDINATOR_ROLE
+    assert bridge.coordinator_persona.human_name == "Координатор"
 
 
 def test_construction_rejects_invalid_project_context_resolver():
@@ -893,7 +907,7 @@ def test_voice_failure_apologies_with_persona():
     result = bridge.handle(msg)
     assert result.handled is False
     assert len(sender.sent) == 1
-    assert "Менеджер:" in sender.sent[0].text
+    assert "Координатор:" in sender.sent[0].text
     assert "расшифровать" in sender.sent[0].text.lower()
 
 
@@ -950,8 +964,7 @@ def test_command_dispatched_via_registry():
     assert result.handled is True
     assert result.reason == "command"
     assert "Список команд" in sender.sent[0].text
-    # signed by manager
-    assert sender.sent[0].text.startswith("Менеджер:")
+    assert sender.sent[0].text.startswith("Координатор:")
 
 
 def test_command_without_registry_apologies():
@@ -1024,7 +1037,7 @@ def test_task_handler_returning_none_sends_generic_ack():
     )
     bridge.handle(_msg(text="сделай"))
     assert DEFAULT_GENERIC_ACK in sender.sent[0].text
-    assert sender.sent[0].text.startswith("Менеджер:")
+    assert sender.sent[0].text.startswith("Координатор:")
 
 
 def test_task_handler_returning_invalid_type_apologies():
@@ -1049,7 +1062,7 @@ def test_task_handler_exception_apologies():
     assert "invalid stuff" in sender.sent[0].text
 
 
-def test_task_unknown_persona_role_falls_back_to_manager():
+def test_task_unknown_persona_role_falls_back_to_coordinator():
     sender = CapturingSender()
     bridge = _make_bridge(
         sender=sender,
@@ -1058,9 +1071,9 @@ def test_task_unknown_persona_role_falls_back_to_manager():
     bridge.handle(_msg(text="сделай"))
     # persona_role is rejected at BridgeReply construction... wait, no, the
     # constructor only checks non-empty. Unknown roles are caught at signing
-    # time and fall back to manager with marker.
+    # time and fall back to coordinator with marker.
     assert "[неизвестная роль" in sender.sent[0].text
-    assert sender.sent[0].text.startswith("Менеджер:")
+    assert sender.sent[0].text.startswith("Координатор:")
 
 
 def test_task_without_handler_apologies():
@@ -1183,17 +1196,17 @@ def test_bridge_result_is_frozen():
 
 
 # ---------------------------------------------------------------------------
-# Manager persona signature on system replies
+# Coordinator persona signature on system replies
 # ---------------------------------------------------------------------------
 
 
-def test_command_reply_signed_by_manager():
+def test_command_reply_signed_by_coordinator():
     sender = CapturingSender()
     reg = CommandRegistry()
     reg.register(CommandName.HELP, lambda c, ctx: "/help: список")
     bridge = _make_bridge(sender=sender, commands=reg)
     bridge.handle(_msg(text="/help"))
-    assert sender.sent[0].text.startswith("Менеджер:")
+    assert sender.sent[0].text.startswith("Координатор:")
 
 
 def test_denial_message_not_signed():

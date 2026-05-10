@@ -23,9 +23,10 @@ def test_valid_seniorities_constant():
     assert len(VALID_SENIORITIES) == 4
 
 
-def test_default_personas_covers_all_eight_roles():
+def test_default_personas_covers_all_nine_roles():
     roles = {p.agent_role for p in DEFAULT_PERSONAS}
     expected = {
+        "coordinator_agent",
         "planning_agent",
         "pm_agent",
         "architect_agent",
@@ -45,6 +46,7 @@ def test_default_personas_have_unique_human_names():
 
 def test_default_personas_match_expected_callsigns():
     by_role = {p.agent_role: p for p in DEFAULT_PERSONAS}
+    assert by_role["coordinator_agent"].human_name == "Координатор"
     assert by_role["planning_agent"].human_name == "Планировщик"
     assert by_role["pm_agent"].human_name == "Менеджер"
     assert by_role["architect_agent"].human_name == "Архитектор"
@@ -459,14 +461,15 @@ def test_default_personas_qualified_names_unique():
 # ---------------------------------------------------------------------------
 
 
-def test_default_registry_has_eight_personas():
+def test_default_registry_has_nine_personas():
     reg = default_registry()
-    assert len(reg) == 8
+    assert len(reg) == 9
 
 
 def test_default_registry_covers_all_required_roles():
     reg = default_registry()
     for role in (
+        "coordinator_agent",
         "planning_agent",
         "pm_agent",
         "architect_agent",
@@ -521,7 +524,7 @@ def test_registry_list_roles_returns_sorted():
     reg = default_registry()
     roles = reg.list_roles()
     assert roles == sorted(roles)
-    assert len(roles) == 8
+    assert len(roles) == 9
 
 
 def test_registry_with_subset_personas():
@@ -550,6 +553,6 @@ def test_registry_with_replaced_default():
     )
     others = tuple(p for p in DEFAULT_PERSONAS if p.agent_role != "writer_agent")
     reg = PersonaRegistry((*others, custom_writer))
-    assert len(reg) == 8
+    assert len(reg) == 9
     assert reg.for_role("writer_agent").human_name == "Custom"
     assert reg.for_role("architect_agent").human_name == "Архитектор"

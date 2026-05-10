@@ -1,9 +1,10 @@
 """
 core/agent_personas.py
 
-Step 14a of the ULTRA spec: bot persona layer. Each functional agent role
-(planning_agent, pm_agent, architect_agent, ...) is wrapped in an
-AgentPersona that gives it a human-readable identity for Telegram replies.
+Step 14a of the ULTRA spec: bot persona layer. Each functional agent or
+system control-plane role (coordinator_agent, planning_agent, pm_agent,
+architect_agent, ...) is wrapped in an AgentPersona that gives it a
+human-readable identity for Telegram replies.
 
 This is the "voice" layer — pure data + small string helpers. It does not
 talk to LLMs, does not touch network, does not cross any FSM boundaries.
@@ -12,7 +13,7 @@ of structured JSON.
 
 CONTRACTS:
 1. AgentPersona is frozen; mutation raises FrozenInstanceError.
-2. agent_role MUST be one of REQUIRED_AGENTS from core.orchestrator.
+2. agent_role MUST be one of the known system roles for this product.
    Unknown roles -> ValueError at construction time (fail fast).
 3. human_name must be non-empty Russian/Latin text (chars: word, Cyrillic,
    space, hyphen, apostrophe), 1-40 chars after strip.
@@ -23,7 +24,7 @@ CONTRACTS:
 7. format_signature(body) -> "<Title> <Name>: <body>".
    Idempotent: if body already starts with the signature, returns body
    unchanged (protects against double-signing in chains).
-8. DEFAULT_PERSONAS provides a complete set for all 8 REQUIRED_AGENTS.
+8. DEFAULT_PERSONAS provides a complete set for all default system personas.
 9. PersonaRegistry maps agent_role -> AgentPersona, with .for_role()
    raising KeyError for unknown roles, .all() returning sorted tuple.
 """
@@ -34,10 +35,11 @@ from dataclasses import dataclass
 
 VALID_SENIORITIES = ("junior", "middle", "senior", "lead")
 
-# Agent roles that the orchestrator requires. Keep in sync with
-# core.orchestrator.REQUIRED_AGENTS — duplicated here to avoid an
-# import cycle (orchestrator does not need to know about personas).
+# Agent roles and system personas that may appear in owner-facing chat.
+# The orchestrator worker set is a subset of these roles; coordinator is a
+# control-plane persona and does not participate in the FSM worker chain.
 _KNOWN_ROLES = frozenset({
+    "coordinator_agent",
     "planning_agent",
     "pm_agent",
     "architect_agent",
@@ -154,6 +156,14 @@ class AgentPersona:
 # the user sees in chat ("Архитектор: предлагаю стек") is unambiguous and
 # self-explanatory; no separate codename layer.
 DEFAULT_PERSONAS: tuple[AgentPersona, ...] = (
+    AgentPersona(
+        agent_role="coordinator_agent",
+        human_name="Координатор",
+        title="Координатор",
+        seniority="lead",
+        voice_traits=("собранный", "держит контекст", "координирует действия"),
+        emoji="🎯",
+    ),
     AgentPersona(
         agent_role="planning_agent",
         human_name="Планировщик",

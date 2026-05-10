@@ -18,7 +18,7 @@ CONTRACTS:
    (deferred to Module 7b). They return either real data (e.g. /help,
    /agents) or a clear "будет в 7b" placeholder so users see what's
    wired and what's coming.
-4. make_simple_task_handler returns a BridgeReply ack from the Менеджер;
+4. make_simple_task_handler returns a BridgeReply ack from the Координатор;
    this is the MVP behaviour when the full pipeline is not configured.
 5. parse_owner_chat_ids accepts comma-separated env value, strips spaces,
    rejects non-int/empty/negative, returns frozenset[int].
@@ -52,6 +52,7 @@ from core.bot_commands import (
     parse_budget_amount,
 )
 from core.confirmation_gate import DEFAULT_COST_THRESHOLD_USD, ConfirmationGate
+from core.coordinator_role import COORDINATOR_ROLE
 from core.dispatcher_agents import build_dispatcher_agent_registry_factory
 from core.llm_dispatcher import LLMDispatcher
 from core.model_tier import default_registry as default_tier_registry
@@ -1217,9 +1218,9 @@ def make_agents_handler(personas: PersonaRegistry) -> CommandHandler:
 
     def _handle(_cmd: BotCommand, _ctx: Any) -> str:
         lines: list[str] = ["👥 Состав команды", ""]
-        # Stable order matching the FSM pipeline flow:
-        # Planner → PM → Architect → Programmer → Reviewer → Tester → QA → Fixer
+        # Stable order: control-plane coordinator first, then FSM flow.
         flow_order = (
+            COORDINATOR_ROLE,
             "planning_agent",
             "pm_agent",
             "architect_agent",
@@ -2094,7 +2095,7 @@ def make_simple_task_handler(
     def _handle(text: str, _msg: IncomingMessage) -> BridgeReply:
         excerpt = text if len(text) <= 200 else text[:200] + " …[обрезано]"
         return BridgeReply(
-            persona_role="pm_agent",
+            persona_role=COORDINATOR_ROLE,
             body=(
                 f"⚠️ Реальный pipeline сейчас недоступен — задачу не могу "
                 f"выполнить.\n"

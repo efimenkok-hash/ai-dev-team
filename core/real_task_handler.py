@@ -63,6 +63,7 @@ from core.background_runner import (
     RunnerBusyError,
     TaskHandle,
 )
+from core.coordinator_role import COORDINATOR_ROLE
 from core.fsm import State
 from core.memory import PipelineMemory
 from core.model_tier import TierConfig
@@ -456,7 +457,7 @@ def make_real_task_handler(
 
     def _runtime_error_reply(reason_code: str) -> BridgeReply:
         return BridgeReply(
-            persona_role="pm_agent",
+            persona_role=COORDINATOR_ROLE,
             body=(
                 "⚠️ Не удалось определить runtime проекта для этой задачи.\n"
                 "\n"
@@ -555,7 +556,7 @@ def make_real_task_handler(
     def _handle(text: str, msg: IncomingMessage) -> BridgeReply | None:
         if not isinstance(msg, IncomingMessage):
             return BridgeReply(
-                persona_role="pm_agent",
+                persona_role=COORDINATOR_ROLE,
                 body="Внутренняя ошибка моста: неизвестный формат сообщения.",
             )
         chat_id = msg.chat_id
@@ -564,7 +565,7 @@ def make_real_task_handler(
         tier_name = tier_store.active_tier_name(chat_id)
         if tier_name is None:
             return BridgeReply(
-                persona_role="pm_agent",
+                persona_role=COORDINATOR_ROLE,
                 body=(
                     f"💼 Сначала выбери тариф моделей.\n"
                     f"\n"
@@ -580,7 +581,7 @@ def make_real_task_handler(
             tier_store.registry.get(tier_name)
         except KeyError:
             return BridgeReply(
-                persona_role="pm_agent",
+                persona_role=COORDINATOR_ROLE,
                 body=(
                     f"⚠️ Сохранённый тариф «{tier_name}» больше не доступен.\n"
                     f"\n"
@@ -602,7 +603,7 @@ def make_real_task_handler(
             task_id = task_id_factory()
         except Exception as exc:
             return BridgeReply(
-                persona_role="pm_agent",
+                persona_role=COORDINATOR_ROLE,
                 body=(
                     f"⚠️ Не удалось сгенерировать task_id: "
                     f"{type(exc).__name__}: {str(exc)[:120]}"
@@ -610,7 +611,7 @@ def make_real_task_handler(
             )
         if not isinstance(task_id, str) or not _TASK_ID_RE.match(task_id):
             return BridgeReply(
-                persona_role="pm_agent",
+                persona_role=COORDINATOR_ROLE,
                 body=f"⚠️ Невалидный task_id: `{task_id!r}`",
             )
 
@@ -636,7 +637,7 @@ def make_real_task_handler(
             if len(current_excerpt) > 120:
                 current_excerpt = current_excerpt[:120] + " …"
             return BridgeReply(
-                persona_role="pm_agent",
+                persona_role=COORDINATOR_ROLE,
                 body=(
                     f"⏳ Сейчас уже работаю.\n"
                     f"\n"
@@ -648,7 +649,7 @@ def make_real_task_handler(
             )
         except Exception as exc:
             return BridgeReply(
-                persona_role="pm_agent",
+                persona_role=COORDINATOR_ROLE,
                 body=(
                     f"⚠️ Не удалось запустить задачу: "
                     f"{type(exc).__name__}: {str(exc)[:200]}"
@@ -658,7 +659,7 @@ def make_real_task_handler(
         # 5. Immediate ack.
         excerpt = text if len(text) <= 120 else text[:120] + " …"
         return BridgeReply(
-            persona_role="pm_agent",
+            persona_role=COORDINATOR_ROLE,
             body=(
                 f"🚀 Принял в работу\n"
                 f"\n"

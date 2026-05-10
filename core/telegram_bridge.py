@@ -28,12 +28,12 @@ CONTRACTS:
 4. Modality precedence inside one IncomingMessage: text > voice > photo.
    Multi-modal messages fall through in that order.
 5. Voice/photo failure (Whisper/Vision exception) is reported as an
-   apology from the Менеджер persona, NOT propagated to task_handler.
+   apology from the Coordinator persona, NOT propagated to task_handler.
 6. Slash commands are parsed via core.bot_commands.parse_command;
    dispatch errors (unknown handler, handler exception, non-string return)
    become apology replies.
 7. Free-text messages call task_handler(text, msg). If task_handler returns
-   None, bridge sends a generic "принял задачу" ack from Менеджер.
+   None, bridge sends a generic "принял задачу" ack from Coordinator.
    If it returns BridgeReply, bridge formats and sends. If it raises,
    bridge sends an apology with class+message of the exception.
 8. In project-aware mode, free-text plus project-sensitive commands
@@ -54,6 +54,11 @@ from core.bot_commands import CommandRegistry, parse_command
 from core.confirmation_gate import (
     BatchDecision,
     ConfirmationGate,
+)
+from core.coordinator_role import (
+    COORDINATOR_ROLE,
+    normalize_coordinator_role,
+    resolve_coordinator_persona,
 )
 from core.observability import Observability
 from core.project_context import VALID_PROJECT_CONTEXT_SOURCES, ProjectContextResolver
@@ -233,7 +238,8 @@ class TelegramBridge:
         commands: CommandRegistry | None = None,
         task_handler: TaskHandler | None = None,
         observability: Observability | None = None,
-        manager_role: str = "pm_agent",
+        coordinator_role: str = COORDINATOR_ROLE,
+        manager_role: str | None = None,
         denial_message: str = DEFAULT_DENIAL_MESSAGE,
         project_context_resolver: ProjectContextResolver | None = None,
     ) -> None:
@@ -248,8 +254,6 @@ class TelegramBridge:
             raise ValueError("send_not_callable")
         if task_handler is not None and not callable(task_handler):
             raise ValueError("task_handler_not_callable")
-        if not isinstance(manager_role, str) or not manager_role.strip():
-            raise ValueError("empty_manager_role")
         if not isinstance(denial_message, str) or not denial_message.strip():
             raise ValueError("empty_denial_message")
         if (
@@ -257,6 +261,9 @@ class TelegramBridge:
             and not isinstance(project_context_resolver, ProjectContextResolver)
         ):
             raise ValueError("invalid_project_context_resolver")
+        normalized_coordinator_role = normalize_coordinator_role(
+            manager_role if manager_role is not None else coordinator_role
+        )
 
         self._owner_chat_ids = owner_chat_ids
         self._send = send
@@ -269,17 +276,22 @@ class TelegramBridge:
         self._obs = observability
         self._denial_message = denial_message
         self._project_context_resolver = project_context_resolver
+        self._coordinator_role = normalized_coordinator_role
 
-        # Eagerly resolve the manager persona so we fail at construction
-        # if manager_role is unknown.
-        try:
-            self._manager = self._personas.for_role(manager_role)
-        except KeyError as exc:
-            raise ValueError(f"unknown_manager_role:{manager_role}") from exc
+        self._coordinator = resolve_coordinator_persona(self._personas)
+
+    @property
+    def coordinator_role(self) -> str:
+        return self._coordinator_role
+
+    @property
+    def coordinator_persona(self) -> AgentPersona:
+        return self._coordinator
 
     @property
     def manager_persona(self) -> AgentPersona:
-        return self._manager
+        """Legacy compatibility alias for older call sites/tests."""
+        return self._coordinator
 
     def handle(self, msg: IncomingMessage) -> BridgeResult:
         """Process one incoming message. Total — never raises."""
@@ -290,7 +302,7 @@ class TelegramBridge:
                 self._safe_send(
                     OutgoingMessage(
                         chat_id=getattr(msg, "chat_id", 0) or 0,
-                        text=self._sign_manager(
+                        text=self._sign_coordinator(
                             "Невалидный формат входящего сообщения."
                         ),
                     ),
@@ -323,7 +335,7 @@ class TelegramBridge:
                     self._safe_send(
                         OutgoingMessage(
                             chat_id=resolved_msg.chat_id,
-                            text=self._sign_manager(
+                            text=self._sign_coordinator(
                                 self._format_missing_project_context_message(
                                     resolved_msg.project_context_reason
                                 )
@@ -377,7 +389,7 @@ class TelegramBridge:
                 self._safe_send(
                     OutgoingMessage(
                         chat_id=getattr(msg, "chat_id", 0) or 0,
-                        text=self._sign_manager(
+                        text=self._sign_coordinator(
                             f"Внутренняя ошибка моста: "
                             f"{type(exc).__name__}: {str(exc)[:200]}"
                         ),
@@ -475,7 +487,7 @@ class TelegramBridge:
                 self._safe_send(
                     OutgoingMessage(
                         chat_id=msg.chat_id,
-                        text=self._sign_manager(
+                        text=self._sign_coordinator(
                             "🎙 Голосовые сообщения сейчас не обрабатываются.\n"
                             "\n"
                             "Подключите OPENAI_API_KEY в .env, чтобы включить."
@@ -495,7 +507,7 @@ class TelegramBridge:
                 self._safe_send(
                     OutgoingMessage(
                         chat_id=msg.chat_id,
-                        text=self._sign_manager(
+                        text=self._sign_coordinator(
                             f"🎙 Не удалось расшифровать голосовое\n"
                             f"\n"
                             f"Причина: {_short_err(exc)}\n"
@@ -513,7 +525,7 @@ class TelegramBridge:
                 self._safe_send(
                     OutgoingMessage(
                         chat_id=msg.chat_id,
-                        text=self._sign_manager(
+                        text=self._sign_coordinator(
                             "🖼 Изображения сейчас не обрабатываются.\n"
                             "\n"
                             "Подключите OPENROUTER_API_KEY в .env, чтобы включить."
@@ -531,7 +543,7 @@ class TelegramBridge:
                 self._safe_send(
                     OutgoingMessage(
                         chat_id=msg.chat_id,
-                        text=self._sign_manager(
+                        text=self._sign_coordinator(
                             f"🖼 Не удалось распознать изображение\n"
                             f"\n"
                             f"Причина: {_short_err(exc)}\n"
@@ -557,7 +569,7 @@ class TelegramBridge:
             self._safe_send(
                 OutgoingMessage(
                     chat_id=msg.chat_id,
-                    text=self._sign_manager(
+                    text=self._sign_coordinator(
                         "Команды сейчас не зарегистрированы."
                     ),
                 ),
@@ -570,7 +582,7 @@ class TelegramBridge:
             self._safe_send(
                 OutgoingMessage(
                     chat_id=msg.chat_id,
-                    text=self._sign_manager(
+                    text=self._sign_coordinator(
                         f"Команда /{cmd.name.value} не имеет хендлера."
                     ),
                 ),
@@ -581,7 +593,7 @@ class TelegramBridge:
             self._safe_send(
                 OutgoingMessage(
                     chat_id=msg.chat_id,
-                    text=self._sign_manager(
+                    text=self._sign_coordinator(
                         f"Ошибка при выполнении /{cmd.name.value}: "
                         f"{_short_err(exc)}"
                     ),
@@ -592,7 +604,7 @@ class TelegramBridge:
         self._safe_send(
             OutgoingMessage(
                 chat_id=msg.chat_id,
-                text=self._sign_manager(reply_text),
+                text=self._sign_coordinator(reply_text),
             ),
             ctx,
         )
@@ -607,7 +619,7 @@ class TelegramBridge:
             self._safe_send(
                 OutgoingMessage(
                     chat_id=msg.chat_id,
-                    text=self._sign_manager(
+                    text=self._sign_coordinator(
                         "Задачи сейчас не обрабатываются: "
                         "task_handler не подключён."
                     ),
@@ -621,7 +633,7 @@ class TelegramBridge:
             self._safe_send(
                 OutgoingMessage(
                     chat_id=msg.chat_id,
-                    text=self._sign_manager(
+                    text=self._sign_coordinator(
                         f"Не удалось обработать задачу: {_short_err(exc)}"
                     ),
                 ),
@@ -633,7 +645,7 @@ class TelegramBridge:
             self._safe_send(
                 OutgoingMessage(
                     chat_id=msg.chat_id,
-                    text=self._sign_manager(DEFAULT_GENERIC_ACK),
+                    text=self._sign_coordinator(DEFAULT_GENERIC_ACK),
                 ),
                 ctx,
             )
@@ -642,7 +654,7 @@ class TelegramBridge:
             self._safe_send(
                 OutgoingMessage(
                     chat_id=msg.chat_id,
-                    text=self._sign_manager(
+                    text=self._sign_coordinator(
                         "Внутренняя ошибка: некорректный формат ответа от обработчика."
                     ),
                 ),
@@ -685,15 +697,15 @@ class TelegramBridge:
         lines.append("Ответьте «да» / «нет».")
         return "\n".join(lines)
 
-    def _sign_manager(self, body: str) -> str:
-        return self._manager.format_signature(body)
+    def _sign_coordinator(self, body: str) -> str:
+        return self._coordinator.format_signature(body)
 
     def _sign_with_role(self, role: str, body: str) -> str:
         try:
             persona = self._personas.for_role(role)
         except KeyError:
-            # Fall back to manager if the role is unknown.
-            return self._sign_manager(
+            # Fall back to the control-plane Coordinator if the role is unknown.
+            return self._sign_coordinator(
                 f"[неизвестная роль '{role}'] {body}"
             )
         return persona.format_signature(body)

@@ -36,6 +36,7 @@ from core.bot_runner import (
     parse_owner_chat_ids,
 )
 from core.confirmation_gate import ConfirmationGate
+from core.coordinator_role import COORDINATOR_ROLE
 from core.model_tier import default_registry as default_tier_registry
 from core.project_chat_binding_service import ProjectChatBindingService
 from core.project_context import ProjectContextResolver
@@ -2309,7 +2310,7 @@ def test_simple_task_handler_returns_bridge_reply():
     msg = IncomingMessage(chat_id=1, user_id=1, message_id=1, text="hello")
     reply = handler("hello", msg)
     assert isinstance(reply, BridgeReply)
-    assert reply.persona_role == "pm_agent"
+    assert reply.persona_role == COORDINATOR_ROLE
     assert "hello" in reply.body
 
 
@@ -2364,6 +2365,7 @@ def test_build_bridge_from_env_minimal(tmp_path):
     send, _ = _captured_send()
     bridge = build_bridge_from_env(env, send_callable=send)
     assert isinstance(bridge, TelegramBridge)
+    assert bridge.coordinator_role == COORDINATOR_ROLE
 
 
 def test_build_bridge_from_env_with_all_keys(tmp_path):
@@ -2404,7 +2406,7 @@ def test_build_bridge_from_env_end_to_end_flow(tmp_path):
     msg = IncomingMessage(chat_id=777, user_id=777, message_id=1, text="привет")
     bridge.handle(msg)
     assert len(captured) == 1
-    assert captured[0].text.startswith("Менеджер:")
+    assert captured[0].text.startswith("Координатор:")
     assert "привет" in captured[0].text
 
 
@@ -2416,7 +2418,7 @@ def test_build_bridge_from_env_command_flow(tmp_path):
     bridge.handle(msg)
     assert len(captured) == 1
     assert "/help" in captured[0].text
-    assert captured[0].text.startswith("Менеджер:")
+    assert captured[0].text.startswith("Координатор:")
 
 
 def test_build_bridge_from_env_intruder_denied(tmp_path):
