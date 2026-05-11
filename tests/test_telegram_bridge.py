@@ -24,6 +24,7 @@ from core.telegram_bridge import (
     BridgeReply,
     BridgeResult,
     IncomingMessage,
+    OutgoingEnvelope,
     OutgoingMessage,
     TelegramBridge,
 )
@@ -41,9 +42,9 @@ INTRUDER_CHAT_ID = 22222
 class CapturingSender:
     def __init__(self, raise_exc=None):
         self.raise_exc = raise_exc
-        self.sent: list[OutgoingMessage] = []
+        self.sent: list[OutgoingEnvelope] = []
 
-    def __call__(self, msg: OutgoingMessage) -> None:
+    def __call__(self, msg: OutgoingEnvelope) -> None:
         if self.raise_exc is not None:
             raise self.raise_exc
         self.sent.append(msg)
@@ -108,7 +109,7 @@ def _make_bridge(
 ):
     return TelegramBridge(
         owner_chat_ids=frozenset({OWNER_CHAT_ID}),
-        send=sender or CapturingSender(),
+        send_envelope=sender or CapturingSender(),
         whisper=whisper,
         vision=vision,
         personas=default_registry(),
@@ -340,6 +341,48 @@ def test_outgoing_message_is_frozen():
 
 
 # ---------------------------------------------------------------------------
+# OutgoingEnvelope validation
+# ---------------------------------------------------------------------------
+
+
+def test_outgoing_envelope_happy_path():
+    envelope = OutgoingEnvelope(
+        message=OutgoingMessage(chat_id=1, text="hello"),
+        sender_role="architect_agent",
+    )
+
+    assert envelope.text == "hello"
+    assert envelope.sender_role == "architect_agent"
+
+
+def test_outgoing_envelope_rejects_invalid_message():
+    with pytest.raises(
+        ValueError,
+        match="invalid_outgoing_message_type:str",
+    ):
+        OutgoingEnvelope(  # type: ignore[arg-type]
+            message="not-a-message",
+            sender_role=COORDINATOR_ROLE,
+        )
+
+
+def test_outgoing_envelope_rejects_empty_sender_role():
+    with pytest.raises(ValueError, match="empty_sender_role"):
+        OutgoingEnvelope(
+            message=OutgoingMessage(chat_id=1, text="hello"),
+            sender_role="  ",
+        )
+
+
+def test_outgoing_envelope_rejects_malformed_sender_role():
+    with pytest.raises(ValueError, match="invalid_sender_role:bad-role"):
+        OutgoingEnvelope(
+            message=OutgoingMessage(chat_id=1, text="hello"),
+            sender_role="bad-role",
+        )
+
+
+# ---------------------------------------------------------------------------
 # BridgeReply validation
 # ---------------------------------------------------------------------------
 
@@ -461,6 +504,7 @@ def test_handle_rejects_intruder_chat():
     assert result.handled is False
     assert result.reason == "not_owner"
     assert len(sender.sent) == 1
+    assert sender.sent[0].sender_role == COORDINATOR_ROLE
     assert DEFAULT_DENIAL_MESSAGE in sender.sent[0].text
 
 
@@ -1026,6 +1070,7 @@ def test_task_reply_signed_by_persona():
         ),
     )
     bridge.handle(_msg(text="новый сервис"))
+    assert sender.sent[0].sender_role == "architect_agent"
     assert sender.sent[0].text == "Архитектор: предлагаю стек"
 
 
@@ -1036,6 +1081,7 @@ def test_task_handler_returning_none_sends_generic_ack():
         task_handler=lambda t, m: None,
     )
     bridge.handle(_msg(text="сделай"))
+    assert sender.sent[0].sender_role == COORDINATOR_ROLE
     assert DEFAULT_GENERIC_ACK in sender.sent[0].text
     assert sender.sent[0].text.startswith("Координатор:")
 
@@ -1072,6 +1118,7 @@ def test_task_unknown_persona_role_falls_back_to_coordinator():
     # persona_role is rejected at BridgeReply construction... wait, no, the
     # constructor only checks non-empty. Unknown roles are caught at signing
     # time and fall back to coordinator with marker.
+    assert sender.sent[0].sender_role == "ghost_agent"
     assert "[неизвестная роль" in sender.sent[0].text
     assert sender.sent[0].text.startswith("Координатор:")
 
@@ -1206,6 +1253,7 @@ def test_command_reply_signed_by_coordinator():
     reg.register(CommandName.HELP, lambda c, ctx: "/help: список")
     bridge = _make_bridge(sender=sender, commands=reg)
     bridge.handle(_msg(text="/help"))
+    assert sender.sent[0].sender_role == COORDINATOR_ROLE
     assert sender.sent[0].text.startswith("Координатор:")
 
 

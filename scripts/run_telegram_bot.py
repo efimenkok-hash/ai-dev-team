@@ -60,7 +60,16 @@ from core.bot_runner import (  # noqa: E402
 from core.coordinator_role import COORDINATOR_ROLE  # noqa: E402
 from core.multi_bot_bridge import MultiBotBridge  # noqa: E402
 from core.multi_bot_runtime import BotIdentity  # noqa: E402
-from core.telegram_bridge import IncomingMessage, OutgoingMessage  # noqa: E402
+from core.multi_bot_sender import (  # noqa: E402
+    MultiBotOutboundSender,
+    PerRoleOutboundSender,
+    RoleBoundSender,
+)
+from core.telegram_bridge import (  # noqa: E402
+    IncomingMessage,
+    OutgoingEnvelope,
+    OutgoingMessage,
+)
 
 logger = logging.getLogger("ai_dev_team.bot")
 
@@ -87,6 +96,7 @@ class RunningBotApplication:
 class RunningMultiBotRuntime:
     bridge: MultiBotBridge
     applications_by_role: Mapping[str, RunningBotApplication]
+    outbound_sender: MultiBotOutboundSender
     primary_role: str
 
     def __post_init__(self) -> None:
@@ -94,6 +104,11 @@ class RunningMultiBotRuntime:
             raise ValueError(
                 "invalid_multi_bot_bridge_type:"
                 f"{type(self.bridge).__name__}"
+            )
+        if not isinstance(self.outbound_sender, MultiBotOutboundSender):
+            raise ValueError(
+                "invalid_multi_bot_outbound_sender_type:"
+                f"{type(self.outbound_sender).__name__}"
             )
         if not isinstance(self.applications_by_role, Mapping):
             raise ValueError(
@@ -173,6 +188,21 @@ def _build_send_callable(application, loop):
         future.result(timeout=30)
 
     return _send
+
+
+def _build_send_envelope_callable(send_callable):
+    if not callable(send_callable):
+        raise ValueError("send_callable_not_callable")
+
+    def _send_envelope(envelope: OutgoingEnvelope) -> None:
+        if not isinstance(envelope, OutgoingEnvelope):
+            raise ValueError(
+                "invalid_outgoing_envelope_type:"
+                f"{type(envelope).__name__}"
+            )
+        send_callable(envelope.message)
+
+    return _send_envelope
 
 
 def _load_ptb_runtime():
@@ -402,6 +432,22 @@ def _build_running_multi_bot_runtime(
     if bridge is None:
         raise RuntimeError("multi_bot_bridge_build_failed")
 
+    outbound_sender = MultiBotOutboundSender(
+        PerRoleOutboundSender(
+            primary_role=COORDINATOR_ROLE,
+            senders_by_role={
+                role: RoleBoundSender(
+                    identity=running_app.identity,
+                    send_envelope=_build_send_envelope_callable(
+                        running_app.send_callable
+                    ),
+                )
+                for role, running_app in applications_by_role.items()
+            },
+        )
+    )
+    bridge.primary_bridge.set_send_envelope(outbound_sender.send)
+
     message_filter = (
         resolved_ptb_runtime.filters.TEXT
         | resolved_ptb_runtime.filters.VOICE
@@ -419,6 +465,7 @@ def _build_running_multi_bot_runtime(
     return RunningMultiBotRuntime(
         bridge=bridge,
         applications_by_role=applications_by_role,
+        outbound_sender=outbound_sender,
         primary_role=COORDINATOR_ROLE,
     )
 

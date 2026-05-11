@@ -29,7 +29,13 @@ from core.multi_bot_runtime import (  # noqa: E402
     MultiBotRuntimeSpec,
     PerRoleBotMap,
 )
+from core.multi_bot_sender import (  # noqa: E402
+    MultiBotOutboundSender,
+    PerRoleOutboundSender,
+    RoleBoundSender,
+)
 from core.telegram_bridge import (  # noqa: E402
+    BridgeReply,
     BridgeResult,
     IncomingMessage,
     TelegramBridge,
@@ -108,6 +114,52 @@ def _multi_bridge() -> MultiBotBridge:
         send=_send,
         personas=default_registry(),
         task_handler=lambda _text, _msg: None,
+    )
+    return MultiBotBridge(
+        runtime_spec=runtime_spec,
+        primary_bridge=primary_bridge,
+    )
+
+
+def _outbound_sender_for_bridge(bridge: MultiBotBridge) -> MultiBotOutboundSender:
+    return MultiBotOutboundSender(
+        PerRoleOutboundSender(
+            primary_role=COORDINATOR_ROLE,
+            senders_by_role={
+                role: RoleBoundSender(
+                    identity=bridge.resolve_identity(role),
+                    send_envelope=lambda _envelope: None,
+                )
+                for role in bridge.enabled_roles()
+            },
+        )
+    )
+
+
+def _multi_bridge_with_task_handler(task_handler) -> MultiBotBridge:
+    coordinator = _identity(
+        token_env_key="TELEGRAM_BOT_TOKEN",
+        token="123:coord",
+    )
+    writer = _identity(
+        "writer_agent",
+        token_env_key="TELEGRAM_WRITER_BOT_TOKEN",
+        token="456:writer",
+    )
+    runtime_spec = MultiBotRuntimeSpec(
+        primary_bot=coordinator,
+        role_map=_role_map(coordinator, writer),
+        source="telegram_agent_tokens",
+    )
+
+    def _send(_out) -> None:
+        return None
+
+    primary_bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=_send,
+        personas=default_registry(),
+        task_handler=task_handler,
     )
     return MultiBotBridge(
         runtime_spec=runtime_spec,
@@ -260,6 +312,7 @@ def test_running_multi_bot_runtime_happy_path():
             "writer_agent": writer,
             COORDINATOR_ROLE: coordinator,
         },
+        outbound_sender=_outbound_sender_for_bridge(bridge),
         primary_role=COORDINATOR_ROLE,
     )
 
@@ -284,6 +337,7 @@ def test_running_multi_bot_runtime_rejects_missing_role():
         script.RunningMultiBotRuntime(
             bridge=bridge,
             applications_by_role={COORDINATOR_ROLE: coordinator},
+            outbound_sender=_outbound_sender_for_bridge(bridge),
             primary_role=COORDINATOR_ROLE,
         )
 
@@ -306,6 +360,7 @@ def test_running_multi_bot_runtime_rejects_role_identity_mismatch():
                 COORDINATOR_ROLE: coordinator,
                 "writer_agent": coordinator,
             },
+            outbound_sender=_outbound_sender_for_bridge(bridge),
             primary_role=COORDINATOR_ROLE,
         )
 
@@ -688,8 +743,225 @@ def test_build_running_multi_bot_runtime_builds_application_per_enabled_role(tmp
         COORDINATOR_ROLE,
         "writer_agent",
     )
+    assert runtime.outbound_sender.enabled_roles() == (
+        COORDINATOR_ROLE,
+        "writer_agent",
+    )
     assert len(runtime.applications_by_role[COORDINATOR_ROLE].application.handlers) == 1
     assert len(runtime.applications_by_role["writer_agent"].application.handlers) == 1
+
+
+def test_multi_bot_runtime_routes_coordinator_reply_through_coordinator_sender(
+    tmp_path,
+):
+    runtime_bridge = _multi_bridge_with_task_handler(
+        lambda _text, _msg: BridgeReply(
+            persona_role=COORDINATOR_ROLE,
+            body="контрольный ответ",
+        )
+    )
+    with patch(
+        "scripts.run_telegram_bot.build_multi_bot_bridge_from_env",
+        return_value=runtime_bridge,
+    ):
+        runtime = script._build_running_multi_bot_runtime(
+            {
+                "TELEGRAM_OWNER_CHAT_ID": "777",
+                "STATE_DB_PATH": str(tmp_path / "state.db"),
+                "TELEGRAM_AGENT_TOKENS": (
+                    "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                    "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+                ),
+                "TELEGRAM_BOT_TOKEN": "123:coord",
+                "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
+            },
+            _ImmediateLoop(),
+            ptb_runtime=_FakePTBRuntime(lambda token: _FakeApplication(token)),
+        )
+
+    assert runtime is not None
+    coordinator_app = runtime.applications_by_role[COORDINATOR_ROLE].application
+    writer_app = runtime.applications_by_role["writer_agent"].application
+    fake_future = MagicMock()
+    fake_future.result.return_value = None
+
+    with patch(
+        "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+        side_effect=_close_coro_and_return(fake_future),
+    ):
+        result = runtime.bridge.primary_bridge.handle(
+            IncomingMessage(
+                chat_id=777,
+                user_id=777,
+                message_id=1,
+                text="сделай задачу",
+            )
+        )
+
+    assert result.handled is True
+    coordinator_app.bot.send_message.assert_called_once()
+    writer_app.bot.send_message.assert_not_called()
+    assert "Координатор:" in coordinator_app.bot.send_message.call_args.kwargs["text"]
+
+
+def test_multi_bot_runtime_routes_writer_reply_through_writer_sender(tmp_path):
+    runtime_bridge = _multi_bridge_with_task_handler(
+        lambda _text, _msg: BridgeReply(
+            persona_role="writer_agent",
+            body="черновик готов",
+        )
+    )
+    with patch(
+        "scripts.run_telegram_bot.build_multi_bot_bridge_from_env",
+        return_value=runtime_bridge,
+    ):
+        runtime = script._build_running_multi_bot_runtime(
+            {
+                "TELEGRAM_OWNER_CHAT_ID": "777",
+                "STATE_DB_PATH": str(tmp_path / "state.db"),
+                "TELEGRAM_AGENT_TOKENS": (
+                    "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                    "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+                ),
+                "TELEGRAM_BOT_TOKEN": "123:coord",
+                "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
+            },
+            _ImmediateLoop(),
+            ptb_runtime=_FakePTBRuntime(lambda token: _FakeApplication(token)),
+        )
+
+    assert runtime is not None
+    coordinator_app = runtime.applications_by_role[COORDINATOR_ROLE].application
+    writer_app = runtime.applications_by_role["writer_agent"].application
+    fake_future = MagicMock()
+    fake_future.result.return_value = None
+
+    with patch(
+        "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+        side_effect=_close_coro_and_return(fake_future),
+    ):
+        result = runtime.bridge.primary_bridge.handle(
+            IncomingMessage(
+                chat_id=777,
+                user_id=777,
+                message_id=2,
+                text="сделай текст",
+            )
+        )
+
+    assert result.handled is True
+    writer_app.bot.send_message.assert_called_once()
+    coordinator_app.bot.send_message.assert_not_called()
+    sent_text = writer_app.bot.send_message.call_args.kwargs["text"]
+    assert sent_text.startswith("Программист:")
+    assert "черновик готов" in sent_text
+
+
+def test_multi_bot_runtime_unknown_role_falls_back_to_coordinator_sender(tmp_path):
+    runtime_bridge = _multi_bridge_with_task_handler(
+        lambda _text, _msg: BridgeReply(
+            persona_role="ghost_agent",
+            body="неизвестная роль ответила",
+        )
+    )
+    with patch(
+        "scripts.run_telegram_bot.build_multi_bot_bridge_from_env",
+        return_value=runtime_bridge,
+    ):
+        runtime = script._build_running_multi_bot_runtime(
+            {
+                "TELEGRAM_OWNER_CHAT_ID": "777",
+                "STATE_DB_PATH": str(tmp_path / "state.db"),
+                "TELEGRAM_AGENT_TOKENS": (
+                    "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                    "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+                ),
+                "TELEGRAM_BOT_TOKEN": "123:coord",
+                "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
+            },
+            _ImmediateLoop(),
+            ptb_runtime=_FakePTBRuntime(lambda token: _FakeApplication(token)),
+        )
+
+    assert runtime is not None
+    coordinator_app = runtime.applications_by_role[COORDINATOR_ROLE].application
+    writer_app = runtime.applications_by_role["writer_agent"].application
+    fake_future = MagicMock()
+    fake_future.result.return_value = None
+
+    with patch(
+        "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+        side_effect=_close_coro_and_return(fake_future),
+    ):
+        result = runtime.bridge.primary_bridge.handle(
+            IncomingMessage(
+                chat_id=777,
+                user_id=777,
+                message_id=3,
+                text="что-то странное",
+            )
+        )
+
+    assert result.handled is True
+    coordinator_app.bot.send_message.assert_called_once()
+    writer_app.bot.send_message.assert_not_called()
+    sent_text = coordinator_app.bot.send_message.call_args.kwargs["text"]
+    assert "Координатор:" in sent_text
+    assert "[неизвестная роль 'ghost_agent']" in sent_text
+
+
+def test_build_running_multi_bot_runtime_keeps_progress_sender_on_coordinator(
+    tmp_path,
+):
+    captured: dict[str, object] = {}
+
+    def _fake_build_multi_bot_bridge(
+        _env,
+        *,
+        send_callable,
+        send_progress_callable=None,
+    ):
+        captured["send_progress_callable"] = send_progress_callable
+        captured["send_callable"] = send_callable
+        return _multi_bridge()
+
+    with patch(
+        "scripts.run_telegram_bot.build_multi_bot_bridge_from_env",
+        side_effect=_fake_build_multi_bot_bridge,
+    ):
+        runtime = script._build_running_multi_bot_runtime(
+            {
+                "TELEGRAM_OWNER_CHAT_ID": "777",
+                "STATE_DB_PATH": str(tmp_path / "state.db"),
+                "TELEGRAM_AGENT_TOKENS": (
+                    "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                    "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+                ),
+                "TELEGRAM_BOT_TOKEN": "123:coord",
+                "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
+            },
+            _ImmediateLoop(),
+            ptb_runtime=_FakePTBRuntime(lambda token: _FakeApplication(token)),
+        )
+
+    assert runtime is not None
+    assert callable(captured["send_progress_callable"])
+    coordinator_app = runtime.applications_by_role[COORDINATOR_ROLE].application
+    writer_app = runtime.applications_by_role["writer_agent"].application
+    fake_future = MagicMock()
+    fake_future.result.return_value = None
+
+    with patch(
+        "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+        side_effect=_close_coro_and_return(fake_future),
+    ):
+        captured["send_progress_callable"](777, "progress update")
+
+    coordinator_app.bot.send_message.assert_called_once_with(
+        chat_id=777,
+        text="progress update",
+    )
+    writer_app.bot.send_message.assert_not_called()
 
 
 def test_multi_bot_handler_routes_coordinator_inbound_through_multi_bot_bridge(tmp_path):

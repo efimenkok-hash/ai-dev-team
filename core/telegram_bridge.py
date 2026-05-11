@@ -4,7 +4,7 @@ core/telegram_bridge.py
 Step 14a: glue layer between Telegram and the orchestrator. Pure logic —
 no python-telegram-bot dependency in this module. Real Telegram I/O lives
 in scripts/run_telegram_bot.py which converts PTB updates into the abstract
-IncomingMessage / SendMessage interfaces this module consumes.
+IncomingMessage / OutgoingEnvelope transport seam this module consumes.
 
 The bridge orchestrates:
   - whitelist enforcement (only owner_chat_ids can drive the bot)
@@ -39,8 +39,9 @@ CONTRACTS:
 8. In project-aware mode, free-text plus project-sensitive commands
    (`/push`, `/pr`) are blocked before handler execution when project context
    cannot be resolved.
-9. send() callable is invoked exactly once per outbound reply. Bridge
-   never batches or reorders.
+9. The outbound transport callable is invoked exactly once per outbound
+   reply. Bridge never batches or reorders, and it preserves sender_role
+   inside OutgoingEnvelope for the transport boundary.
 """
 
 import contextlib
@@ -72,6 +73,7 @@ DEFAULT_DENIAL_MESSAGE = (
 )
 DEFAULT_GENERIC_ACK = "👋 Принял задачу. Сейчас разберём."
 _PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_ROLE_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PROJECT_CONTEXT_BLOCKED_COMMANDS = frozenset({"push", "pr"})
 
 
@@ -185,6 +187,44 @@ class OutgoingMessage:
 
 
 @dataclass(frozen=True)
+class OutgoingEnvelope:
+    message: OutgoingMessage
+    sender_role: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.message, OutgoingMessage):
+            raise ValueError(
+                "invalid_outgoing_message_type:"
+                f"{type(self.message).__name__}"
+            )
+        if not isinstance(self.sender_role, str):
+            raise ValueError(
+                "invalid_sender_role_type:"
+                f"{type(self.sender_role).__name__}"
+            )
+        normalized_role = self.sender_role.strip().lower()
+        if not normalized_role:
+            raise ValueError("empty_sender_role")
+        if not normalized_role.isascii():
+            raise ValueError(f"non_ascii_sender_role:{normalized_role}")
+        if not _ROLE_ID_RE.fullmatch(normalized_role):
+            raise ValueError(f"invalid_sender_role:{normalized_role}")
+        object.__setattr__(self, "sender_role", normalized_role)
+
+    @property
+    def chat_id(self) -> int:
+        return self.message.chat_id
+
+    @property
+    def text(self) -> str:
+        return self.message.text
+
+    @property
+    def reply_to_message_id(self) -> int | None:
+        return self.message.reply_to_message_id
+
+
+@dataclass(frozen=True)
 class BridgeReply:
     """What task_handler returns. Bridge formats it into OutgoingMessage."""
 
@@ -214,6 +254,7 @@ class BridgeResult:
 
 # Type aliases for injected dependencies.
 SendMessage = Callable[[OutgoingMessage], None]
+SendEnvelope = Callable[[OutgoingEnvelope], None]
 TaskHandler = Callable[[str, IncomingMessage], "BridgeReply | None"]
 
 
@@ -230,7 +271,8 @@ class TelegramBridge:
         self,
         *,
         owner_chat_ids: frozenset[int],
-        send: SendMessage,
+        send: SendMessage | None = None,
+        send_envelope: SendEnvelope | None = None,
         whisper: WhisperClient | None = None,
         vision: VisionClient | None = None,
         personas: PersonaRegistry | None = None,
@@ -250,7 +292,11 @@ class TelegramBridge:
         for cid in owner_chat_ids:
             if not isinstance(cid, int) or isinstance(cid, bool):
                 raise ValueError(f"invalid_owner_chat_id:{cid!r}")
-        if not callable(send):
+        if send is not None and not callable(send):
+            raise ValueError("send_not_callable")
+        if send_envelope is not None and not callable(send_envelope):
+            raise ValueError("send_envelope_not_callable")
+        if send is None and send_envelope is None:
             raise ValueError("send_not_callable")
         if task_handler is not None and not callable(task_handler):
             raise ValueError("task_handler_not_callable")
@@ -267,6 +313,11 @@ class TelegramBridge:
 
         self._owner_chat_ids = owner_chat_ids
         self._send = send
+        self._send_envelope = (
+            send_envelope
+            if send_envelope is not None
+            else self._adapt_legacy_send(send)
+        )
         self._whisper = whisper
         self._vision = vision
         self._personas = personas if personas is not None else default_registry()
@@ -292,6 +343,11 @@ class TelegramBridge:
     def manager_persona(self) -> AgentPersona:
         """Legacy compatibility alias for older call sites/tests."""
         return self._coordinator
+
+    def set_send_envelope(self, send_envelope: SendEnvelope) -> None:
+        if not callable(send_envelope):
+            raise ValueError("send_envelope_not_callable")
+        self._send_envelope = send_envelope
 
     def handle(self, msg: IncomingMessage) -> BridgeResult:
         """Process one incoming message. Total — never raises."""
@@ -673,6 +729,7 @@ class TelegramBridge:
                         text=self._sign_with_role(reply.persona_role, ask_text),
                     ),
                     ctx,
+                    sender_role=reply.persona_role,
                 )
                 return
 
@@ -683,6 +740,7 @@ class TelegramBridge:
                 text=self._sign_with_role(reply.persona_role, reply.body),
             ),
             ctx,
+            sender_role=reply.persona_role,
         )
 
     def _format_ask_message(
@@ -714,13 +772,25 @@ class TelegramBridge:
         self,
         out: OutgoingMessage,
         ctx: _BridgeContext,
+        *,
+        sender_role: str = COORDINATOR_ROLE,
     ) -> None:
         """Calls send() once. Suppresses transport errors so handle() stays total."""
+        envelope = OutgoingEnvelope(message=out, sender_role=sender_role)
         try:
-            self._send(out)
+            self._send_envelope(envelope)
             ctx.sent_count += 1
         except Exception as exc:
             ctx.notes.append(f"send_failed:{type(exc).__name__}:{exc}")
+
+    def _adapt_legacy_send(self, send: SendMessage | None) -> SendEnvelope:
+        if send is None or not callable(send):
+            raise ValueError("send_not_callable")
+
+        def _send_envelope(envelope: OutgoingEnvelope) -> None:
+            send(envelope.message)
+
+        return _send_envelope
 
 
 def _short_err(exc: Any, limit: int = 200) -> str:
