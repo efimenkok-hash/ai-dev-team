@@ -112,6 +112,7 @@ Project runtime resolution for the full pipeline:
 Optional:
 
 - `OPENAI_API_KEY` - enables Whisper voice transcription.
+- `TELEGRAM_AGENT_TOKENS` - optional role-to-env-key mapping for the future multi-bot runtime contract. Format: `coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN`. The values inside this string are env-var names, not raw Telegram tokens. At the current step this is only a typed config/runtime model; the real multi-bot Telegram bridge is not launched yet.
 - `REPO_PATH` - legacy bootstrap/fallback for single-project compatibility. It is no longer the sole source of runtime selection once projects with runtime bindings already exist in `StateDB`.
 - `WORKTREE_ROOT` - optional legacy bootstrap override for the worktree root.
 - `STATE_DB_PATH` - SQLite path for tier sessions, task history, budget state, and the project registry/runtime bindings.

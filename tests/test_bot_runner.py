@@ -17,6 +17,7 @@ from core.bot_runner import (
     build_command_registry,
     build_confirmation_gate,
     build_dispatcher_from_env,
+    build_multi_bot_runtime_spec_from_env,
     build_real_task_handler_from_env,
     build_vision_client,
     build_whisper_client,
@@ -310,6 +311,39 @@ def test_build_dispatcher_from_env_strips_whitespace():
     from core.llm_dispatcher import LLMDispatcher
     d = build_dispatcher_from_env({"OPENROUTER_API_KEY": "  sk-or-padded  "})
     assert isinstance(d, LLMDispatcher)
+
+
+# ---------------------------------------------------------------------------
+# build_multi_bot_runtime_spec_from_env
+# ---------------------------------------------------------------------------
+
+
+def test_build_multi_bot_runtime_spec_from_env_helper_available():
+    spec = build_multi_bot_runtime_spec_from_env(
+        {"TELEGRAM_BOT_TOKEN": "123:legacy"}
+    )
+    assert spec is not None
+    assert spec.source == "single_token_legacy"
+    assert spec.primary_bot.agent_role == COORDINATOR_ROLE
+
+
+def test_build_multi_bot_runtime_spec_from_env_supports_multi_bot_contract():
+    spec = build_multi_bot_runtime_spec_from_env(
+        {
+            "TELEGRAM_AGENT_TOKENS": (
+                "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+            ),
+            "TELEGRAM_BOT_TOKEN": "123:coord",
+            "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
+        }
+    )
+    assert spec is not None
+    assert spec.source == "telegram_agent_tokens"
+    assert tuple(spec.role_map.by_role.keys()) == (
+        COORDINATOR_ROLE,
+        "writer_agent",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2645,6 +2679,22 @@ def test_build_bridge_from_env_with_all_keys(tmp_path):
     send, _ = _captured_send()
     bridge = build_bridge_from_env(env, send_callable=send)
     assert isinstance(bridge, TelegramBridge)
+
+
+def test_build_bridge_from_env_ignores_multi_bot_runtime_contract(tmp_path):
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_AGENT_TOKENS=(
+            "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+            "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+        ),
+        TELEGRAM_BOT_TOKEN="123:coord",
+        TELEGRAM_WRITER_BOT_TOKEN="456:writer",
+    )
+    send, _ = _captured_send()
+    bridge = build_bridge_from_env(env, send_callable=send)
+    assert isinstance(bridge, TelegramBridge)
+    assert bridge.coordinator_role == COORDINATOR_ROLE
 
 
 def test_build_bridge_from_env_missing_owner_id():

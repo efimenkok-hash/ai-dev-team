@@ -60,6 +60,10 @@ from core.coordinator_team_assembly import (
 from core.dispatcher_agents import build_dispatcher_agent_registry_factory
 from core.llm_dispatcher import LLMDispatcher
 from core.model_tier import default_registry as default_tier_registry
+from core.multi_bot_runtime import (
+    MultiBotRuntimeSpec,
+    build_multi_bot_runtime_spec,
+)
 from core.observability import JsonLinesSink, Observability
 from core.project_bootstrap import (
     ProjectBootstrapResult,
@@ -176,6 +180,14 @@ def build_dispatcher_from_env(
     if not isinstance(key, str) or not key.strip():
         return None
     return LLMDispatcher(api_key=key.strip(), observability=observability)
+
+
+def build_multi_bot_runtime_spec_from_env(
+    env: Mapping[str, str],
+    *,
+    personas: PersonaRegistry | None = None,
+) -> MultiBotRuntimeSpec | None:
+    return build_multi_bot_runtime_spec(env, personas=personas)
 
 
 def cleanup_orphan_worktrees_from_env(env: Mapping[str, str]) -> int:
