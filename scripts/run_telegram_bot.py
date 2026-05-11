@@ -35,10 +35,14 @@ Threading contract:
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import sys
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
 
 # Ensure project root is on sys.path when running as a script
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,10 +51,93 @@ if str(ROOT) not in sys.path:
 
 from dotenv import load_dotenv  # noqa: E402
 
-from core.bot_runner import build_bridge_from_env, get_required_env  # noqa: E402
+from core.bot_runner import (  # noqa: E402
+    build_bridge_from_env,
+    build_multi_bot_bridge_from_env,
+    build_multi_bot_runtime_spec_from_env,
+    get_required_env,
+)
+from core.coordinator_role import COORDINATOR_ROLE  # noqa: E402
+from core.multi_bot_bridge import MultiBotBridge  # noqa: E402
+from core.multi_bot_runtime import BotIdentity  # noqa: E402
 from core.telegram_bridge import IncomingMessage, OutgoingMessage  # noqa: E402
 
 logger = logging.getLogger("ai_dev_team.bot")
+
+
+@dataclass(frozen=True)
+class RunningBotApplication:
+    identity: BotIdentity
+    application: object
+    send_callable: object
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, BotIdentity):
+            raise ValueError(
+                "invalid_running_bot_identity_type:"
+                f"{type(self.identity).__name__}"
+            )
+        if self.application is None:
+            raise ValueError("running_bot_application_missing_application")
+        if not callable(self.send_callable):
+            raise ValueError("running_bot_send_callable_not_callable")
+
+
+@dataclass(frozen=True)
+class RunningMultiBotRuntime:
+    bridge: MultiBotBridge
+    applications_by_role: Mapping[str, RunningBotApplication]
+    primary_role: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.bridge, MultiBotBridge):
+            raise ValueError(
+                "invalid_multi_bot_bridge_type:"
+                f"{type(self.bridge).__name__}"
+            )
+        if not isinstance(self.applications_by_role, Mapping):
+            raise ValueError(
+                "invalid_running_multi_bot_applications_type:"
+                f"{type(self.applications_by_role).__name__}"
+            )
+        if self.primary_role != COORDINATOR_ROLE:
+            raise ValueError(
+                "running_multi_bot_primary_role_must_be_coordinator_agent:"
+                f"{self.primary_role}"
+            )
+
+        expected_roles = self.bridge.enabled_roles()
+        raw_roles = tuple(self.applications_by_role.keys())
+        if not raw_roles:
+            raise ValueError("empty_running_multi_bot_applications")
+        unexpected_roles = sorted(set(raw_roles) - set(expected_roles))
+        if unexpected_roles:
+            raise ValueError(
+                "unexpected_running_multi_bot_roles:"
+                + ",".join(unexpected_roles)
+            )
+
+        normalized: dict[str, RunningBotApplication] = {}
+        for role in expected_roles:
+            if role not in self.applications_by_role:
+                raise ValueError(f"missing_running_multi_bot_role:{role}")
+            running = self.applications_by_role[role]
+            if not isinstance(running, RunningBotApplication):
+                raise ValueError(
+                    "invalid_running_bot_application_type:"
+                    f"{type(running).__name__}"
+                )
+            if running.identity.agent_role != role:
+                raise ValueError(
+                    "running_bot_role_identity_mismatch:"
+                    f"{role}!={running.identity.agent_role}"
+                )
+            normalized[role] = running
+        object.__setattr__(
+            self,
+            "applications_by_role",
+            MappingProxyType(normalized),
+        )
 
 
 def _setup_logging(level: str) -> None:
@@ -86,6 +173,22 @@ def _build_send_callable(application, loop):
         future.result(timeout=30)
 
     return _send
+
+
+def _load_ptb_runtime():
+    try:
+        from telegram.ext import (
+            ApplicationBuilder,
+            MessageHandler,
+            filters,
+        )
+    except ImportError:
+        return None
+    return SimpleNamespace(
+        ApplicationBuilder=ApplicationBuilder,
+        MessageHandler=MessageHandler,
+        filters=filters,
+    )
 
 
 def _build_send_progress_callable(application, loop):
@@ -175,8 +278,12 @@ async def _download_photo(message) -> tuple[bytes, str]:
     return bytes(payload), "image/jpeg"
 
 
-def _make_handlers(bridge, loop):
-    """Build PTB callbacks that delegate to bridge.handle(...)."""
+def _make_incoming_handler(
+    handle_incoming,
+    loop,
+    *,
+    reply_on_attachment_error: bool = True,
+):
     async def on_message(update, context):
         message = getattr(update, "message", None)
         if message is None:
@@ -196,13 +303,14 @@ def _make_handlers(bridge, loop):
                 photo_bytes, photo_mime = await _download_photo(message)
         except Exception as exc:
             logger.exception("Failed to download attachment: %s", exc)
-            await context.bot.send_message(
-                chat_id=message.chat.id,
-                text=(
-                    "Менеджер: Не удалось скачать вложение. "
-                    "Попробуйте отправить ещё раз или текстом."
-                ),
-            )
+            if reply_on_attachment_error:
+                await context.bot.send_message(
+                    chat_id=message.chat.id,
+                    text=(
+                        "Менеджер: Не удалось скачать вложение. "
+                        "Попробуйте отправить ещё раз или текстом."
+                    ),
+                )
             return
 
         # If nothing to handle, skip
@@ -225,10 +333,177 @@ def _make_handlers(bridge, loop):
             logger.warning("Invalid incoming message: %s", exc)
             return
 
-        # Bridge.handle is sync — run in default executor so PTB loop stays free
-        await loop.run_in_executor(None, bridge.handle, incoming)
+        await loop.run_in_executor(None, handle_incoming, incoming)
 
     return on_message
+
+
+def _make_handlers(bridge, loop):
+    """Build PTB callbacks that delegate to bridge.handle(...)."""
+    return _make_incoming_handler(bridge.handle, loop)
+
+
+def _make_multi_bot_handlers(runtime_bridge, agent_role, loop):
+    def _handle_incoming(incoming: IncomingMessage):
+        return runtime_bridge.handle_incoming(agent_role, incoming)
+
+    return _make_incoming_handler(
+        _handle_incoming,
+        loop,
+        reply_on_attachment_error=(agent_role == COORDINATOR_ROLE),
+    )
+
+
+def _build_running_multi_bot_runtime(
+    env: Mapping[str, str],
+    loop,
+    *,
+    ptb_runtime=None,
+) -> RunningMultiBotRuntime | None:
+    if not isinstance(env, Mapping):
+        raise ValueError("env_must_be_mapping")
+    runtime_spec = build_multi_bot_runtime_spec_from_env(env)
+    if runtime_spec is None or runtime_spec.source != "telegram_agent_tokens":
+        return None
+    resolved_ptb_runtime = (
+        _load_ptb_runtime() if ptb_runtime is None else ptb_runtime
+    )
+    if resolved_ptb_runtime is None:
+        raise RuntimeError("ptb_runtime_unavailable")
+
+    applications_by_role: dict[str, RunningBotApplication] = {}
+    for role in runtime_spec.role_map.by_role:
+        identity = runtime_spec.role_map.by_role[role]
+        try:
+            application = (
+                resolved_ptb_runtime.ApplicationBuilder()
+                .token(identity.token)
+                .build()
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"multi_bot_application_build_failed:{role}"
+            ) from exc
+        applications_by_role[role] = RunningBotApplication(
+            identity=identity,
+            application=application,
+            send_callable=_build_send_callable(application, loop),
+        )
+
+    coordinator_app = applications_by_role[COORDINATOR_ROLE]
+    bridge = build_multi_bot_bridge_from_env(
+        env,
+        send_callable=coordinator_app.send_callable,
+        send_progress_callable=_build_send_progress_callable(
+            coordinator_app.application,
+            loop,
+        ),
+    )
+    if bridge is None:
+        raise RuntimeError("multi_bot_bridge_build_failed")
+
+    message_filter = (
+        resolved_ptb_runtime.filters.TEXT
+        | resolved_ptb_runtime.filters.VOICE
+        | resolved_ptb_runtime.filters.PHOTO
+        | resolved_ptb_runtime.filters.CAPTION
+    )
+    for role, running_app in applications_by_role.items():
+        running_app.application.add_handler(
+            resolved_ptb_runtime.MessageHandler(
+                message_filter,
+                _make_multi_bot_handlers(bridge, role, loop),
+            )
+        )
+
+    return RunningMultiBotRuntime(
+        bridge=bridge,
+        applications_by_role=applications_by_role,
+        primary_role=COORDINATOR_ROLE,
+    )
+
+
+async def _start_running_multi_bot_runtime(
+    runtime: RunningMultiBotRuntime,
+) -> None:
+    initialized_roles: list[str] = []
+    started_roles: list[str] = []
+    polling_roles: list[str] = []
+    try:
+        for role, running_app in runtime.applications_by_role.items():
+            try:
+                await running_app.application.initialize()
+                initialized_roles.append(role)
+                await running_app.application.start()
+                started_roles.append(role)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"multi_bot_application_start_failed:{role}"
+                ) from exc
+
+            updater = getattr(running_app.application, "updater", None)
+            if updater is None:
+                raise RuntimeError(
+                    f"multi_bot_application_polling_failed:{role}"
+                )
+            polling_roles.append(role)
+            try:
+                await updater.start_polling()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"multi_bot_application_polling_failed:{role}"
+                ) from exc
+    except Exception:
+        await _shutdown_running_multi_bot_runtime(
+            runtime,
+            initialized_roles=tuple(initialized_roles),
+            started_roles=tuple(started_roles),
+            polling_roles=tuple(polling_roles),
+        )
+        raise
+
+
+async def _shutdown_running_multi_bot_runtime(
+    runtime: RunningMultiBotRuntime,
+    *,
+    initialized_roles: tuple[str, ...] | None = None,
+    started_roles: tuple[str, ...] | None = None,
+    polling_roles: tuple[str, ...] | None = None,
+) -> None:
+    resolved_initialized = (
+        initialized_roles
+        if initialized_roles is not None
+        else tuple(runtime.applications_by_role.keys())
+    )
+    resolved_started = (
+        started_roles
+        if started_roles is not None
+        else tuple(runtime.applications_by_role.keys())
+    )
+    resolved_polling = (
+        polling_roles
+        if polling_roles is not None
+        else tuple(runtime.applications_by_role.keys())
+    )
+
+    for role in reversed(resolved_polling):
+        updater = getattr(
+            runtime.applications_by_role[role].application,
+            "updater",
+            None,
+        )
+        if updater is None:
+            continue
+        with contextlib.suppress(Exception):
+            await updater.stop()
+
+    for role in reversed(resolved_started):
+        with contextlib.suppress(Exception):
+            await runtime.applications_by_role[role].application.stop()
+
+    for role in reversed(resolved_initialized):
+        with contextlib.suppress(Exception):
+            await runtime.applications_by_role[role].application.shutdown()
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -247,29 +522,70 @@ async def main(argv: list[str] | None = None) -> int:
     load_dotenv(dotenv_path=ROOT / ".env")
     env = dict(os.environ)
 
-    try:
-        token = get_required_env(env, "TELEGRAM_BOT_TOKEN")
-    except ValueError as exc:
-        logger.error("Configuration error: %s", exc)
-        return 2
-
-    # Lazy PTB import — keep the rest of the script importable without
-    # python-telegram-bot installed (useful for unit tests).
-    try:
-        from telegram.ext import (
-            ApplicationBuilder,
-            MessageHandler,
-            filters,
-        )
-    except ImportError:
+    ptb_runtime = _load_ptb_runtime()
+    if ptb_runtime is None:
         logger.error(
             "python-telegram-bot not installed. "
             "Run: pip install -r requirements.txt"
         )
         return 3
 
-    application = ApplicationBuilder().token(token).build()
+    # Sweep stale worktrees from previous sessions before accepting messages.
+    # A previous bot crash or kill -9 can leave /tmp/aidt_worktrees/<task_id>
+    # directories that git no longer tracks. Cleaning them on startup keeps
+    # disk usage bounded and prevents stale state from interfering with new
+    # acquire() calls that could trip the worktree_exists guard.
+    from core.bot_runner import cleanup_orphan_worktrees_from_env
+
+    orphans = cleanup_orphan_worktrees_from_env(env)
+    if orphans > 0:
+        logger.info("Cleaned %d orphan worktree(s) from previous sessions", orphans)
+
     loop = asyncio.get_running_loop()
+    try:
+        multi_runtime = _build_running_multi_bot_runtime(
+            env,
+            loop,
+            ptb_runtime=ptb_runtime,
+        )
+    except Exception as exc:
+        logger.error("Multi-bot runtime construction failed: %s", exc)
+        return 5
+
+    if multi_runtime is not None:
+        logger.info(
+            "Multi-bot runtime enabled for roles: %s",
+            ", ".join(multi_runtime.applications_by_role.keys()),
+        )
+        logger.info(
+            "Bot starting. Owner whitelist: %s",
+            env.get("TELEGRAM_OWNER_CHAT_ID"),
+        )
+        logger.info("Whisper enabled: %s", bool(env.get("OPENAI_API_KEY")))
+        logger.info("Vision enabled: %s", bool(env.get("OPENROUTER_API_KEY")))
+        logger.info(
+            "Real LLM pipeline: %s",
+            bool(env.get("OPENROUTER_API_KEY") and env.get("REPO_PATH")),
+        )
+        try:
+            await _start_running_multi_bot_runtime(multi_runtime)
+        except Exception as exc:
+            logger.error("Multi-bot startup failed: %s", exc)
+            return 5
+        try:
+            stop_event = asyncio.Event()
+            await stop_event.wait()
+        finally:
+            await _shutdown_running_multi_bot_runtime(multi_runtime)
+        return 0
+
+    try:
+        token = get_required_env(env, "TELEGRAM_BOT_TOKEN")
+    except ValueError as exc:
+        logger.error("Configuration error: %s", exc)
+        return 2
+
+    application = ptb_runtime.ApplicationBuilder().token(token).build()
 
     send_callable = _build_send_callable(application, loop)
     send_progress_callable = _build_send_progress_callable(application, loop)
@@ -285,25 +601,15 @@ async def main(argv: list[str] | None = None) -> int:
 
     on_message = _make_handlers(bridge, loop)
 
-    # One handler covers text, voice, photo, captioned photos, and slash
-    # commands (we let parse_command in the bridge decide).
     application.add_handler(
-        MessageHandler(
-            filters.TEXT | filters.VOICE | filters.PHOTO | filters.CAPTION,
+        ptb_runtime.MessageHandler(
+            ptb_runtime.filters.TEXT
+            | ptb_runtime.filters.VOICE
+            | ptb_runtime.filters.PHOTO
+            | ptb_runtime.filters.CAPTION,
             on_message,
         )
     )
-
-    # Sweep stale worktrees from previous sessions before accepting messages.
-    # A previous bot crash or kill -9 can leave /tmp/aidt_worktrees/<task_id>
-    # directories that git no longer tracks. Cleaning them on startup keeps
-    # disk usage bounded and prevents stale state from interfering with new
-    # acquire() calls that could trip the worktree_exists guard.
-    from core.bot_runner import cleanup_orphan_worktrees_from_env
-
-    orphans = cleanup_orphan_worktrees_from_env(env)
-    if orphans > 0:
-        logger.info("Cleaned %d orphan worktree(s) from previous sessions", orphans)
 
     logger.info("Bot starting. Owner whitelist: %s", env.get("TELEGRAM_OWNER_CHAT_ID"))
     logger.info("Whisper enabled: %s", bool(env.get("OPENAI_API_KEY")))

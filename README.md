@@ -2,7 +2,7 @@
 
 AI Dev Team is a Telegram-driven multi-agent engineering bot for autonomous work on real git repositories. It runs a fixed FSM pipeline over specialised agents, writes changes into isolated git worktrees, validates them with `ruff` and `pytest`, and can commit, push, and open draft PRs.
 
-Current production scope: one Telegram bot, one active worker, real OpenRouter pipeline, SQLite-backed state, and project-aware execution resolved from bound project chats or the single-project owner-DM/bootstrap fallback.
+Current production scope: coordinator-centric Telegram control plane, one active worker, real OpenRouter pipeline, SQLite-backed state, project-aware execution resolved from bound project chats or the single-project owner-DM/bootstrap fallback, and an entrypoint that can launch multiple Telegram bot identities from `TELEGRAM_AGENT_TOKENS` while keeping replies coordinator-centric.
 
 ## Status
 
@@ -112,7 +112,7 @@ Project runtime resolution for the full pipeline:
 Optional:
 
 - `OPENAI_API_KEY` - enables Whisper voice transcription.
-- `TELEGRAM_AGENT_TOKENS` - optional role-to-env-key mapping for the future multi-bot runtime contract. Format: `coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN`. The values inside this string are env-var names, not raw Telegram tokens. At the current step this is only a typed config/runtime model; the real multi-bot Telegram bridge is not launched yet.
+- `TELEGRAM_AGENT_TOKENS` - optional role-to-env-key mapping for multi-bot runtime startup. Format: `coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN`. The values inside this string are env-var names, not raw Telegram tokens. When present, the entrypoint starts one PTB `Application` per configured identity and routes inbound messages through `MultiBotBridge`; outbound replies still remain coordinator-centric, and secondary inbound identities currently resolve to `secondary_bot_inbound_not_enabled`.
 - `REPO_PATH` - legacy bootstrap/fallback for single-project compatibility. It is no longer the sole source of runtime selection once projects with runtime bindings already exist in `StateDB`.
 - `WORKTREE_ROOT` - optional legacy bootstrap override for the worktree root.
 - `STATE_DB_PATH` - SQLite path for tier sessions, task history, budget state, and the project registry/runtime bindings.
