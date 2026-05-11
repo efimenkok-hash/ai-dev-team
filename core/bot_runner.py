@@ -60,6 +60,7 @@ from core.coordinator_team_assembly import (
 from core.dispatcher_agents import build_dispatcher_agent_registry_factory
 from core.llm_dispatcher import LLMDispatcher
 from core.model_tier import default_registry as default_tier_registry
+from core.multi_bot_bridge import MultiBotBridge
 from core.multi_bot_runtime import (
     MultiBotRuntimeSpec,
     build_multi_bot_runtime_spec,
@@ -188,6 +189,27 @@ def build_multi_bot_runtime_spec_from_env(
     personas: PersonaRegistry | None = None,
 ) -> MultiBotRuntimeSpec | None:
     return build_multi_bot_runtime_spec(env, personas=personas)
+
+
+def build_multi_bot_bridge_from_env(
+    env: Mapping[str, str] | None = None,
+    *,
+    send_callable=None,
+    send_progress_callable: Callable[[int, str], None] | None = None,
+) -> MultiBotBridge | None:
+    resolved_env = dict(os.environ) if env is None else env
+    runtime_spec = build_multi_bot_runtime_spec_from_env(resolved_env)
+    if runtime_spec is None:
+        return None
+    primary_bridge = build_bridge_from_env(
+        resolved_env,
+        send_callable=send_callable,
+        send_progress_callable=send_progress_callable,
+    )
+    return MultiBotBridge(
+        runtime_spec=runtime_spec,
+        primary_bridge=primary_bridge,
+    )
 
 
 def cleanup_orphan_worktrees_from_env(env: Mapping[str, str]) -> int:

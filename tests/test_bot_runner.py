@@ -17,6 +17,7 @@ from core.bot_runner import (
     build_command_registry,
     build_confirmation_gate,
     build_dispatcher_from_env,
+    build_multi_bot_bridge_from_env,
     build_multi_bot_runtime_spec_from_env,
     build_real_task_handler_from_env,
     build_vision_client,
@@ -39,6 +40,7 @@ from core.bot_runner import (
 from core.confirmation_gate import ConfirmationGate
 from core.coordinator_role import COORDINATOR_ROLE
 from core.model_tier import default_registry as default_tier_registry
+from core.multi_bot_bridge import MultiBotBridge
 from core.project_chat_binding_service import ProjectChatBindingService
 from core.project_context import ProjectContextResolver
 from core.project_migration_service import ProjectMigrationService
@@ -344,6 +346,74 @@ def test_build_multi_bot_runtime_spec_from_env_supports_multi_bot_contract():
         COORDINATOR_ROLE,
         "writer_agent",
     )
+
+
+# ---------------------------------------------------------------------------
+# build_multi_bot_bridge_from_env
+# ---------------------------------------------------------------------------
+
+
+def test_build_multi_bot_bridge_from_env_returns_none_without_runtime_tokens(tmp_path):
+    def _send(_out):
+        return None
+
+    assert (
+        build_multi_bot_bridge_from_env(
+            {
+                "TELEGRAM_OWNER_CHAT_ID": "12345",
+                "STATE_DB_PATH": str(tmp_path / "state.db"),
+            },
+            send_callable=_send,
+        )
+        is None
+    )
+
+
+def test_build_multi_bot_bridge_from_env_supports_legacy_env(tmp_path):
+    def _send(_out):
+        return None
+
+    bridge = build_multi_bot_bridge_from_env(
+        {
+            "TELEGRAM_OWNER_CHAT_ID": "12345",
+            "STATE_DB_PATH": str(tmp_path / "state.db"),
+            "TELEGRAM_BOT_TOKEN": "123:legacy",
+        },
+        send_callable=_send,
+    )
+
+    assert isinstance(bridge, MultiBotBridge)
+    assert bridge.runtime_spec.source == "single_token_legacy"
+    assert bridge.primary_role == COORDINATOR_ROLE
+    assert isinstance(bridge.primary_bridge, TelegramBridge)
+
+
+def test_build_multi_bot_bridge_from_env_supports_multi_bot_contract(tmp_path):
+    def _send(_out):
+        return None
+
+    bridge = build_multi_bot_bridge_from_env(
+        {
+            "TELEGRAM_OWNER_CHAT_ID": "12345",
+            "STATE_DB_PATH": str(tmp_path / "state.db"),
+            "TELEGRAM_AGENT_TOKENS": (
+                "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+            ),
+            "TELEGRAM_BOT_TOKEN": "123:coord",
+            "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
+        },
+        send_callable=_send,
+    )
+
+    assert isinstance(bridge, MultiBotBridge)
+    assert bridge.runtime_spec.source == "telegram_agent_tokens"
+    assert bridge.primary_role == COORDINATOR_ROLE
+    assert tuple(bridge.runtime_spec.role_map.by_role.keys()) == (
+        COORDINATOR_ROLE,
+        "writer_agent",
+    )
+    assert isinstance(bridge.primary_bridge, TelegramBridge)
 
 
 # ---------------------------------------------------------------------------
