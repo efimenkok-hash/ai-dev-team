@@ -8,7 +8,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from core.agent_dm_models import AgentDmSession
 from core.agent_dm_reply import AgentDmSingleReplyService
+from core.agent_owner_notifications import (
+    AgentOwnerNotificationRequest,
+    AgentOwnerNotificationService,
+)
 from core.agent_personas import default_registry
 from core.bot_commands import CommandName, CommandRegistry
 from core.bot_runner import wrap_task_handler_with_agent_dm_single_reply
@@ -32,6 +37,7 @@ from core.telegram_bridge import (
     IncomingMessage,
     OutgoingEnvelope,
     OutgoingMessage,
+    PendingBridgeReply,
     TelegramBridge,
 )
 from core.tier_session import TierSessionStore
@@ -113,6 +119,7 @@ def _make_bridge(
     gate=None,
     sender=None,
     project_context_resolver=None,
+    pending_direct_dm_replies=None,
 ):
     return TelegramBridge(
         owner_chat_ids=frozenset({OWNER_CHAT_ID}),
@@ -123,6 +130,7 @@ def _make_bridge(
         gate=gate,
         commands=commands,
         task_handler=task_handler,
+        pending_direct_dm_replies=pending_direct_dm_replies,
         project_context_resolver=project_context_resolver,
     )
 
@@ -1358,6 +1366,174 @@ def test_direct_writer_photo_dm_uses_single_shot_path_after_vision_resolution(
         "Распознанный photo вопрос",
         "Разберу photo-вопрос как writer.",
     ]
+
+
+def test_resolved_secondary_owner_dm_flushes_pending_notifications_before_current_reply(
+    tmp_path,
+):
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    _register_project(registry, with_chat_binding=False)
+    db.upsert_agent_dm_session(
+        AgentDmSession(
+            owner_user_id=OWNER_CHAT_ID,
+            project_id="alpha_project",
+            agent_role="writer_agent",
+            thread_bot_role="writer_agent",
+            dm_chat_id=OWNER_CHAT_ID,
+            status="active",
+            created_at=10.0,
+            last_interaction_at=20.0,
+        )
+    )
+    notification_service = AgentOwnerNotificationService(db, clock=lambda: 1500.0)
+    notification_service.dispatch_or_queue(
+        AgentOwnerNotificationRequest(
+            owner_user_id=OWNER_CHAT_ID,
+            project_id="alpha_project",
+            agent_role="writer_agent",
+            thread_bot_role="writer_agent",
+            body="Отложенное уведомление writer.",
+        )
+    )
+
+    def _pending(msg: IncomingMessage) -> tuple[PendingBridgeReply, ...]:
+        session = db.get_agent_dm_session(
+            OWNER_CHAT_ID,
+            "alpha_project",
+            "writer_agent",
+        )
+        assert session is not None
+        return tuple(
+            PendingBridgeReply(
+                reply=notification_service.build_agent_reply(notification),
+                ack=lambda notification=notification: notification_service.ack_delivered(
+                    notification
+                ),
+            )
+            for notification in notification_service.list_pending_for_session(session)
+        )
+
+    sender = CapturingSender()
+    bridge = _make_bridge(
+        sender=sender,
+        pending_direct_dm_replies=_pending,
+        task_handler=lambda text, msg: BridgeReply(
+            persona_role="writer_agent",
+            body="Текущий ответ writer.",
+        ),
+    )
+
+    result = bridge.handle(
+        IncomingMessage(
+            chat_id=OWNER_CHAT_ID,
+            user_id=OWNER_CHAT_ID,
+            message_id=1,
+            text="Текущий вопрос owner",
+            project_id="alpha_project",
+            project_slug="alpha-project",
+            project_context_source="agent_dm_active_session",
+            incoming_bot_role="writer_agent",
+        )
+    )
+
+    assert result.handled is True
+    assert [envelope.text for envelope in sender.sent] == [
+        "Программист: Отложенное уведомление writer.",
+        "Программист: Текущий ответ writer.",
+    ]
+    assert [envelope.sender_role for envelope in sender.sent] == [
+        "writer_agent",
+        "writer_agent",
+    ]
+    assert [envelope.delivery_role for envelope in sender.sent] == [
+        "writer_agent",
+        "writer_agent",
+    ]
+    assert db.list_queued_agent_owner_notifications(
+        OWNER_CHAT_ID,
+        "alpha_project",
+        "writer_agent",
+        "writer_agent",
+    ) == ()
+    assert [message.body for message in db.list_agent_dm_messages(
+        OWNER_CHAT_ID,
+        "alpha_project",
+        "writer_agent",
+    )] == ["Отложенное уведомление writer."]
+
+
+def test_pending_notification_send_failure_does_not_ack_or_write_transcript(
+    tmp_path,
+):
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    _register_project(registry, with_chat_binding=False)
+    db.upsert_agent_dm_session(
+        AgentDmSession(
+            owner_user_id=OWNER_CHAT_ID,
+            project_id="alpha_project",
+            agent_role="writer_agent",
+            thread_bot_role="writer_agent",
+            dm_chat_id=OWNER_CHAT_ID,
+            status="active",
+            created_at=10.0,
+            last_interaction_at=20.0,
+        )
+    )
+    notification_service = AgentOwnerNotificationService(db, clock=lambda: 1700.0)
+    queued = notification_service.dispatch_or_queue(
+        AgentOwnerNotificationRequest(
+            owner_user_id=OWNER_CHAT_ID,
+            project_id="alpha_project",
+            agent_role="writer_agent",
+            thread_bot_role="writer_agent",
+            body="Непрочитанное уведомление writer.",
+        )
+    ).notification
+    task_calls: list[str] = []
+
+    def _pending(msg: IncomingMessage) -> tuple[PendingBridgeReply, ...]:
+        return (
+            PendingBridgeReply(
+                reply=notification_service.build_agent_reply(queued),
+                ack=lambda: notification_service.ack_delivered(queued),
+            ),
+        )
+
+    bridge = _make_bridge(
+        sender=CapturingSender(raise_exc=RuntimeError("telegram down")),
+        pending_direct_dm_replies=_pending,
+        task_handler=lambda text, msg: task_calls.append(text)
+        or BridgeReply(persona_role="writer_agent", body="Текущий ответ"),
+    )
+
+    result = bridge.handle(
+        IncomingMessage(
+            chat_id=OWNER_CHAT_ID,
+            user_id=OWNER_CHAT_ID,
+            message_id=1,
+            text="Текущий вопрос owner",
+            project_id="alpha_project",
+            project_slug="alpha-project",
+            project_context_source="agent_dm_active_session",
+            incoming_bot_role="writer_agent",
+        )
+    )
+
+    assert result.handled is True
+    assert task_calls == []
+    assert db.list_queued_agent_owner_notifications(
+        OWNER_CHAT_ID,
+        "alpha_project",
+        "writer_agent",
+        "writer_agent",
+    ) == (queued,)
+    assert db.list_agent_dm_messages(
+        OWNER_CHAT_ID,
+        "alpha_project",
+        "writer_agent",
+    ) == ()
 
 
 def test_private_writer_dm_command_reply_stays_in_same_bot_thread():

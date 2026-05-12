@@ -44,6 +44,7 @@ from typing import Any
 
 from core.agent_dm_disambiguation import AgentDmDisambiguationService
 from core.agent_dm_reply import AgentDmSingleReplyService
+from core.agent_owner_notifications import AgentOwnerNotificationService
 from core.agent_personas import PersonaRegistry, default_registry
 from core.background_runner import BackgroundTaskRunner
 from core.bot_commands import (
@@ -93,6 +94,7 @@ from core.telegram_bridge import (
     BridgeReply,
     IncomingMessage,
     OutgoingEnvelope,
+    PendingBridgeReply,
     TaskHandler,
     TelegramBridge,
 )
@@ -2369,6 +2371,87 @@ def _with_task_handler_text(
     return replace(msg, text=text)
 
 
+def _build_pending_direct_dm_replies_hook(
+    *,
+    disambiguation_service: AgentDmDisambiguationService,
+    direct_reply_service: AgentDmSingleReplyService,
+    notification_service: AgentOwnerNotificationService,
+    state_db: StateDB,
+) -> Callable[[IncomingMessage], tuple[PendingBridgeReply, ...]]:
+    if not isinstance(disambiguation_service, AgentDmDisambiguationService):
+        raise ValueError("invalid_agent_dm_disambiguation_service")
+    if not isinstance(direct_reply_service, AgentDmSingleReplyService):
+        raise ValueError("invalid_agent_dm_single_reply_service")
+    if not isinstance(notification_service, AgentOwnerNotificationService):
+        raise ValueError("invalid_agent_owner_notification_service")
+    if not isinstance(state_db, StateDB):
+        raise ValueError("invalid_state_db")
+
+    def _load(msg: IncomingMessage) -> tuple[PendingBridgeReply, ...]:
+        if not disambiguation_service.is_secondary_owner_dm_candidate(msg):
+            return ()
+        resolution = disambiguation_service.resolve(msg)
+        if resolution.status != "resolved" or resolution.snapshot is None:
+            return ()
+        if msg.incoming_bot_role is None:
+            return ()
+        if (
+            resolution.snapshot.policy is None
+            or not resolution.snapshot.policy.allow_agent_dm
+        ):
+            return ()
+        pending = state_db.list_queued_agent_owner_notifications(
+            msg.user_id,
+            resolution.snapshot.project.project_id,
+            msg.incoming_bot_role,
+            msg.incoming_bot_role,
+        )
+        if not pending:
+            return ()
+        resolved_context_source = {
+            "owner_dm_single_project": "owner_dm_single_project",
+            "explicit_project_slug": "agent_dm_explicit_project",
+            "active_agent_session": "agent_dm_active_session",
+            "single_candidate": "agent_dm_single_candidate",
+        }.get(resolution.resolution_source)
+        if resolved_context_source is None:
+            return ()
+        resolved_msg = replace(
+            msg,
+            text=resolution.normalized_owner_text,
+            project_id=resolution.snapshot.project.project_id,
+            project_slug=resolution.snapshot.project.slug,
+            project_context_source=resolved_context_source,
+            project_context_reason=None,
+        )
+        context = direct_reply_service.build_context(
+            resolved_msg,
+            resolution.snapshot,
+        )
+        session = state_db.get_agent_dm_session(
+            msg.user_id,
+            resolution.snapshot.project.project_id,
+            msg.incoming_bot_role,
+        )
+        if (
+            session is None
+            or session.status != "active"
+            or session.thread_bot_role != msg.incoming_bot_role
+        ):
+            session = direct_reply_service.ensure_active_session(context)
+        return tuple(
+            PendingBridgeReply(
+                reply=notification_service.build_agent_reply(notification),
+                ack=lambda notification=notification: notification_service.ack_delivered(
+                    notification
+                ),
+            )
+            for notification in pending
+        )
+
+    return _load
+
+
 # ---------------------------------------------------------------------------
 # top-level builder
 # ---------------------------------------------------------------------------
@@ -2552,26 +2635,35 @@ def build_bridge_from_env(
             ),
         )
     )
+    pending_direct_dm_replies = None
     if state_db is not None:
         project_registry = ProjectRegistry(state_db)
         disambiguation_service = AgentDmDisambiguationService(
             state_db=state_db,
             project_registry=project_registry,
         )
+        notification_service = AgentOwnerNotificationService(state_db=state_db)
+        direct_reply_service = AgentDmSingleReplyService(
+            dispatcher=build_dispatcher_from_env(env),
+            state_db=state_db,
+            personas=personas,
+            tier_registry=tier_store.registry,
+        )
         task_handler = wrap_task_handler_with_agent_dm_single_reply(
             task_handler,
-            service=AgentDmSingleReplyService(
-                dispatcher=build_dispatcher_from_env(env),
-                state_db=state_db,
-                personas=personas,
-                tier_registry=tier_store.registry,
-            ),
+            service=direct_reply_service,
             tier_store=tier_store,
             project_registry=project_registry,
         )
         task_handler = wrap_task_handler_with_agent_dm_disambiguation(
             task_handler,
             service=disambiguation_service,
+        )
+        pending_direct_dm_replies = _build_pending_direct_dm_replies_hook(
+            disambiguation_service=disambiguation_service,
+            direct_reply_service=direct_reply_service,
+            notification_service=notification_service,
+            state_db=state_db,
         )
     return TelegramBridge(
         owner_chat_ids=owner_chat_ids,
@@ -2582,5 +2674,6 @@ def build_bridge_from_env(
         gate=gate,
         commands=commands,
         task_handler=task_handler,
+        pending_direct_dm_replies=pending_direct_dm_replies,
         project_context_resolver=project_context_resolver,
     )

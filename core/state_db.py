@@ -3,7 +3,7 @@ core/state_db.py
 
 SQLite-backed persistent state for chat tier selection, completed task
 history, per-chat budget, the AI Office project model, and owner-agent
-DM session/message state.
+DM session/message state, plus queued agent-owner notifications.
 
 Design goals:
 1. Single-file stdlib-only storage (`sqlite3`), safe for bot restarts.
@@ -18,13 +18,13 @@ Design goals:
 CONTRACTS:
 1. StateDB(path) requires a Path; constructor creates parent directories and
    initializes/migrates the schema eagerly.
-2. Current schema version is 7. Unknown future versions raise ValueError.
+2. Current schema version is 8. Unknown future versions raise ValueError.
 3. Every public method validates arguments via isinstance/ValueError.
 4. Writes are serialized with a process-local lock; reads use independent
    SQLite connections and remain safe under concurrent access.
 5. task_history keeps an append-only audit log. get_task(task_id) returns the
    newest record for that task_id; recent_tasks(n) returns newest-last order.
-6. schema migration supports v1 -> v2 -> v3 -> v4 -> v5 -> v6 -> v7:
+6. schema migration supports v1 -> v2 -> v3 -> v4 -> v5 -> v6 -> v7 -> v8:
    - v1 -> v2: tier_sessions.tier_name -> active_tier
    - v1 -> v2: task_history gains AUTOINCREMENT id for stable append-order
      semantics
@@ -34,6 +34,8 @@ CONTRACTS:
    - v4 -> v5: adds task_history.project_id for project-aware task identity
    - v5 -> v6: adds agent_dm_sessions for typed owner-agent DM session state
    - v6 -> v7: adds agent_dm_messages for typed owner-agent DM transcripts
+   - v7 -> v8: adds agent_owner_notifications for queued personal DM
+     notifications that can be delivered later into an active agent thread
 7. Identity model is explicit:
    - Project.owner_user_id is a positive Telegram owner user id stored in
      projects.owner_user_id.
@@ -61,6 +63,7 @@ from core.agent_dm_models import (
     AgentDmMessage,
     AgentDmSession,
 )
+from core.agent_owner_notifications import AgentOwnerNotification
 from core.project_models import (
     VALID_CHAT_PROVIDERS,
     Project,
@@ -71,7 +74,7 @@ from core.project_models import (
 from core.project_runtime import ProjectRuntimeBinding
 from core.task_history import TaskSummary
 
-_CURRENT_SCHEMA_VERSION = 7
+_CURRENT_SCHEMA_VERSION = 8
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -198,6 +201,21 @@ CREATE TABLE IF NOT EXISTS agent_dm_messages (
 )
 """
 
+_CREATE_AGENT_OWNER_NOTIFICATIONS = """
+CREATE TABLE IF NOT EXISTS agent_owner_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER NOT NULL,
+    project_id TEXT NOT NULL,
+    agent_role TEXT NOT NULL,
+    thread_bot_role TEXT NOT NULL,
+    body TEXT NOT NULL,
+    chat_provider TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    delivered_at REAL NULL
+)
+"""
+
 _CREATE_INDEX_TASK_HISTORY_TASK_ID = """
 CREATE INDEX IF NOT EXISTS idx_task_history_task_id_id
 ON task_history(task_id, id DESC)
@@ -211,6 +229,18 @@ ON task_history(finished_at DESC, id DESC)
 _CREATE_INDEX_AGENT_DM_MESSAGES_TRANSCRIPT_ID = """
 CREATE INDEX IF NOT EXISTS idx_agent_dm_messages_transcript_id_desc
 ON agent_dm_messages(owner_user_id, project_id, agent_role, id DESC)
+"""
+
+_CREATE_INDEX_AGENT_OWNER_NOTIFICATIONS_QUEUE = """
+CREATE INDEX IF NOT EXISTS idx_agent_owner_notifications_queue
+ON agent_owner_notifications(
+    owner_user_id,
+    project_id,
+    agent_role,
+    thread_bot_role,
+    status,
+    id ASC
+)
 """
 
 
@@ -714,6 +744,91 @@ class StateDB:
     # Agent DM messages
     # ------------------------------------------------------------------
 
+    def insert_agent_owner_notification(
+        self,
+        notification: AgentOwnerNotification,
+    ) -> AgentOwnerNotification:
+        if not isinstance(notification, AgentOwnerNotification):
+            raise ValueError(
+                "invalid_agent_owner_notification_type:"
+                f"{type(notification).__name__}"
+            )
+        return self._run_write_transaction(
+            lambda conn: self._insert_agent_owner_notification_conn(
+                conn,
+                notification,
+            )
+        )
+
+    def list_queued_agent_owner_notifications(
+        self,
+        owner_user_id: int,
+        project_id: str,
+        agent_role: str,
+        thread_bot_role: str,
+    ) -> tuple[AgentOwnerNotification, ...]:
+        self._validate_positive_int(owner_user_id, "owner_user_id")
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_agent_role = self._normalize_project_identifier(
+            agent_role,
+            field_name="agent_role",
+        )
+        normalized_thread_bot_role = self._normalize_project_identifier(
+            thread_bot_role,
+            field_name="thread_bot_role",
+        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, owner_user_id, project_id, agent_role, thread_bot_role,
+                       body, chat_provider, status, created_at, delivered_at
+                FROM agent_owner_notifications
+                WHERE owner_user_id = ?
+                  AND project_id = ?
+                  AND agent_role = ?
+                  AND thread_bot_role = ?
+                  AND status = 'queued'
+                ORDER BY id ASC
+                """,
+                (
+                    owner_user_id,
+                    normalized_project_id,
+                    normalized_agent_role,
+                    normalized_thread_bot_role,
+                ),
+            ).fetchall()
+        return tuple(
+            notification
+            for row in rows
+            if (
+                notification := self._row_to_agent_owner_notification(row)
+            )
+            is not None
+        )
+
+    def mark_agent_owner_notification_delivered(
+        self,
+        notification_id: int,
+        *,
+        delivered_at: float,
+    ) -> AgentOwnerNotification:
+        self._validate_positive_int(notification_id, "notification_id")
+        normalized_delivered_at = self._normalise_timestamp(
+            delivered_at,
+            field_name="delivered_at",
+            allow_zero=False,
+        )
+        return self._run_write_transaction(
+            lambda conn: self._mark_agent_owner_notification_delivered_conn(
+                conn,
+                notification_id,
+                delivered_at=normalized_delivered_at,
+            )
+        )
+
     def record_agent_dm_message(
         self,
         message: AgentDmMessage,
@@ -815,7 +930,7 @@ class StateDB:
         with self._lock, self._connect() as conn:
             version = self._detect_schema_version(conn)
             if version == 0:
-                self._create_v7_schema(conn)
+                self._create_v8_schema(conn)
                 return
             if version > _CURRENT_SCHEMA_VERSION:
                 raise ValueError(
@@ -846,9 +961,13 @@ class StateDB:
                     self._migrate_v6_to_v7(conn)
                     version = 7
                     continue
+                if version == 7:
+                    self._migrate_v7_to_v8(conn)
+                    version = 8
+                    continue
                 raise ValueError(f"unsupported_schema_version:{version}")
 
-    def _create_v7_schema(self, conn: sqlite3.Connection) -> None:
+    def _create_v8_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE_SCHEMA_META)
         conn.execute(_CREATE_TIER_SESSIONS)
         conn.execute(_CREATE_TASK_HISTORY)
@@ -860,9 +979,11 @@ class StateDB:
         conn.execute(_CREATE_PROJECT_RUNTIME_BINDINGS)
         conn.execute(_CREATE_AGENT_DM_SESSIONS)
         conn.execute(_CREATE_AGENT_DM_MESSAGES)
+        conn.execute(_CREATE_AGENT_OWNER_NOTIFICATIONS)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_TASK_ID)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_FINISHED)
         conn.execute(_CREATE_INDEX_AGENT_DM_MESSAGES_TRANSCRIPT_ID)
+        conn.execute(_CREATE_INDEX_AGENT_OWNER_NOTIFICATIONS_QUEUE)
         self._set_schema_version(conn, _CURRENT_SCHEMA_VERSION)
 
     def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
@@ -899,6 +1020,11 @@ class StateDB:
         conn.execute(_CREATE_AGENT_DM_MESSAGES)
         conn.execute(_CREATE_INDEX_AGENT_DM_MESSAGES_TRANSCRIPT_ID)
         self._set_schema_version(conn, 7)
+
+    def _migrate_v7_to_v8(self, conn: sqlite3.Connection) -> None:
+        conn.execute(_CREATE_AGENT_OWNER_NOTIFICATIONS)
+        conn.execute(_CREATE_INDEX_AGENT_OWNER_NOTIFICATIONS_QUEUE)
+        self._set_schema_version(conn, 8)
 
     def _migrate_tier_sessions_to_v2(self, conn: sqlite3.Connection) -> None:
         columns = self._table_columns(conn, "tier_sessions")
@@ -1204,6 +1330,29 @@ class StateDB:
             sender_role=str(row["sender_role"]),
             body=str(row["body"]),
             created_at=float(row["created_at"]),
+        )
+
+    @staticmethod
+    def _row_to_agent_owner_notification(
+        row: sqlite3.Row | None,
+    ) -> AgentOwnerNotification | None:
+        if row is None:
+            return None
+        return AgentOwnerNotification(
+            notification_id=int(row["id"]),
+            owner_user_id=int(row["owner_user_id"]),
+            project_id=str(row["project_id"]),
+            agent_role=str(row["agent_role"]),
+            thread_bot_role=str(row["thread_bot_role"]),
+            body=str(row["body"]),
+            chat_provider=str(row["chat_provider"]),
+            status=str(row["status"]),
+            created_at=float(row["created_at"]),
+            delivered_at=(
+                None
+                if row["delivered_at"] is None
+                else float(row["delivered_at"])
+            ),
         )
 
     def _upsert_project_conn(
@@ -1518,6 +1667,107 @@ class StateDB:
             max_entries,
         )
 
+    def _insert_agent_owner_notification_conn(
+        self,
+        conn: sqlite3.Connection,
+        notification: AgentOwnerNotification,
+    ) -> AgentOwnerNotification:
+        if notification.notification_id is not None:
+            raise ValueError("notification_id_must_be_none_for_insert")
+        project = self._get_project_row_by_id(conn, notification.project_id)
+        if project is None:
+            raise ValueError(f"unknown_project_id:{notification.project_id}")
+        project_owner_user_id = int(project["owner_user_id"])
+        if notification.owner_user_id != project_owner_user_id:
+            raise ValueError(
+                "agent_owner_notification_owner_project_mismatch:"
+                f"{notification.owner_user_id}!={project_owner_user_id}"
+            )
+        session = self._get_agent_dm_session_row(
+            conn,
+            owner_user_id=notification.owner_user_id,
+            project_id=notification.project_id,
+            agent_role=notification.agent_role,
+        )
+        if (
+            session is not None
+            and str(session["thread_bot_role"]) != notification.thread_bot_role
+        ):
+            raise ValueError(
+                "agent_owner_notification_thread_bot_role_mismatch:"
+                f"{notification.thread_bot_role}!={session['thread_bot_role']}"
+            )
+        cursor = conn.execute(
+            """
+            INSERT INTO agent_owner_notifications(
+                owner_user_id,
+                project_id,
+                agent_role,
+                thread_bot_role,
+                body,
+                chat_provider,
+                status,
+                created_at,
+                delivered_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                notification.owner_user_id,
+                notification.project_id,
+                notification.agent_role,
+                notification.thread_bot_role,
+                notification.body,
+                notification.chat_provider,
+                notification.status,
+                notification.created_at,
+                notification.delivered_at,
+            ),
+        )
+        row = self._get_agent_owner_notification_row(
+            conn,
+            int(cursor.lastrowid),
+        )
+        persisted = self._row_to_agent_owner_notification(row)
+        if persisted is None:
+            raise ValueError("inserted_agent_owner_notification_missing")
+        return persisted
+
+    def _mark_agent_owner_notification_delivered_conn(
+        self,
+        conn: sqlite3.Connection,
+        notification_id: int,
+        *,
+        delivered_at: float,
+    ) -> AgentOwnerNotification:
+        row = self._get_agent_owner_notification_row(conn, notification_id)
+        if row is None:
+            raise ValueError(f"unknown_notification_id:{notification_id}")
+        notification = self._row_to_agent_owner_notification(row)
+        if notification is None:
+            raise ValueError(f"unknown_notification_id:{notification_id}")
+        if notification.status != "queued":
+            raise ValueError(
+                "notification_not_queued:"
+                f"{notification_id}:{notification.status}"
+            )
+        conn.execute(
+            """
+            UPDATE agent_owner_notifications
+            SET status = 'delivered',
+                delivered_at = ?
+            WHERE id = ?
+            """,
+            (delivered_at, notification_id),
+        )
+        updated_row = self._get_agent_owner_notification_row(conn, notification_id)
+        updated = self._row_to_agent_owner_notification(updated_row)
+        if updated is None:
+            raise ValueError(
+                f"updated_agent_owner_notification_missing:{notification_id}"
+            )
+        return updated
+
     def _trim_agent_dm_messages_conn(
         self,
         conn: sqlite3.Connection,
@@ -1580,6 +1830,21 @@ class StateDB:
             WHERE owner_user_id = ? AND project_id = ? AND agent_role = ?
             """,
             (owner_user_id, project_id, agent_role),
+        ).fetchone()
+
+    def _get_agent_owner_notification_row(
+        self,
+        conn: sqlite3.Connection,
+        notification_id: int,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT id, owner_user_id, project_id, agent_role, thread_bot_role,
+                   body, chat_provider, status, created_at, delivered_at
+            FROM agent_owner_notifications
+            WHERE id = ?
+            """,
+            (notification_id,),
         ).fetchone()
 
     def _project_exists_conn(

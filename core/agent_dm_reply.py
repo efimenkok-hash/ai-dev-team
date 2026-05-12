@@ -395,6 +395,21 @@ class AgentDmSingleReplyService:
             reply=reply,
         )
 
+    def ensure_active_session(
+        self,
+        context: AgentDmSingleReplyContext,
+    ) -> AgentDmSession:
+        if not isinstance(context, AgentDmSingleReplyContext):
+            raise ValueError(
+                "invalid_agent_dm_single_reply_context_type:"
+                f"{type(context).__name__}"
+            )
+        now = _normalize_timestamp(
+            self._clock(),
+            field_name="session_activation_timestamp",
+        )
+        return self._activate_session(context, now=now)
+
     def reply_or_unavailable(
         self,
         context: AgentDmSingleReplyContext,

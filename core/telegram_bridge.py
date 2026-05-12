@@ -39,9 +39,11 @@ CONTRACTS:
 8. In project-aware mode, free-text plus project-sensitive commands
    (`/push`, `/pr`) are blocked before handler execution when project context
    cannot be resolved.
-9. The outbound transport callable is invoked exactly once per outbound
-   reply. Bridge never batches or reorders, and it preserves sender_role
-   inside OutgoingEnvelope for the transport boundary.
+9. The outbound transport callable is invoked exactly once per emitted
+   outbound reply. For resolved secondary owner-DM paths, the bridge may
+   flush queued pending agent notifications before the current task reply;
+   each emitted reply still preserves sender_role/delivery_role inside
+   OutgoingEnvelope for the transport boundary.
 """
 
 import contextlib
@@ -293,6 +295,21 @@ class BridgeReply:
 
 
 @dataclass(frozen=True)
+class PendingBridgeReply:
+    reply: BridgeReply
+    ack: Callable[[], None] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reply, BridgeReply):
+            raise ValueError(
+                "invalid_bridge_reply_type:"
+                f"{type(self.reply).__name__}"
+            )
+        if self.ack is not None and not callable(self.ack):
+            raise ValueError("pending_bridge_reply_ack_not_callable")
+
+
+@dataclass(frozen=True)
 class BridgeResult:
     """Audit trail of one handle() invocation."""
 
@@ -307,6 +324,10 @@ class BridgeResult:
 SendMessage = Callable[[OutgoingMessage], None]
 SendEnvelope = Callable[[OutgoingEnvelope], None]
 TaskHandler = Callable[[str, IncomingMessage], "BridgeReply | None"]
+PendingDirectDmReplies = Callable[
+    [IncomingMessage],
+    tuple[PendingBridgeReply, ...],
+]
 
 
 @dataclass
@@ -330,6 +351,7 @@ class TelegramBridge:
         gate: ConfirmationGate | None = None,
         commands: CommandRegistry | None = None,
         task_handler: TaskHandler | None = None,
+        pending_direct_dm_replies: PendingDirectDmReplies | None = None,
         observability: Observability | None = None,
         coordinator_role: str = COORDINATOR_ROLE,
         manager_role: str | None = None,
@@ -351,6 +373,11 @@ class TelegramBridge:
             raise ValueError("send_not_callable")
         if task_handler is not None and not callable(task_handler):
             raise ValueError("task_handler_not_callable")
+        if (
+            pending_direct_dm_replies is not None
+            and not callable(pending_direct_dm_replies)
+        ):
+            raise ValueError("pending_direct_dm_replies_not_callable")
         if not isinstance(denial_message, str) or not denial_message.strip():
             raise ValueError("empty_denial_message")
         if (
@@ -375,6 +402,7 @@ class TelegramBridge:
         self._gate = gate
         self._commands = commands
         self._task_handler = task_handler
+        self._pending_direct_dm_replies = pending_direct_dm_replies
         self._obs = observability
         self._denial_message = denial_message
         self._project_context_resolver = project_context_resolver
@@ -747,6 +775,8 @@ class TelegramBridge:
         msg: IncomingMessage,
         ctx: _BridgeContext,
     ) -> None:
+        if not self._flush_pending_direct_dm_replies(text, msg, ctx):
+            return
         if self._task_handler is None:
             self._safe_send(
                 OutgoingMessage(
@@ -824,6 +854,58 @@ class TelegramBridge:
             sender_role=reply.persona_role,
             incoming=msg,
         )
+
+    def _flush_pending_direct_dm_replies(
+        self,
+        text: str,
+        msg: IncomingMessage,
+        ctx: _BridgeContext,
+    ) -> bool:
+        if self._pending_direct_dm_replies is None:
+            return True
+        try:
+            candidate_msg = (
+                msg
+                if msg.text is not None and msg.text.strip() == text.strip()
+                else replace(msg, text=text)
+            )
+            pending = self._pending_direct_dm_replies(candidate_msg)
+        except Exception as exc:
+            ctx.notes.append(
+                f"pending_direct_dm_replies_failed:{type(exc).__name__}:{exc}"
+            )
+            return True
+        if not isinstance(pending, tuple):
+            ctx.notes.append("pending_direct_dm_replies_invalid_type")
+            return True
+        for pending_reply in pending:
+            if not isinstance(pending_reply, PendingBridgeReply):
+                ctx.notes.append("pending_direct_dm_replies_invalid_item")
+                continue
+            sent = self._safe_send(
+                OutgoingMessage(
+                    chat_id=msg.chat_id,
+                    text=self._sign_with_role(
+                        pending_reply.reply.persona_role,
+                        pending_reply.reply.body,
+                    ),
+                ),
+                ctx,
+                sender_role=pending_reply.reply.persona_role,
+                incoming=msg,
+            )
+            if not sent:
+                return False
+            if pending_reply.ack is not None:
+                try:
+                    pending_reply.ack()
+                except Exception as exc:
+                    ctx.notes.append(
+                        "pending_direct_dm_reply_ack_failed:"
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                    return False
+        return True
 
     def _format_ask_message(
         self,

@@ -15,6 +15,7 @@ from core.agent_dm_models import (
     AgentDmMessage,
     AgentDmSession,
 )
+from core.agent_owner_notifications import AgentOwnerNotification
 from core.project_models import (
     Project,
     ProjectChatBinding,
@@ -152,6 +153,23 @@ def _agent_dm_message(**overrides: object) -> AgentDmMessage:
     }
     data.update(overrides)
     return AgentDmMessage(**data)
+
+
+def _agent_owner_notification(**overrides: object) -> AgentOwnerNotification:
+    data: dict[str, object] = {
+        "notification_id": None,
+        "owner_user_id": 101,
+        "project_id": "alpha_project",
+        "agent_role": "writer_agent",
+        "thread_bot_role": "writer_agent",
+        "body": "Need owner review",
+        "chat_provider": "telegram",
+        "status": "queued",
+        "created_at": 1002.0,
+        "delivered_at": None,
+    }
+    data.update(overrides)
+    return AgentOwnerNotification(**data)
 
 
 def _table_names(path: Path) -> set[str]:
@@ -910,6 +928,65 @@ def _build_v6_db(path: Path, repo_path: Path) -> None:
         conn.close()
 
 
+def _build_v7_db(path: Path, repo_path: Path) -> None:
+    _build_v6_db(path, repo_path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE agent_dm_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER NOT NULL,
+                project_id TEXT NOT NULL,
+                agent_role TEXT NOT NULL,
+                sender_kind TEXT NOT NULL,
+                sender_role TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX idx_agent_dm_messages_transcript_id_desc
+            ON agent_dm_messages(owner_user_id, project_id, agent_role, id DESC)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_dm_messages(
+                owner_user_id,
+                project_id,
+                agent_role,
+                sender_kind,
+                sender_role,
+                body,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                101,
+                "alpha_project",
+                "writer_agent",
+                "owner",
+                "owner",
+                "Need a draft",
+                1001.0,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE schema_meta
+            SET value = '7'
+            WHERE key = 'schema_version'
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Construction / schema
 # ---------------------------------------------------------------------------
@@ -939,12 +1016,12 @@ def test_constructor_creates_database_file(tmp_path: Path):
 
 def test_schema_version_is_current(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 7
+    assert db.schema_version() == 8
 
 
 def test_fresh_schema_creates_project_tables(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 7
+    assert db.schema_version() == 8
     assert _table_names(db.path) >= {
         "schema_meta",
         "tier_sessions",
@@ -957,6 +1034,7 @@ def test_fresh_schema_creates_project_tables(tmp_path: Path):
         "project_runtime_bindings",
         "agent_dm_sessions",
         "agent_dm_messages",
+        "agent_owner_notifications",
     }
     assert _table_columns(db.path, "task_history") == [
         "id",
@@ -1028,6 +1106,18 @@ def test_fresh_schema_creates_project_tables(tmp_path: Path):
         "sender_role",
         "body",
         "created_at",
+    ]
+    assert _table_columns(db.path, "agent_owner_notifications") == [
+        "id",
+        "owner_user_id",
+        "project_id",
+        "agent_role",
+        "thread_bot_role",
+        "body",
+        "chat_provider",
+        "status",
+        "created_at",
+        "delivered_at",
     ]
 
 
@@ -1916,6 +2006,176 @@ def test_list_agent_dm_sessions_for_owner_rejects_invalid_owner_id(tmp_path: Pat
 
 
 # ---------------------------------------------------------------------------
+# Agent owner notifications
+# ---------------------------------------------------------------------------
+
+
+def test_insert_agent_owner_notification_round_trip_and_mark_delivered(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_agent_dm_session(_agent_dm_session())
+
+    inserted = db.insert_agent_owner_notification(_agent_owner_notification())
+
+    assert inserted.notification_id is not None
+    queued = db.list_queued_agent_owner_notifications(
+        101,
+        "alpha_project",
+        "writer_agent",
+        "writer_agent",
+    )
+    assert queued == (inserted,)
+
+    delivered = db.mark_agent_owner_notification_delivered(
+        inserted.notification_id,
+        delivered_at=1003.0,
+    )
+
+    assert delivered.status == "delivered"
+    assert delivered.delivered_at == 1003.0
+    assert db.list_queued_agent_owner_notifications(
+        101,
+        "alpha_project",
+        "writer_agent",
+        "writer_agent",
+    ) == ()
+
+
+def test_list_queued_agent_owner_notifications_returns_oldest_first(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_agent_dm_session(_agent_dm_session())
+
+    first = db.insert_agent_owner_notification(
+        _agent_owner_notification(body="First", created_at=1001.0)
+    )
+    second = db.insert_agent_owner_notification(
+        _agent_owner_notification(body="Second", created_at=1002.0)
+    )
+
+    queued = db.list_queued_agent_owner_notifications(
+        101,
+        "alpha_project",
+        "writer_agent",
+        "writer_agent",
+    )
+
+    assert queued == (first, second)
+
+
+def test_insert_agent_owner_notification_rejects_non_notification(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_agent_owner_notification_type:str"):
+        db.insert_agent_owner_notification("bad")  # type: ignore[arg-type]
+
+
+def test_insert_agent_owner_notification_rejects_persisted_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    with pytest.raises(ValueError, match="notification_id_must_be_none_for_insert"):
+        db.insert_agent_owner_notification(
+            _agent_owner_notification(notification_id=1)
+        )
+
+
+def test_insert_agent_owner_notification_rejects_unknown_project(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="unknown_project_id:alpha_project"):
+        db.insert_agent_owner_notification(_agent_owner_notification())
+
+
+def test_insert_agent_owner_notification_rejects_owner_project_mismatch(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project(owner_user_id=999))
+    with pytest.raises(
+        ValueError,
+        match="agent_owner_notification_owner_project_mismatch:101!=999",
+    ):
+        db.insert_agent_owner_notification(_agent_owner_notification())
+
+
+def test_insert_agent_owner_notification_rejects_thread_mismatch_with_session(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_agent_dm_session(_agent_dm_session(thread_bot_role="writer_agent"))
+    with pytest.raises(
+        ValueError,
+        match="agent_owner_notification_thread_bot_role_mismatch",
+    ):
+        db.insert_agent_owner_notification(
+            _agent_owner_notification(thread_bot_role="reviewer_agent")
+        )
+
+
+def test_list_queued_agent_owner_notifications_rejects_invalid_args(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_owner_user_id"):
+        db.list_queued_agent_owner_notifications(
+            0,
+            "alpha_project",
+            "writer_agent",
+            "writer_agent",
+        )
+    with pytest.raises(ValueError, match="invalid_project_id"):
+        db.list_queued_agent_owner_notifications(
+            101,
+            "bad-id",
+            "writer_agent",
+            "writer_agent",
+        )
+    with pytest.raises(ValueError, match="invalid_agent_role"):
+        db.list_queued_agent_owner_notifications(
+            101,
+            "alpha_project",
+            "writer-agent",
+            "writer_agent",
+        )
+    with pytest.raises(ValueError, match="invalid_thread_bot_role"):
+        db.list_queued_agent_owner_notifications(
+            101,
+            "alpha_project",
+            "writer_agent",
+            "writer-agent",
+        )
+
+
+def test_mark_agent_owner_notification_delivered_rejects_invalid_args(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_notification_id"):
+        db.mark_agent_owner_notification_delivered(0, delivered_at=1.0)
+    with pytest.raises(ValueError, match="invalid_delivered_at"):
+        db.mark_agent_owner_notification_delivered(1, delivered_at=0.0)
+
+
+def test_mark_agent_owner_notification_delivered_rejects_repeated_delivery(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_agent_dm_session(_agent_dm_session())
+    inserted = db.insert_agent_owner_notification(_agent_owner_notification())
+
+    db.mark_agent_owner_notification_delivered(
+        inserted.notification_id,
+        delivered_at=1004.0,
+    )
+
+    with pytest.raises(ValueError, match="notification_not_queued"):
+        db.mark_agent_owner_notification_delivered(
+            inserted.notification_id,
+            delivered_at=1005.0,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Agent DM messages
 # ---------------------------------------------------------------------------
 
@@ -2098,7 +2358,7 @@ def test_trim_agent_dm_messages_supports_manual_windowing(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v1 -> v7
+# Migration v1 -> v8
 # ---------------------------------------------------------------------------
 
 
@@ -2108,7 +2368,7 @@ def test_migrates_v1_schema_with_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 7
+    assert db.schema_version() == 8
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v1")
     assert task is not None
@@ -2129,7 +2389,7 @@ def test_migrates_v1_schema_without_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 7
+    assert db.schema_version() == 8
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(7.5)
 
@@ -2167,7 +2427,7 @@ def test_v1_migration_adds_autoincrement_id_to_task_history(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v2 -> v7
+# Migration v2 -> v8
 # ---------------------------------------------------------------------------
 
 
@@ -2177,7 +2437,7 @@ def test_migrates_v2_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 7
+    assert db.schema_version() == 8
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v2")
     assert task is not None
@@ -2202,7 +2462,7 @@ def test_v2_migration_adds_project_tables(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v3 -> v7
+# Migration v3 -> v8
 # ---------------------------------------------------------------------------
 
 
@@ -2212,7 +2472,7 @@ def test_migrates_v3_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 7
+    assert db.schema_version() == 8
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(9.5)
     task = db.get_task("task-v3")
@@ -2235,7 +2495,7 @@ def test_v3_migration_adds_project_runtime_bindings_table(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v4 -> v7
+# Migration v4 -> v8
 # ---------------------------------------------------------------------------
 
 
@@ -2245,7 +2505,7 @@ def test_migrates_v4_schema_to_v5_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 7
+    assert db.schema_version() == 8
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(10.5)
     task = db.get_task("task-v4")
@@ -2265,7 +2525,7 @@ def test_v4_migration_adds_task_history_project_id_column(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v5 -> v7
+# Migration v5 -> v8
 # ---------------------------------------------------------------------------
 
 
@@ -2276,7 +2536,7 @@ def test_migrates_v5_schema_to_v6_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 7
+    assert db.schema_version() == 8
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -2301,7 +2561,7 @@ def test_v5_migration_adds_agent_dm_sessions_table(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v6 -> v7
+# Migration v6 -> v8
 # ---------------------------------------------------------------------------
 
 
@@ -2312,7 +2572,7 @@ def test_migrates_v6_schema_to_v7_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 7
+    assert db.schema_version() == 8
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -2337,3 +2597,51 @@ def test_v6_migration_adds_agent_dm_messages_table(tmp_path: Path):
     StateDB(db_path)
 
     assert "agent_dm_messages" in _table_names(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Migration v7 -> v8
+# ---------------------------------------------------------------------------
+
+
+def test_migrates_v7_schema_to_v8_and_preserves_existing_data(tmp_path: Path):
+    db_path = tmp_path / "v7.db"
+    repo = _git_repo(tmp_path, "v7-repo")
+    _build_v7_db(db_path, repo)
+
+    db = StateDB(db_path)
+
+    assert db.schema_version() == 8
+    assert db.get_tier(1) == "STANDARD"
+    assert db.get_budget(1) == pytest.approx(11.5)
+    task = db.get_task("task-v5")
+    assert task is not None
+    assert task.branch == "feature/task-v5"
+    assert task.project_id == "alpha_project"
+    assert db.get_project("alpha_project") == _project()
+    assert db.get_project_policy("alpha_project") == _policy()
+    assert db.list_project_memberships("alpha_project") == [_membership()]
+    assert db.get_project_chat_binding("alpha_project") == _binding()
+    assert db.get_project_runtime_binding("alpha_project") == _runtime_binding(repo)
+    assert db.get_agent_dm_session(101, "alpha_project", "writer_agent") == (
+        _agent_dm_session()
+    )
+    assert db.list_agent_dm_messages(101, "alpha_project", "writer_agent") == (
+        _agent_dm_message(body="Need a draft"),
+    )
+    assert db.list_queued_agent_owner_notifications(
+        101,
+        "alpha_project",
+        "writer_agent",
+        "writer_agent",
+    ) == ()
+
+
+def test_v7_migration_adds_agent_owner_notifications_table(tmp_path: Path):
+    db_path = tmp_path / "v7-notifications.db"
+    repo = _git_repo(tmp_path, "v7-notifications-repo")
+    _build_v7_db(db_path, repo)
+
+    StateDB(db_path)
+
+    assert "agent_owner_notifications" in _table_names(db_path)

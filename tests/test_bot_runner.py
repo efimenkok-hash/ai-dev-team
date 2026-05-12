@@ -8,6 +8,10 @@ import pytest
 from core.agent_dm_disambiguation import AgentDmDisambiguationService
 from core.agent_dm_models import AgentDmSession
 from core.agent_dm_reply import AgentDmSingleReplyService
+from core.agent_owner_notifications import (
+    AgentOwnerNotificationRequest,
+    AgentOwnerNotificationService,
+)
 from core.agent_personas import default_registry
 from core.bot_commands import (
     BotCommand,
@@ -3485,6 +3489,235 @@ def test_build_bridge_from_env_wires_contextual_secondary_owner_dm_reply(
     assert "Первый вопрос owner" in content
     assert "Первый ответ writer." in content
     assert "Второй вопрос owner" in content
+
+
+def test_build_bridge_from_env_drains_queued_writer_notifications_before_current_reply(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    ProjectRegistry(db).register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=True),
+        )
+    )
+    db.set_tier(101, "STANDARD", last_changed_at=1.0)
+    db.upsert_agent_dm_session(
+        AgentDmSession(
+            owner_user_id=101,
+            project_id="alpha_project",
+            agent_role="writer_agent",
+            thread_bot_role="writer_agent",
+            dm_chat_id=101,
+            status="active",
+            created_at=10.0,
+            last_interaction_at=20.0,
+        )
+    )
+    notification_service = AgentOwnerNotificationService(db, clock=lambda: 1000.0)
+    dispatch_result = notification_service.dispatch_or_queue(
+        AgentOwnerNotificationRequest(
+            owner_user_id=101,
+            project_id="alpha_project",
+            agent_role="writer_agent",
+            thread_bot_role="writer_agent",
+            body="Отложенное уведомление writer.",
+        )
+    )
+    assert dispatch_result.status == "direct_dm_ready"
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="101",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
+    send, captured = _captured_send()
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(  # type: ignore[method-assign]
+        return_value=_llm_response("Текущий ответ writer.")
+    )
+
+    with patch("core.bot_runner.build_dispatcher_from_env", return_value=dispatcher):
+        bridge = build_bridge_from_env(env, send_callable=send)
+
+    result = bridge.handle(
+        _direct_dm_msg(
+            text="Продолжаем обсуждение?",
+            project_id=None,
+            project_slug=None,
+            project_context_source="none",
+            project_context_reason="owner_dm_requires_explicit_project_chat",
+        )
+    )
+
+    assert result.handled is True
+    assert [envelope.text for envelope in captured] == [
+        "Программист: Отложенное уведомление writer.",
+        "Программист: Текущий ответ writer.",
+    ]
+    assert db.list_queued_agent_owner_notifications(
+        101,
+        "alpha_project",
+        "writer_agent",
+        "writer_agent",
+    ) == ()
+    assert [message.body for message in db.list_agent_dm_messages(
+        101,
+        "alpha_project",
+        "writer_agent",
+    )] == [
+        "Отложенное уведомление writer.",
+        "Продолжаем обсуждение?",
+        "Текущий ответ writer.",
+    ]
+
+
+def test_build_bridge_from_env_first_explicit_open_dm_flushes_queued_notification(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=True),
+        )
+    )
+    registry.register_project(
+        ProjectSnapshot(
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+            ),
+            policy=_policy(
+                project_id="beta_project",
+                allow_agent_dm=True,
+            ),
+        )
+    )
+    db.set_tier(101, "STANDARD", last_changed_at=1.0)
+    notification_service = AgentOwnerNotificationService(db, clock=lambda: 1050.0)
+    dispatch_result = notification_service.dispatch_or_queue(
+        AgentOwnerNotificationRequest(
+            owner_user_id=101,
+            project_id="alpha_project",
+            agent_role="writer_agent",
+            thread_bot_role="writer_agent",
+            body="Очередное уведомление до открытия DM.",
+        )
+    )
+    assert dispatch_result.status == "queued_requires_coordinator"
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="101",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
+    send, captured = _captured_send()
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(  # type: ignore[method-assign]
+        return_value=_llm_response("Текущий ответ writer.")
+    )
+
+    with patch("core.bot_runner.build_dispatcher_from_env", return_value=dispatcher):
+        bridge = build_bridge_from_env(env, send_callable=send)
+
+    result = bridge.handle(
+        IncomingMessage(
+            chat_id=101,
+            user_id=101,
+            message_id=1,
+            text="project alpha-project: открываю личку",
+            incoming_bot_role="writer_agent",
+        )
+    )
+
+    assert result.handled is True
+    assert [message.text for message in captured] == [
+        "Программист: Очередное уведомление до открытия DM.",
+        "Программист: Текущий ответ writer.",
+    ]
+    session = db.get_agent_dm_session(101, "alpha_project", "writer_agent")
+    assert session is not None
+    assert session.status == "active"
+    assert db.list_queued_agent_owner_notifications(
+        101,
+        "alpha_project",
+        "writer_agent",
+        "writer_agent",
+    ) == ()
+    assert [message.body for message in db.list_agent_dm_messages(
+        101,
+        "alpha_project",
+        "writer_agent",
+    )] == [
+        "Очередное уведомление до открытия DM.",
+        "открываю личку",
+        "Текущий ответ writer.",
+    ]
+    assert db.list_agent_dm_messages(101, "beta_project", "writer_agent") == ()
+
+
+def test_build_bridge_from_env_coordinator_dm_does_not_flush_writer_queue(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    ProjectRegistry(db).register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=True),
+        )
+    )
+    db.set_tier(101, "STANDARD", last_changed_at=1.0)
+    db.upsert_agent_dm_session(
+        AgentDmSession(
+            owner_user_id=101,
+            project_id="alpha_project",
+            agent_role="writer_agent",
+            thread_bot_role="writer_agent",
+            dm_chat_id=101,
+            status="active",
+            created_at=10.0,
+            last_interaction_at=20.0,
+        )
+    )
+    notification_service = AgentOwnerNotificationService(db, clock=lambda: 1100.0)
+    queued = notification_service.dispatch_or_queue(
+        AgentOwnerNotificationRequest(
+            owner_user_id=101,
+            project_id="alpha_project",
+            agent_role="writer_agent",
+            thread_bot_role="writer_agent",
+            body="Отложенное уведомление writer.",
+        )
+    ).notification
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="101",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
+    send, captured = _captured_send()
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(return_value=_llm_response())  # type: ignore[method-assign]
+
+    with patch("core.bot_runner.build_dispatcher_from_env", return_value=dispatcher):
+        bridge = build_bridge_from_env(env, send_callable=send)
+
+    result = bridge.handle(
+        _direct_dm_msg(
+            incoming_bot_role="coordinator_agent",
+            text="coord path",
+        )
+    )
+
+    assert result.handled is True
+    assert len(captured) == 1
+    assert captured[0].text.startswith("Координатор:")
+    assert db.list_queued_agent_owner_notifications(
+        101,
+        "alpha_project",
+        "writer_agent",
+        "writer_agent",
+    ) == (queued,)
 
 
 def test_build_bridge_from_env_multi_project_writer_dm_explicit_slug_resolves_without_pipeline_guessing(
