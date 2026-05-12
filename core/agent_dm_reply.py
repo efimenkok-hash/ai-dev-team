@@ -1,14 +1,15 @@
 """
 core/agent_dm_reply.py
 
-Typed single-shot owner-agent DM reply service.
+Typed owner-agent DM reply service.
 
-Scope for roadmap step E4.3:
+Scope through roadmap step E4.4:
 1. Activate a direct owner-agent DM reply path only for secondary private
    agent-bot threads with single-project owner-DM fallback.
-2. Keep the flow strictly single-shot: no transcript-aware prompts, no
-   hidden pipeline execution, no task-history side effects.
-3. Persist session activation plus the owner/agent text exchange in StateDB
+2. Keep the flow non-pipeline: no hidden task execution, no task-history
+   side effects, no project-runtime work.
+3. Build contextual prompts from persistent owner-agent transcript windows.
+4. Persist session activation plus the owner/agent text exchange in StateDB
    only after a successful direct reply.
 """
 
@@ -17,8 +18,9 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
+from core.agent_dm_context import AgentDmContextService, AgentDmPromptContext
 from core.agent_dm_models import AgentDmMessage, AgentDmSession
 from core.agent_personas import PersonaRegistry
 from core.coordinator_role import COORDINATOR_ROLE
@@ -35,7 +37,14 @@ from core.state_db import StateDB
 from core.telegram_bridge import BridgeReply, IncomingMessage
 
 _ROLE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_VALID_PROJECT_CONTEXT_SOURCES = frozenset({"owner_dm_single_project"})
+_VALID_PROJECT_CONTEXT_SOURCES = frozenset(
+    {
+        "owner_dm_single_project",
+        "agent_dm_explicit_project",
+        "agent_dm_active_session",
+        "agent_dm_single_candidate",
+    }
+)
 
 
 def _normalize_role(value: str, *, field_name: str) -> str:
@@ -225,6 +234,7 @@ class AgentDmSingleReplyService:
         personas: PersonaRegistry,
         clock: Callable[[], float] | None = None,
         tier_registry: TierRegistry | None = None,
+        context_service: AgentDmContextService | None = None,
     ) -> None:
         if dispatcher is not None and not isinstance(dispatcher, LLMDispatcher):
             raise ValueError(
@@ -246,12 +256,25 @@ class AgentDmSingleReplyService:
                 "invalid_tier_registry_type:"
                 f"{type(tier_registry).__name__}"
             )
+        if (
+            context_service is not None
+            and not isinstance(context_service, AgentDmContextService)
+        ):
+            raise ValueError(
+                "invalid_agent_dm_context_service_type:"
+                f"{type(context_service).__name__}"
+            )
         self._dispatcher = dispatcher
         self._state_db = state_db
         self._personas = personas
         self._clock = clock if clock is not None else _default_clock
         self._tier_registry = (
             tier_registry if tier_registry is not None else default_tier_registry()
+        )
+        self._context_service = (
+            context_service
+            if context_service is not None
+            else AgentDmContextService(state_db)
         )
         self._owner_dm_routing = OwnerDmRoutingService()
 
@@ -264,7 +287,7 @@ class AgentDmSingleReplyService:
             return False
         if msg.incoming_bot_role == COORDINATOR_ROLE:
             return False
-        if msg.project_context_source != "owner_dm_single_project":
+        if msg.project_context_source not in _VALID_PROJECT_CONTEXT_SOURCES:
             return False
         if msg.text is None or not msg.text.strip():
             return False
@@ -322,7 +345,8 @@ class AgentDmSingleReplyService:
         except KeyError as exc:
             raise ValueError(f"unknown_tier:{tier_name.strip()}") from exc
 
-        request = self._build_request(context)
+        prompt_context = self._context_service.build_prompt_context(context)
+        request = self._build_request(prompt_context)
         try:
             response = self._dispatcher.dispatch(request, tier)
         except LLMDispatchError as exc:
@@ -387,32 +411,20 @@ class AgentDmSingleReplyService:
 
     def _build_request(
         self,
-        context: AgentDmSingleReplyContext,
+        prompt_context: AgentDmPromptContext,
     ) -> LLMRequest:
-        persona = self._personas.for_role(context.agent_role)
-        project = context.snapshot.project
-        messages = (
-            {
-                "role": "system",
-                "content": (
-                    "Ты отвечаешь owner'у в личке как конкретный агент AI Office.\n"
-                    f"Твоя роль: {persona.title} ({context.agent_role}).\n"
-                    f"Проект: {project.slug} ({project.project_id}).\n"
-                    "Это single-shot консультационный ответ вне project pipeline.\n"
-                    "Не утверждай, что уже изменил код, запустил тесты, создал "
-                    "ветку, сделал commit/push или выполнил проектную задачу.\n"
-                    "Если owner просит реальное выполнение работы, честно скажи, "
-                    "что execution идёт через coordinator / project chat.\n"
-                    "Отвечай по-русски, коротко, по делу и без подписи имени."
-                ),
-            },
-            {
-                "role": "user",
-                "content": context.owner_text,
-            },
-        )
+        persona = self._personas.for_role(prompt_context.agent_role)
+        base_messages = self._context_service.build_dispatch_messages(prompt_context)
+        system_message = {
+            "role": base_messages[0]["role"],
+            "content": (
+                f"{base_messages[0]['content']}\n"
+                f"Persona label: {persona.human_name} / {persona.title}."
+            ),
+        }
+        messages = (system_message, *base_messages[1:])
         return LLMRequest(
-            agent_role=context.agent_role,
+            agent_role=prompt_context.agent_role,
             messages=messages,
             max_tokens=900,
             temperature=0.2,
@@ -424,6 +436,7 @@ class AgentDmSingleReplyService:
         *,
         now: float,
     ) -> AgentDmSession:
+        self._close_other_agent_sessions(context)
         existing = self._state_db.get_agent_dm_session(
             context.owner_user_id,
             context.snapshot.project.project_id,
@@ -442,6 +455,23 @@ class AgentDmSingleReplyService:
         )
         self._state_db.upsert_agent_dm_session(session)
         return session
+
+    def _close_other_agent_sessions(
+        self,
+        context: AgentDmSingleReplyContext,
+    ) -> None:
+        for session in self._state_db.list_agent_dm_sessions_for_owner(
+            context.owner_user_id
+        ):
+            if session.agent_role != context.agent_role:
+                continue
+            if session.project_id == context.snapshot.project.project_id:
+                continue
+            if session.status == "closed":
+                continue
+            self._state_db.upsert_agent_dm_session(
+                replace(session, status="closed")
+            )
 
     def _format_unavailable_body(
         self,

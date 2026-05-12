@@ -76,6 +76,13 @@ DEFAULT_GENERIC_ACK = "👋 Принял задачу. Сейчас разбер
 _PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ROLE_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PROJECT_CONTEXT_BLOCKED_COMMANDS = frozenset({"push", "pr"})
+_DIRECT_AGENT_DM_PROJECT_CONTEXT_SOURCES = frozenset(
+    {
+        "agent_dm_explicit_project",
+        "agent_dm_active_session",
+        "agent_dm_single_candidate",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -132,7 +139,11 @@ class IncomingMessage:
             self.project_context_source is not None
             and (
                 not isinstance(self.project_context_source, str)
-                or self.project_context_source not in VALID_PROJECT_CONTEXT_SOURCES
+                or self.project_context_source
+                not in (
+                    VALID_PROJECT_CONTEXT_SOURCES
+                    | _DIRECT_AGENT_DM_PROJECT_CONTEXT_SOURCES
+                )
             )
         ):
             raise ValueError(
@@ -171,6 +182,7 @@ class IncomingMessage:
         if self.project_context_source in {
             "bound_chat",
             "owner_dm_single_project",
+            *_DIRECT_AGENT_DM_PROJECT_CONTEXT_SOURCES,
         } and self.project_id is None:
             raise ValueError(
                 "resolved_project_context_requires_project_id"
@@ -549,6 +561,16 @@ class TelegramBridge:
             return False
         if msg.project_context_source != "none":
             return False
+        if (
+            msg.project_context_reason
+            == "owner_dm_requires_explicit_project_chat"
+            and msg.incoming_bot_role is not None
+            and msg.incoming_bot_role != COORDINATOR_ROLE
+            and self._owner_dm_routing.is_owner_dm_message(msg)
+        ):
+            # Secondary owner DMs may resolve project context later via
+            # explicit slug or one active session; do not block them here.
+            return False
         return _message_requires_project_context(msg)
 
     def _format_missing_project_context_message(self, reason: str | None) -> str:
@@ -835,7 +857,7 @@ class TelegramBridge:
         *,
         sender_role: str = COORDINATOR_ROLE,
         incoming: IncomingMessage | None = None,
-    ) -> None:
+    ) -> bool:
         """Calls send() once. Suppresses transport errors so handle() stays total."""
         envelope = OutgoingEnvelope(
             message=out,
@@ -845,8 +867,10 @@ class TelegramBridge:
         try:
             self._send_envelope(envelope)
             ctx.sent_count += 1
+            return True
         except Exception as exc:
             ctx.notes.append(f"send_failed:{type(exc).__name__}:{exc}")
+            return False
 
     def _resolve_delivery_role(
         self,

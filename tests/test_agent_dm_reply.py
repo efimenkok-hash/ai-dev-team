@@ -88,6 +88,35 @@ def _msg(**overrides) -> IncomingMessage:
     return IncomingMessage(**data)
 
 
+def _message(**overrides) -> AgentDmMessage:
+    data = {
+        "owner_user_id": OWNER_ID,
+        "project_id": "alpha_project",
+        "agent_role": "writer_agent",
+        "sender_kind": "owner",
+        "sender_role": "owner",
+        "body": "Owner says hi",
+        "created_at": 10.0,
+    }
+    data.update(overrides)
+    return AgentDmMessage(**data)
+
+
+def _session(**overrides) -> AgentDmSession:
+    data = {
+        "owner_user_id": OWNER_ID,
+        "project_id": "alpha_project",
+        "agent_role": "writer_agent",
+        "thread_bot_role": "writer_agent",
+        "dm_chat_id": OWNER_ID,
+        "status": "active",
+        "created_at": 10.0,
+        "last_interaction_at": 10.0,
+    }
+    data.update(overrides)
+    return AgentDmSession(**data)
+
+
 def _response(text: str = "Я бы начал с тонкого HTTP-слоя.") -> LLMResponse:
     return LLMResponse(
         text=text,
@@ -129,6 +158,11 @@ def _service(
     )
 
 
+def _request_content(dispatcher: LLMDispatcher, call_index: int = -1) -> str:
+    request = dispatcher.dispatch.call_args_list[call_index].args[0]
+    return "\n".join(message["content"] for message in request.messages)
+
+
 def test_context_happy_path():
     ctx = AgentDmSingleReplyContext(
         snapshot=_snapshot(),
@@ -143,6 +177,31 @@ def test_context_happy_path():
     assert ctx.agent_role == "writer_agent"
     assert ctx.thread_bot_role == "writer_agent"
     assert ctx.owner_text == "Подскажи по API"
+
+
+@pytest.mark.parametrize(
+    "project_context_source",
+    [
+        "owner_dm_single_project",
+        "agent_dm_explicit_project",
+        "agent_dm_active_session",
+        "agent_dm_single_candidate",
+    ],
+)
+def test_context_accepts_resolved_agent_dm_context_sources(
+    project_context_source: str,
+):
+    ctx = AgentDmSingleReplyContext(
+        snapshot=_snapshot(),
+        owner_user_id=OWNER_ID,
+        dm_chat_id=OWNER_ID,
+        agent_role="writer_agent",
+        thread_bot_role="writer_agent",
+        owner_text="Подскажи по API",
+        project_context_source=project_context_source,
+    )
+
+    assert ctx.project_context_source == project_context_source
 
 
 def test_context_is_frozen():
@@ -269,6 +328,27 @@ def test_secondary_private_owner_dm_is_candidate(tmp_path):
     assert service.is_direct_reply_candidate(_msg()) is True
 
 
+@pytest.mark.parametrize(
+    "project_context_source",
+    [
+        "agent_dm_explicit_project",
+        "agent_dm_active_session",
+        "agent_dm_single_candidate",
+    ],
+)
+def test_new_resolved_agent_dm_sources_are_direct_reply_candidates(
+    tmp_path,
+    project_context_source: str,
+):
+    service = _service(_db(tmp_path))
+    assert (
+        service.is_direct_reply_candidate(
+            _msg(project_context_source=project_context_source)
+        )
+        is True
+    )
+
+
 def test_coordinator_dm_is_not_candidate(tmp_path):
     service = _service(_db(tmp_path))
     assert (
@@ -380,6 +460,55 @@ def test_reply_once_reopens_closed_session(tmp_path):
     assert result.session.last_interaction_at == 40.0
 
 
+def test_reply_once_closes_other_agent_sessions_for_same_owner_and_agent(tmp_path):
+    db = _db(tmp_path)
+    snapshot = _register_snapshot(db)
+    registry = ProjectRegistry(db)
+    registry.register_project(
+        ProjectSnapshot(
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+            ),
+            policy=_policy(project_id="beta_project"),
+        )
+    )
+    db.upsert_agent_dm_session(
+        AgentDmSession(
+            owner_user_id=OWNER_ID,
+            project_id="beta_project",
+            agent_role="writer_agent",
+            thread_bot_role="writer_agent",
+            dm_chat_id=OWNER_ID,
+            status="active",
+            created_at=5.0,
+            last_interaction_at=6.0,
+        )
+    )
+    service = _service(
+        db,
+        dispatcher=_dispatcher("Остаюсь на alpha."),
+        clock=lambda: 50.0,
+    )
+
+    result = service.reply_once(
+        service.build_context(
+            _msg(project_context_source="agent_dm_explicit_project"),
+            snapshot,
+        ),
+        tier_name="STANDARD",
+    )
+
+    assert result.session.project_id == "alpha_project"
+    selected = db.get_agent_dm_session(OWNER_ID, "alpha_project", "writer_agent")
+    other = db.get_agent_dm_session(OWNER_ID, "beta_project", "writer_agent")
+    assert selected is not None
+    assert selected.status == "active"
+    assert other is not None
+    assert other.status == "closed"
+
+
 def test_reply_result_type_is_consistent(tmp_path):
     db = _db(tmp_path)
     snapshot = _register_snapshot(db)
@@ -399,15 +528,111 @@ def test_reply_result_type_is_consistent(tmp_path):
     assert result.reply.persona_role == "writer_agent"
 
 
-def test_reply_once_prompt_does_not_include_previous_transcript(tmp_path):
+def test_second_exchange_uses_prior_transcript_in_dispatch_prompt(tmp_path):
     db = _db(tmp_path)
     snapshot = _register_snapshot(db)
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(  # type: ignore[method-assign]
+        side_effect=[
+            _response("Первый ответ агента"),
+            _response("Второй ответ агента"),
+        ]
+    )
+    service = _service(db, dispatcher=dispatcher, clock=lambda: 20.0)
+
+    service.reply_once(
+        service.build_context(_msg(text="Первый вопрос owner"), snapshot),
+        tier_name="STANDARD",
+    )
+    service.reply_once(
+        service.build_context(_msg(text="Второй вопрос owner"), snapshot),
+        tier_name="STANDARD",
+    )
+
+    content = _request_content(dispatcher, 1)
+    assert "alpha_project" in content
+    assert "alpha-project" in content
+    assert "Первый вопрос owner" in content
+    assert "Первый ответ агента" in content
+    assert "Второй вопрос owner" in content
+    assert content.count("Второй вопрос owner") == 1
+
+
+def test_third_exchange_preserves_conversation_continuity(tmp_path):
+    db = _db(tmp_path)
+    snapshot = _register_snapshot(db)
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(  # type: ignore[method-assign]
+        side_effect=[
+            _response("Ответ 1"),
+            _response("Ответ 2"),
+            _response("Ответ 3"),
+        ]
+    )
+    service = _service(db, dispatcher=dispatcher, clock=lambda: 30.0)
+
+    service.reply_once(
+        service.build_context(_msg(text="Вопрос 1"), snapshot),
+        tier_name="STANDARD",
+    )
+    service.reply_once(
+        service.build_context(_msg(text="Вопрос 2"), snapshot),
+        tier_name="STANDARD",
+    )
+    service.reply_once(
+        service.build_context(_msg(text="Вопрос 3"), snapshot),
+        tier_name="STANDARD",
+    )
+
+    content = _request_content(dispatcher, 2)
+    assert "Вопрос 1" in content
+    assert "Ответ 1" in content
+    assert "Вопрос 2" in content
+    assert "Ответ 2" in content
+    assert "Вопрос 3" in content
+    messages = db.list_agent_dm_messages(OWNER_ID, "alpha_project", "writer_agent")
+    assert len(messages) == 6
+    assert [message.sender_kind for message in messages] == [
+        "owner",
+        "agent",
+        "owner",
+        "agent",
+        "owner",
+        "agent",
+    ]
+
+
+def test_transcript_from_other_owner_project_agent_does_not_leak(tmp_path):
+    db = _db(tmp_path)
+    snapshot = _register_snapshot(db)
+    registry = ProjectRegistry(db)
+    registry.register_project(
+        ProjectSnapshot(
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=202,
+            ),
+            policy=_policy(project_id="beta_project"),
+        )
+    )
+    db.upsert_agent_dm_session(_session())
+    db.record_agent_dm_message(_message(body="TARGET OWNER", created_at=10.0))
+    db.record_agent_dm_message(
+        _message(
+            sender_kind="agent",
+            sender_role="writer_agent",
+            body="TARGET AGENT",
+            created_at=11.0,
+        )
+    )
     db.upsert_agent_dm_session(
         AgentDmSession(
             owner_user_id=OWNER_ID,
             project_id="alpha_project",
-            agent_role="writer_agent",
-            thread_bot_role="writer_agent",
+            agent_role="reviewer_agent",
+            thread_bot_role="reviewer_agent",
             dm_chat_id=OWNER_ID,
             status="active",
             created_at=10.0,
@@ -418,41 +643,73 @@ def test_reply_once_prompt_does_not_include_previous_transcript(tmp_path):
         AgentDmMessage(
             owner_user_id=OWNER_ID,
             project_id="alpha_project",
+            agent_role="reviewer_agent",
+            sender_kind="agent",
+            sender_role="reviewer_agent",
+            body="LEAK OTHER AGENT",
+            created_at=12.0,
+        )
+    )
+    db.upsert_agent_dm_session(
+        AgentDmSession(
+            owner_user_id=202,
+            project_id="beta_project",
+            agent_role="writer_agent",
+            thread_bot_role="writer_agent",
+            dm_chat_id=202,
+            status="active",
+            created_at=10.0,
+            last_interaction_at=10.0,
+        )
+    )
+    db.record_agent_dm_message(
+        AgentDmMessage(
+            owner_user_id=202,
+            project_id="beta_project",
             agent_role="writer_agent",
             sender_kind="owner",
             sender_role="owner",
-            body="OLD OWNER CONTEXT MUST NOT APPEAR",
-            created_at=11.0,
+            body="LEAK OTHER PROJECT",
+            created_at=13.0,
+        )
+    )
+    db.upsert_agent_dm_session(
+        AgentDmSession(
+            owner_user_id=OWNER_ID,
+            project_id="alpha_project",
+            agent_role="coordinator_agent",
+            thread_bot_role="coordinator_agent",
+            dm_chat_id=OWNER_ID,
+            status="active",
+            created_at=10.0,
+            last_interaction_at=10.0,
         )
     )
     db.record_agent_dm_message(
         AgentDmMessage(
             owner_user_id=OWNER_ID,
             project_id="alpha_project",
-            agent_role="writer_agent",
+            agent_role="coordinator_agent",
             sender_kind="agent",
-            sender_role="writer_agent",
-            body="OLD AGENT CONTEXT MUST NOT APPEAR",
-            created_at=12.0,
+            sender_role="coordinator_agent",
+            body="LEAK COORDINATOR",
+            created_at=14.0,
         )
     )
-    dispatcher = _dispatcher("Сфокусируйся на текущем сообщении.")
-    service = _service(
-        db,
-        dispatcher=dispatcher,
-        clock=lambda: 20.0,
-    )
+    dispatcher = _dispatcher("Контекстный ответ без утечки.")
+    service = _service(db, dispatcher=dispatcher, clock=lambda: 20.0)
 
     service.reply_once(
-        service.build_context(_msg(text="Только новый вопрос"), snapshot),
+        service.build_context(_msg(text="Текущий вопрос owner"), snapshot),
         tier_name="STANDARD",
     )
 
-    request = dispatcher.dispatch.call_args.args[0]
-    content = "\n".join(message["content"] for message in request.messages)
-    assert "OLD OWNER CONTEXT MUST NOT APPEAR" not in content
-    assert "OLD AGENT CONTEXT MUST NOT APPEAR" not in content
-    assert "Только новый вопрос" in content
+    content = _request_content(dispatcher)
+    assert "TARGET OWNER" in content
+    assert "TARGET AGENT" in content
+    assert "LEAK OTHER AGENT" not in content
+    assert "LEAK OTHER PROJECT" not in content
+    assert "LEAK COORDINATOR" not in content
 
 
 def test_missing_dispatcher_returns_truthful_unavailable_reply_without_side_effects(

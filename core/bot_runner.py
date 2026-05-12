@@ -38,9 +38,11 @@ CONTRACTS:
 import os
 import threading
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from core.agent_dm_disambiguation import AgentDmDisambiguationService
 from core.agent_dm_reply import AgentDmSingleReplyService
 from core.agent_personas import PersonaRegistry, default_registry
 from core.background_runner import BackgroundTaskRunner
@@ -2248,27 +2250,7 @@ def wrap_task_handler_with_agent_dm_single_reply(
 
     def _handle(text: str, msg: IncomingMessage) -> BridgeReply | None:
         try:
-            candidate_msg = (
-                msg
-                if msg.text is not None and msg.text.strip() == text.strip()
-                else IncomingMessage(
-                    chat_id=msg.chat_id,
-                    user_id=msg.user_id,
-                    message_id=msg.message_id,
-                    text=text,
-                    voice_bytes=msg.voice_bytes,
-                    voice_mime=msg.voice_mime,
-                    voice_duration_seconds=msg.voice_duration_seconds,
-                    photo_bytes=msg.photo_bytes,
-                    photo_mime=msg.photo_mime,
-                    timestamp=msg.timestamp,
-                    project_id=msg.project_id,
-                    project_slug=msg.project_slug,
-                    project_context_source=msg.project_context_source,
-                    project_context_reason=msg.project_context_reason,
-                    incoming_bot_role=msg.incoming_bot_role,
-                )
-            )
+            candidate_msg = _with_task_handler_text(msg, text)
         except ValueError:
             return base_handler(text, msg)
         if not service.is_direct_reply_candidate(candidate_msg):
@@ -2319,6 +2301,72 @@ def wrap_task_handler_with_agent_dm_single_reply(
         return direct_result.reply
 
     return _handle
+
+
+def wrap_task_handler_with_agent_dm_disambiguation(
+    base_handler: TaskHandler,
+    *,
+    service: AgentDmDisambiguationService,
+) -> TaskHandler:
+    if not callable(base_handler):
+        raise ValueError("base_handler_not_callable")
+    if not isinstance(service, AgentDmDisambiguationService):
+        raise ValueError(
+            "invalid_agent_dm_disambiguation_service:"
+            f"{type(service).__name__}"
+        )
+
+    def _handle(text: str, msg: IncomingMessage) -> BridgeReply | None:
+        try:
+            candidate_msg = _with_task_handler_text(msg, text)
+        except ValueError:
+            return base_handler(text, msg)
+        if not service.is_secondary_owner_dm_candidate(candidate_msg):
+            return base_handler(text, msg)
+
+        resolution = service.resolve(candidate_msg)
+        if resolution.status == "not_applicable":
+            return base_handler(text, msg)
+        if resolution.status == "ambiguous":
+            return service.format_ambiguous_reply(
+                resolution,
+                agent_role=candidate_msg.incoming_bot_role or "",
+            )
+        if resolution.snapshot is None:
+            raise ValueError("resolved_agent_dm_disambiguation_missing_snapshot")
+
+        resolved_context_source = {
+            "owner_dm_single_project": "owner_dm_single_project",
+            "explicit_project_slug": "agent_dm_explicit_project",
+            "active_agent_session": "agent_dm_active_session",
+            "single_candidate": "agent_dm_single_candidate",
+        }.get(resolution.resolution_source)
+        if resolved_context_source is None:
+            raise ValueError(
+                "unsupported_resolved_agent_dm_source:"
+                f"{resolution.resolution_source}"
+            )
+        resolved_msg = replace(
+            candidate_msg,
+            text=resolution.normalized_owner_text,
+            project_id=resolution.snapshot.project.project_id,
+            project_slug=resolution.snapshot.project.slug,
+            project_context_source=resolved_context_source,
+            project_context_reason=None,
+        )
+        return base_handler(resolution.normalized_owner_text, resolved_msg)
+
+    return _handle
+
+
+def _with_task_handler_text(
+    msg: IncomingMessage,
+    text: str,
+) -> IncomingMessage:
+    normalized_text = text.strip()
+    if msg.text is not None and msg.text.strip() == normalized_text:
+        return msg
+    return replace(msg, text=text)
 
 
 # ---------------------------------------------------------------------------
@@ -2505,6 +2553,11 @@ def build_bridge_from_env(
         )
     )
     if state_db is not None:
+        project_registry = ProjectRegistry(state_db)
+        disambiguation_service = AgentDmDisambiguationService(
+            state_db=state_db,
+            project_registry=project_registry,
+        )
         task_handler = wrap_task_handler_with_agent_dm_single_reply(
             task_handler,
             service=AgentDmSingleReplyService(
@@ -2514,7 +2567,11 @@ def build_bridge_from_env(
                 tier_registry=tier_store.registry,
             ),
             tier_store=tier_store,
-            project_registry=ProjectRegistry(state_db),
+            project_registry=project_registry,
+        )
+        task_handler = wrap_task_handler_with_agent_dm_disambiguation(
+            task_handler,
+            service=disambiguation_service,
         )
     return TelegramBridge(
         owner_chat_ids=owner_chat_ids,
