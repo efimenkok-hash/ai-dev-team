@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from core.coordinator_role import COORDINATOR_ROLE
 from core.multi_bot_runtime import BotIdentity, MultiBotRuntimeSpec
+from core.owner_dm_routing import OwnerDmRoutingService
 from core.telegram_bridge import BridgeResult, IncomingMessage, TelegramBridge
 
 
@@ -40,6 +41,7 @@ class MultiBotBridge:
                 f"!="
                 f"{self.runtime_spec.primary_bot.agent_role}"
             )
+        object.__setattr__(self, "_owner_dm_routing", OwnerDmRoutingService())
 
     @property
     def primary_role(self) -> str:
@@ -73,8 +75,18 @@ class MultiBotBridge:
         msg: IncomingMessage,
     ) -> BridgeResult:
         identity = self.resolve_identity(agent_role)
+        delegated_msg = msg
         if identity.agent_role == COORDINATOR_ROLE:
-            return self.primary_bridge.handle(msg)
+            if msg.incoming_bot_role != COORDINATOR_ROLE:
+                delegated_msg = replace(msg, incoming_bot_role=COORDINATOR_ROLE)
+            return self.primary_bridge.handle(delegated_msg)
+        if self._owner_dm_routing.is_owner_dm_message(msg):
+            if msg.incoming_bot_role != identity.agent_role:
+                delegated_msg = replace(
+                    msg,
+                    incoming_bot_role=identity.agent_role,
+                )
+            return self.primary_bridge.handle(delegated_msg)
         return BridgeResult(
             chat_id=getattr(msg, "chat_id", 0),
             handled=False,

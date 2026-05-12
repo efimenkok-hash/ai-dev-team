@@ -92,6 +92,7 @@ from core.orchestrator import (
     reject_injection_markers,
     reject_long_task,
 )
+from core.owner_dm_routing import OwnerDmRoutingService
 from core.progress_emitter import (
     ProgressEmitter,
     ProgressEvent,
@@ -285,6 +286,7 @@ def make_real_task_handler(
     owner_escalation_service = CoordinatorOwnerEscalationService()
     team_proposal_service = CoordinatorTeamProposalService()
     posting_service = ProjectChatPostingService()
+    owner_dm_routing_service = OwnerDmRoutingService()
 
     available_tiers = ", ".join(tier_store.registry.list_names())
 
@@ -327,6 +329,7 @@ def make_real_task_handler(
         owner_task_text: str,
         onboarding_context: ProjectCaptainOnboardingContext | None,
         posting_context: ProjectChatPostingContext | None,
+        owner_dm_delivery_role: str | None,
         pipeline_task_prompt: str,
         initial_artifacts: dict[str, str] | None,
         tier_name: str,
@@ -357,6 +360,7 @@ def make_real_task_handler(
                         chat_id=chat_id,
                         event=evt,
                         posting_context=posting_context,
+                        owner_dm_delivery_role=owner_dm_delivery_role,
                     )
                 )
 
@@ -383,6 +387,7 @@ def make_real_task_handler(
                     _build_system_envelope(
                         chat_id=chat_id,
                         posting_context=posting_context,
+                        owner_dm_delivery_role=owner_dm_delivery_role,
                         text=(
                         f"🌳 worktree готов\n"
                         f"  branch  `{handle.branch}`\n"
@@ -620,6 +625,7 @@ def make_real_task_handler(
     def _fallback_progress_event_envelope(
         chat_id: int,
         event: ProgressEvent,
+        owner_dm_delivery_role: str | None,
     ) -> OutgoingEnvelope:
         return OutgoingEnvelope(
             message=OutgoingMessage(
@@ -627,6 +633,37 @@ def make_real_task_handler(
                 text=_format_event(event),
             ),
             sender_role=COORDINATOR_ROLE,
+            delivery_role=owner_dm_delivery_role,
+        )
+
+    def _resolve_owner_dm_delivery_role(
+        msg: IncomingMessage,
+    ) -> str | None:
+        if msg.project_context_source != "owner_dm_single_project":
+            return None
+        if msg.incoming_bot_role is None:
+            return None
+        if not owner_dm_routing_service.is_owner_dm_message(msg):
+            return None
+        try:
+            context = owner_dm_routing_service.build_context(msg)
+            return owner_dm_routing_service.resolve_delivery_role(
+                context,
+                COORDINATOR_ROLE,
+            )
+        except ValueError:
+            return None
+
+    def _apply_owner_dm_delivery_role(
+        envelope: OutgoingEnvelope,
+        owner_dm_delivery_role: str | None,
+    ) -> OutgoingEnvelope:
+        if owner_dm_delivery_role is None:
+            return envelope
+        return OutgoingEnvelope(
+            message=envelope.message,
+            sender_role=envelope.sender_role,
+            delivery_role=owner_dm_delivery_role,
         )
 
     def _build_event_envelope(
@@ -634,51 +671,97 @@ def make_real_task_handler(
         chat_id: int,
         event: ProgressEvent,
         posting_context: ProjectChatPostingContext | None,
+        owner_dm_delivery_role: str | None,
     ) -> OutgoingEnvelope:
+        if (
+            posting_context is not None
+            and posting_context.context_source == "owner_dm_single_project"
+            and owner_dm_delivery_role is not None
+            and event.kind in {"agent_started", "agent_finished", "agent_failed"}
+        ):
+            if not isinstance(event.agent_role, str) or not event.agent_role.strip():
+                return _fallback_progress_event_envelope(
+                    chat_id,
+                    event,
+                    owner_dm_delivery_role,
+                )
+            return OutgoingEnvelope(
+                message=OutgoingMessage(
+                    chat_id=chat_id,
+                    text=_format_event(event),
+                ),
+                sender_role=event.agent_role,
+                delivery_role=owner_dm_delivery_role,
+            )
         if posting_context is None:
-            return _fallback_progress_event_envelope(chat_id, event)
+            return _fallback_progress_event_envelope(
+                chat_id,
+                event,
+                owner_dm_delivery_role,
+            )
         try:
-            return posting_service.build_event_envelope(posting_context, event)
+            envelope = posting_service.build_event_envelope(posting_context, event)
         except ValueError:
-            return _fallback_progress_event_envelope(chat_id, event)
+            return _fallback_progress_event_envelope(
+                chat_id,
+                event,
+                owner_dm_delivery_role,
+            )
+        return _apply_owner_dm_delivery_role(envelope, owner_dm_delivery_role)
 
     def _build_system_envelope(
         *,
         chat_id: int,
         text: str,
         posting_context: ProjectChatPostingContext | None,
+        owner_dm_delivery_role: str | None,
     ) -> OutgoingEnvelope:
         if posting_context is None:
-            return OutgoingEnvelope(
+            return _apply_owner_dm_delivery_role(
+                OutgoingEnvelope(
                 message=OutgoingMessage(chat_id=chat_id, text=text),
                 sender_role=COORDINATOR_ROLE,
+                ),
+                owner_dm_delivery_role,
             )
         try:
-            return posting_service.build_system_envelope(posting_context, text)
+            envelope = posting_service.build_system_envelope(posting_context, text)
         except ValueError:
-            return OutgoingEnvelope(
+            return _apply_owner_dm_delivery_role(
+                OutgoingEnvelope(
                 message=OutgoingMessage(chat_id=chat_id, text=text),
                 sender_role=COORDINATOR_ROLE,
+                ),
+                owner_dm_delivery_role,
             )
+        return _apply_owner_dm_delivery_role(envelope, owner_dm_delivery_role)
 
     def _build_terminal_envelope(
         *,
         chat_id: int,
         text: str,
         posting_context: ProjectChatPostingContext | None,
+        owner_dm_delivery_role: str | None,
     ) -> OutgoingEnvelope:
         if posting_context is None:
-            return OutgoingEnvelope(
-                message=OutgoingMessage(chat_id=chat_id, text=text),
-                sender_role=COORDINATOR_ROLE,
+            return _apply_owner_dm_delivery_role(
+                OutgoingEnvelope(
+                    message=OutgoingMessage(chat_id=chat_id, text=text),
+                    sender_role=COORDINATOR_ROLE,
+                ),
+                owner_dm_delivery_role,
             )
         try:
-            return posting_service.build_terminal_envelope(posting_context, text)
+            envelope = posting_service.build_terminal_envelope(posting_context, text)
         except ValueError:
-            return OutgoingEnvelope(
-                message=OutgoingMessage(chat_id=chat_id, text=text),
-                sender_role=COORDINATOR_ROLE,
+            return _apply_owner_dm_delivery_role(
+                OutgoingEnvelope(
+                    message=OutgoingMessage(chat_id=chat_id, text=text),
+                    sender_role=COORDINATOR_ROLE,
+                ),
+                owner_dm_delivery_role,
             )
+        return _apply_owner_dm_delivery_role(envelope, owner_dm_delivery_role)
 
     def _fallback_owner_escalation_reply(
         *,
@@ -753,6 +836,7 @@ def make_real_task_handler(
         *,
         project_id: str | None,
         posting_context: ProjectChatPostingContext | None,
+        owner_dm_delivery_role: str | None,
     ) -> Callable[..., None]:
         def _on_complete(handle: TaskHandle, result, error) -> None:
             if error is not None:
@@ -760,6 +844,7 @@ def make_real_task_handler(
                     _build_terminal_envelope(
                         chat_id=chat_id,
                         posting_context=posting_context,
+                        owner_dm_delivery_role=owner_dm_delivery_role,
                         text=(
                         f"❌ Воркер упал\n"
                         f"  task-id `{handle.task_id}`\n"
@@ -773,6 +858,7 @@ def make_real_task_handler(
                     _build_terminal_envelope(
                         chat_id=chat_id,
                         posting_context=posting_context,
+                        owner_dm_delivery_role=owner_dm_delivery_role,
                         text=(
                         f"❌ Воркер вернул неожиданный результат\n"
                         f"  task-id `{handle.task_id}`\n"
@@ -808,6 +894,7 @@ def make_real_task_handler(
                     _build_terminal_envelope(
                         chat_id=chat_id,
                         posting_context=posting_context,
+                        owner_dm_delivery_role=owner_dm_delivery_role,
                         text=(
                         f"⏹ Отменено пользователем\n"
                         f"\n"
@@ -822,6 +909,7 @@ def make_real_task_handler(
                     _build_terminal_envelope(
                         chat_id=chat_id,
                         posting_context=posting_context,
+                        owner_dm_delivery_role=owner_dm_delivery_role,
                         text=(
                         f"✅ Готово\n"
                         f"\n"
@@ -840,6 +928,7 @@ def make_real_task_handler(
                     _build_terminal_envelope(
                         chat_id=chat_id,
                         posting_context=posting_context,
+                        owner_dm_delivery_role=owner_dm_delivery_role,
                         text=(
                         f"❌ Не получилось\n"
                         f"\n"
@@ -914,6 +1003,7 @@ def make_real_task_handler(
             posting_context = _build_project_chat_posting_context(
                 onboarding_context
             )
+            owner_dm_delivery_role = _resolve_owner_dm_delivery_role(msg)
             pipeline_task_prompt = _build_pipeline_task_prompt(
                 onboarding_context,
                 owner_task_text=text,
@@ -952,6 +1042,7 @@ def make_real_task_handler(
             text,
             onboarding_context,
             posting_context,
+            owner_dm_delivery_role,
             pipeline_task_prompt,
             initial_artifacts,
             tier_name,
@@ -961,6 +1052,7 @@ def make_real_task_handler(
             chat_id,
             project_id=project_id,
             posting_context=posting_context,
+            owner_dm_delivery_role=owner_dm_delivery_role,
         )
         try:
             runner.submit(

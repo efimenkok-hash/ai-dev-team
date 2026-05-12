@@ -23,10 +23,16 @@ def _identity(
     )
 
 
-def _envelope(*, role: str, text: str = "hello") -> OutgoingEnvelope:
+def _envelope(
+    *,
+    role: str,
+    text: str = "hello",
+    delivery_role: str | None = None,
+) -> OutgoingEnvelope:
     return OutgoingEnvelope(
         message=OutgoingMessage(chat_id=1, text=text),
         sender_role=role,
+        delivery_role=delivery_role,
     )
 
 
@@ -177,6 +183,105 @@ def test_multi_bot_outbound_sender_unknown_role_falls_back_to_coordinator():
     assert used_role == COORDINATOR_ROLE
     assert len(coordinator_sender.sent) == 1
     assert coordinator_sender.sent[0].text == "Architect: keep text"
+    assert not writer_sender.sent
+
+
+def test_multi_bot_outbound_sender_delivery_role_none_keeps_old_behavior():
+    coordinator_sender = _CapturingEnvelopeSender()
+    writer_sender = _CapturingEnvelopeSender()
+    sender = MultiBotOutboundSender(
+        PerRoleOutboundSender(
+            primary_role=COORDINATOR_ROLE,
+            senders_by_role={
+                "writer_agent": RoleBoundSender(
+                    identity=_identity("writer_agent", token="456:writer"),
+                    send_envelope=writer_sender,
+                ),
+                COORDINATOR_ROLE: RoleBoundSender(
+                    identity=_identity(),
+                    send_envelope=coordinator_sender,
+                ),
+            },
+        )
+    )
+
+    used_role = sender.send(
+        _envelope(
+            role="writer_agent",
+            delivery_role=None,
+            text="Writer: keep sender role routing",
+        )
+    )
+
+    assert used_role == "writer_agent"
+    assert len(writer_sender.sent) == 1
+    assert not coordinator_sender.sent
+
+
+def test_multi_bot_outbound_sender_delivery_role_overrides_sender_role():
+    coordinator_sender = _CapturingEnvelopeSender()
+    writer_sender = _CapturingEnvelopeSender()
+    sender = MultiBotOutboundSender(
+        PerRoleOutboundSender(
+            primary_role=COORDINATOR_ROLE,
+            senders_by_role={
+                "writer_agent": RoleBoundSender(
+                    identity=_identity("writer_agent", token="456:writer"),
+                    send_envelope=writer_sender,
+                ),
+                COORDINATOR_ROLE: RoleBoundSender(
+                    identity=_identity(),
+                    send_envelope=coordinator_sender,
+                ),
+            },
+        )
+    )
+
+    used_role = sender.send(
+        _envelope(
+            role=COORDINATOR_ROLE,
+            delivery_role="writer_agent",
+            text="Координатор: transport through writer",
+        )
+    )
+
+    assert used_role == "writer_agent"
+    assert len(writer_sender.sent) == 1
+    assert writer_sender.sent[0].sender_role == COORDINATOR_ROLE
+    assert writer_sender.sent[0].delivery_role == "writer_agent"
+    assert not coordinator_sender.sent
+
+
+def test_multi_bot_outbound_sender_unknown_delivery_role_falls_back_to_coordinator():
+    coordinator_sender = _CapturingEnvelopeSender()
+    writer_sender = _CapturingEnvelopeSender()
+    sender = MultiBotOutboundSender(
+        PerRoleOutboundSender(
+            primary_role=COORDINATOR_ROLE,
+            senders_by_role={
+                "writer_agent": RoleBoundSender(
+                    identity=_identity("writer_agent", token="456:writer"),
+                    send_envelope=writer_sender,
+                ),
+                COORDINATOR_ROLE: RoleBoundSender(
+                    identity=_identity(),
+                    send_envelope=coordinator_sender,
+                ),
+            },
+        )
+    )
+
+    used_role = sender.send(
+        _envelope(
+            role="writer_agent",
+            delivery_role="ghost_agent",
+            text="Writer: keep text on fallback",
+        )
+    )
+
+    assert used_role == COORDINATOR_ROLE
+    assert len(coordinator_sender.sent) == 1
+    assert coordinator_sender.sent[0].text == "Writer: keep text on fallback"
     assert not writer_sender.sent
 
 

@@ -87,6 +87,15 @@ def _msg() -> IncomingMessage:
     )
 
 
+def _group_msg() -> IncomingMessage:
+    return IncomingMessage(
+        chat_id=-100123,
+        user_id=11111,
+        message_id=1,
+        text="привет",
+    )
+
+
 # ---------------------------------------------------------------------------
 # construction
 # ---------------------------------------------------------------------------
@@ -323,10 +332,45 @@ def test_handle_incoming_coordinator_delegates_to_primary_bridge():
     result = bridge.handle_incoming(COORDINATOR_ROLE, msg)
 
     assert result is expected
-    primary_bridge.handle.assert_called_once_with(msg)
+    delegated_msg = primary_bridge.handle.call_args.args[0]
+    assert delegated_msg.chat_id == msg.chat_id
+    assert delegated_msg.incoming_bot_role == COORDINATOR_ROLE
 
 
-def test_handle_incoming_secondary_role_returns_not_enabled_without_delegation():
+def test_handle_incoming_secondary_private_dm_delegates_to_primary_bridge():
+    coordinator = _identity(token="123:coord")
+    writer = _identity(
+        "writer_agent",
+        token_env_key="TELEGRAM_WRITER_BOT_TOKEN",
+        token="456:writer",
+    )
+    primary_bridge = _primary_bridge()
+    expected = BridgeResult(
+        chat_id=11111,
+        handled=True,
+        reason="delegated",
+        sent_count=1,
+        extracted_text="привет",
+    )
+    primary_bridge.handle = MagicMock(return_value=expected)
+    bridge = MultiBotBridge(
+        runtime_spec=_runtime_spec(
+            coordinator,
+            writer,
+            source="telegram_agent_tokens",
+        ),
+        primary_bridge=primary_bridge,
+    )
+
+    result = bridge.handle_incoming("writer_agent", _msg())
+
+    assert result is expected
+    delegated_msg = primary_bridge.handle.call_args.args[0]
+    assert delegated_msg.chat_id == 11111
+    assert delegated_msg.incoming_bot_role == "writer_agent"
+
+
+def test_handle_incoming_secondary_group_role_returns_not_enabled_without_delegation():
     coordinator = _identity(token="123:coord")
     writer = _identity(
         "writer_agent",
@@ -344,7 +388,7 @@ def test_handle_incoming_secondary_role_returns_not_enabled_without_delegation()
         primary_bridge=primary_bridge,
     )
 
-    result = bridge.handle_incoming("writer_agent", _msg())
+    result = bridge.handle_incoming("writer_agent", _group_msg())
 
     assert result.handled is False
     assert result.reason == "secondary_bot_inbound_not_enabled"

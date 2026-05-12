@@ -128,6 +128,7 @@ def _msg(
     text=None,
     voice_bytes=None,
     photo_bytes=None,
+    incoming_bot_role=None,
 ):
     return IncomingMessage(
         chat_id=chat_id,
@@ -136,6 +137,7 @@ def _msg(
         text=text,
         voice_bytes=voice_bytes,
         photo_bytes=photo_bytes,
+        incoming_bot_role=incoming_bot_role,
     )
 
 
@@ -273,6 +275,29 @@ def test_incoming_message_rejects_invalid_project_context_source():
         )
 
 
+def test_incoming_message_normalizes_incoming_bot_role():
+    message = IncomingMessage(
+        chat_id=1,
+        user_id=1,
+        message_id=1,
+        text="hi",
+        incoming_bot_role="  WRITER_AGENT  ",
+    )
+
+    assert message.incoming_bot_role == "writer_agent"
+
+
+def test_incoming_message_rejects_invalid_incoming_bot_role():
+    with pytest.raises(ValueError, match="invalid_incoming_bot_role:writer-agent"):
+        IncomingMessage(
+            chat_id=1,
+            user_id=1,
+            message_id=1,
+            text="hi",
+            incoming_bot_role="writer-agent",
+        )
+
+
 def test_incoming_message_rejects_none_source_with_project_fields():
     with pytest.raises(ValueError, match="none_project_context_forbids_project_id"):
         IncomingMessage(
@@ -349,10 +374,12 @@ def test_outgoing_envelope_happy_path():
     envelope = OutgoingEnvelope(
         message=OutgoingMessage(chat_id=1, text="hello"),
         sender_role="architect_agent",
+        delivery_role="writer_agent",
     )
 
     assert envelope.text == "hello"
     assert envelope.sender_role == "architect_agent"
+    assert envelope.delivery_role == "writer_agent"
 
 
 def test_outgoing_envelope_rejects_invalid_message():
@@ -379,6 +406,15 @@ def test_outgoing_envelope_rejects_malformed_sender_role():
         OutgoingEnvelope(
             message=OutgoingMessage(chat_id=1, text="hello"),
             sender_role="bad-role",
+        )
+
+
+def test_outgoing_envelope_rejects_malformed_delivery_role():
+    with pytest.raises(ValueError, match="invalid_delivery_role:bad-role"):
+        OutgoingEnvelope(
+            message=OutgoingMessage(chat_id=1, text="hello"),
+            sender_role="architect_agent",
+            delivery_role="bad-role",
         )
 
 
@@ -993,6 +1029,27 @@ def test_photo_failure_apologies():
     assert "распознать" in sender.sent[0].text.lower()
 
 
+def test_private_writer_dm_photo_failure_stays_in_same_bot_thread():
+    sender = CapturingSender()
+    bridge = _make_bridge(
+        sender=sender,
+        vision=FakeVision(raise_exc=VisionError("rate_limited")),
+    )
+    msg = _msg(
+        chat_id=OWNER_CHAT_ID,
+        user_id=OWNER_CHAT_ID,
+        photo_bytes=b"png",
+        incoming_bot_role="writer_agent",
+    )
+
+    result = bridge.handle(msg)
+
+    assert result.handled is False
+    assert sender.sent[0].sender_role == COORDINATOR_ROLE
+    assert sender.sent[0].delivery_role == "writer_agent"
+    assert "распознать" in sender.sent[0].text.lower()
+
+
 # ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
@@ -1121,6 +1178,91 @@ def test_task_unknown_persona_role_falls_back_to_coordinator():
     assert sender.sent[0].sender_role == "ghost_agent"
     assert "[неизвестная роль" in sender.sent[0].text
     assert sender.sent[0].text.startswith("Координатор:")
+
+
+def test_private_writer_dm_task_reply_keeps_semantic_sender_and_delivery_thread():
+    sender = CapturingSender()
+    bridge = _make_bridge(
+        sender=sender,
+        task_handler=lambda t, m: BridgeReply(
+            persona_role="architect_agent",
+            body="предлагаю стек",
+        ),
+    )
+
+    bridge.handle(
+        _msg(
+            chat_id=OWNER_CHAT_ID,
+            user_id=OWNER_CHAT_ID,
+            text="новый сервис",
+            incoming_bot_role="writer_agent",
+        )
+    )
+
+    assert sender.sent[0].sender_role == "architect_agent"
+    assert sender.sent[0].delivery_role == "writer_agent"
+    assert sender.sent[0].text == "Архитектор: предлагаю стек"
+
+
+def test_private_writer_dm_command_reply_stays_in_same_bot_thread():
+    sender = CapturingSender()
+    reg = CommandRegistry()
+    reg.register(CommandName.HELP, lambda c, ctx: "/help: список")
+    bridge = _make_bridge(sender=sender, commands=reg)
+
+    bridge.handle(
+        _msg(
+            chat_id=OWNER_CHAT_ID,
+            user_id=OWNER_CHAT_ID,
+            text="/help",
+            incoming_bot_role="writer_agent",
+        )
+    )
+
+    assert sender.sent[0].sender_role == COORDINATOR_ROLE
+    assert sender.sent[0].delivery_role == "writer_agent"
+    assert sender.sent[0].text.startswith("Координатор:")
+
+
+def test_non_owner_secondary_private_dm_denial_stays_in_same_bot_thread():
+    sender = CapturingSender()
+    bridge = _make_bridge(sender=sender)
+
+    bridge.handle(
+        _msg(
+            chat_id=INTRUDER_CHAT_ID,
+            user_id=INTRUDER_CHAT_ID,
+            text="hi",
+            incoming_bot_role="reviewer_agent",
+        )
+    )
+
+    assert sender.sent[0].text == DEFAULT_DENIAL_MESSAGE
+    assert sender.sent[0].sender_role == COORDINATOR_ROLE
+    assert sender.sent[0].delivery_role == "reviewer_agent"
+
+
+def test_group_reply_does_not_gain_delivery_role():
+    sender = CapturingSender()
+    bridge = _make_bridge(
+        sender=sender,
+        task_handler=lambda t, m: BridgeReply(
+            persona_role="architect_agent",
+            body="предлагаю стек",
+        ),
+    )
+
+    bridge.handle(
+        _msg(
+            chat_id=-100123,
+            user_id=OWNER_CHAT_ID,
+            text="новый сервис",
+            incoming_bot_role="writer_agent",
+        )
+    )
+
+    assert sender.sent[0].sender_role == "architect_agent"
+    assert sender.sent[0].delivery_role is None
 
 
 def test_task_without_handler_apologies():

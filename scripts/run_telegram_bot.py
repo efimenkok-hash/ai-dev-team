@@ -363,6 +363,7 @@ def _make_incoming_handler(
     loop,
     *,
     reply_on_attachment_error: bool = True,
+    incoming_bot_role: str | None = None,
 ):
     async def on_message(update, context):
         message = getattr(update, "message", None)
@@ -408,6 +409,7 @@ def _make_incoming_handler(
                 photo_bytes=photo_bytes,
                 photo_mime=photo_mime,
                 timestamp=float(message.date.timestamp()) if message.date else 0.0,
+                incoming_bot_role=incoming_bot_role,
             )
         except ValueError as exc:
             logger.warning("Invalid incoming message: %s", exc)
@@ -431,6 +433,7 @@ def _make_multi_bot_handlers(runtime_bridge, agent_role, loop):
         _handle_incoming,
         loop,
         reply_on_attachment_error=(agent_role == COORDINATOR_ROLE),
+        incoming_bot_role=agent_role,
     )
 
 

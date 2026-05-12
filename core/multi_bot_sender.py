@@ -109,9 +109,14 @@ class MultiBotOutboundSender:
                 "invalid_outgoing_envelope_type:"
                 f"{type(envelope).__name__}"
             )
-        sender = self._config.senders_by_role.get(envelope.sender_role)
+        transport_role = (
+            envelope.delivery_role
+            if envelope.delivery_role is not None
+            else envelope.sender_role
+        )
+        sender = self._config.senders_by_role.get(transport_role)
         used_role = (
-            envelope.sender_role
+            transport_role
             if sender is not None
             else self._config.primary_role
         )

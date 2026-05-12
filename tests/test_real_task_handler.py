@@ -1332,16 +1332,19 @@ def test_bound_project_chat_progress_posts_use_agent_and_coordinator_roles(
     assert any(
         env.sender_role == COORDINATOR_ROLE
         and env.message.text.startswith("🚀 Старт")
+        and env.delivery_role is None
         for env in captured
     )
     assert any(
         env.sender_role == "architect_agent"
         and "architect_agent начал" in env.message.text
+        and env.delivery_role is None
         for env in captured
     )
     assert any(
         env.sender_role == "writer_agent"
         and "writer_agent закончил" in env.message.text
+        and env.delivery_role is None
         for env in captured
     )
     assert any(
@@ -1404,16 +1407,18 @@ def test_bound_project_chat_agent_failed_post_uses_agent_role(
     assert any(
         env.sender_role == "planning_agent"
         and "planning_agent упал" in env.message.text
+        and env.delivery_role is None
         for env in captured
     )
     assert any(
         env.sender_role == COORDINATOR_ROLE
         and "❌ Не получилось" in env.message.text
+        and env.delivery_role is None
         for env in captured
     )
 
 
-def test_owner_dm_fallback_progress_posts_remain_coordinator_owned(
+def test_owner_dm_fallback_progress_posts_keep_semantic_roles_but_route_back_to_same_bot(
     runner,
     sandbox,
     tier_store,
@@ -1456,12 +1461,42 @@ def test_owner_dm_fallback_progress_posts_remain_coordinator_owned(
                 project_id="alpha_project",
                 project_slug="alpha-project",
                 project_context_source="owner_dm_single_project",
+                incoming_bot_role="writer_agent",
             ),
         )
         _wait_until_idle(runner)
 
     assert any("writer_agent начал" in env.message.text for env in captured)
-    assert all(env.sender_role == COORDINATOR_ROLE for env in captured)
+    assert any(
+        env.sender_role == "planning_agent"
+        and env.delivery_role == "writer_agent"
+        and "planning_agent начал" in env.message.text
+        for env in captured
+    )
+    assert any(
+        env.sender_role == "writer_agent"
+        and env.delivery_role == "writer_agent"
+        and "writer_agent закончил" in env.message.text
+        for env in captured
+    )
+    assert any(
+        env.sender_role == COORDINATOR_ROLE
+        and env.delivery_role == "writer_agent"
+        and env.message.text.startswith("🚀 Старт")
+        for env in captured
+    )
+    assert any(
+        env.sender_role == COORDINATOR_ROLE
+        and env.delivery_role == "writer_agent"
+        and "🌳 worktree готов" in env.message.text
+        for env in captured
+    )
+    assert any(
+        env.sender_role == COORDINATOR_ROLE
+        and env.delivery_role == "writer_agent"
+        and "✅ Готово" in env.message.text
+        for env in captured
+    )
 
 
 def test_legacy_progress_posts_remain_coordinator_owned_and_sender_failure_is_swallowed(
@@ -1490,6 +1525,7 @@ def test_legacy_progress_posts_remain_coordinator_owned_and_sender_failure_is_sw
 
     assert captured
     assert all(env.sender_role == COORDINATOR_ROLE for env in captured)
+    assert all(env.delivery_role is None for env in captured)
 
 
 def test_busy_message_keeps_original_owner_task_text_for_project_aware_tasks(

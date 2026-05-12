@@ -62,6 +62,7 @@ from core.coordinator_role import (
     resolve_coordinator_persona,
 )
 from core.observability import Observability
+from core.owner_dm_routing import OwnerDmRoutingService
 from core.project_context import VALID_PROJECT_CONTEXT_SOURCES, ProjectContextResolver
 from core.vision_client import VisionClient, VisionError
 from core.whisper_client import WhisperClient, WhisperError
@@ -93,6 +94,7 @@ class IncomingMessage:
     project_slug: str | None = None
     project_context_source: str | None = None
     project_context_reason: str | None = None
+    incoming_bot_role: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.chat_id, int) or isinstance(self.chat_id, bool):
@@ -148,6 +150,20 @@ class IncomingMessage:
                 "project_context_reason",
                 self.project_context_reason.strip(),
             )
+        if self.incoming_bot_role is not None:
+            if not isinstance(self.incoming_bot_role, str):
+                raise ValueError(
+                    "invalid_incoming_bot_role_type:"
+                    f"{type(self.incoming_bot_role).__name__}"
+                )
+            normalized_role = self.incoming_bot_role.strip().lower()
+            if not normalized_role:
+                raise ValueError("empty_incoming_bot_role")
+            if not normalized_role.isascii():
+                raise ValueError(f"non_ascii_incoming_bot_role:{normalized_role}")
+            if not _ROLE_ID_RE.fullmatch(normalized_role):
+                raise ValueError(f"invalid_incoming_bot_role:{normalized_role}")
+            object.__setattr__(self, "incoming_bot_role", normalized_role)
         if self.project_id is None and self.project_slug is not None:
             raise ValueError("project_slug_requires_project_id")
         if self.project_context_source == "none" and self.project_id is not None:
@@ -190,6 +206,7 @@ class OutgoingMessage:
 class OutgoingEnvelope:
     message: OutgoingMessage
     sender_role: str
+    delivery_role: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.message, OutgoingMessage):
@@ -210,6 +227,28 @@ class OutgoingEnvelope:
         if not _ROLE_ID_RE.fullmatch(normalized_role):
             raise ValueError(f"invalid_sender_role:{normalized_role}")
         object.__setattr__(self, "sender_role", normalized_role)
+        if self.delivery_role is not None:
+            if not isinstance(self.delivery_role, str):
+                raise ValueError(
+                    "invalid_delivery_role_type:"
+                    f"{type(self.delivery_role).__name__}"
+                )
+            normalized_delivery_role = self.delivery_role.strip().lower()
+            if not normalized_delivery_role:
+                raise ValueError("empty_delivery_role")
+            if not normalized_delivery_role.isascii():
+                raise ValueError(
+                    f"non_ascii_delivery_role:{normalized_delivery_role}"
+                )
+            if not _ROLE_ID_RE.fullmatch(normalized_delivery_role):
+                raise ValueError(
+                    f"invalid_delivery_role:{normalized_delivery_role}"
+                )
+            object.__setattr__(
+                self,
+                "delivery_role",
+                normalized_delivery_role,
+            )
 
     @property
     def chat_id(self) -> int:
@@ -328,6 +367,7 @@ class TelegramBridge:
         self._denial_message = denial_message
         self._project_context_resolver = project_context_resolver
         self._coordinator_role = normalized_coordinator_role
+        self._owner_dm_routing = OwnerDmRoutingService()
 
         self._coordinator = resolve_coordinator_persona(self._personas)
 
@@ -376,8 +416,12 @@ class TelegramBridge:
             if self._project_context_resolver is None:
                 if not self._is_owner(msg):
                     self._safe_send(
-                        OutgoingMessage(chat_id=msg.chat_id, text=self._denial_message),
+                        OutgoingMessage(
+                            chat_id=msg.chat_id,
+                            text=self._denial_message,
+                        ),
                         ctx,
+                        incoming=msg,
                     )
                     return BridgeResult(
                         chat_id=msg.chat_id,
@@ -398,6 +442,7 @@ class TelegramBridge:
                             ),
                         ),
                         ctx,
+                        incoming=resolved_msg,
                     )
                     return BridgeResult(
                         chat_id=resolved_msg.chat_id,
@@ -449,9 +494,10 @@ class TelegramBridge:
                             f"Внутренняя ошибка моста: "
                             f"{type(exc).__name__}: {str(exc)[:200]}"
                         ),
-                    ),
-                    ctx,
-                )
+                        ),
+                        ctx,
+                        incoming=msg,
+                    )
             return BridgeResult(
                 chat_id=getattr(msg, "chat_id", 0) or 0,
                 handled=False,
@@ -548,9 +594,10 @@ class TelegramBridge:
                             "\n"
                             "Подключите OPENAI_API_KEY в .env, чтобы включить."
                         ),
-                    ),
-                    ctx,
-                )
+                        ),
+                        ctx,
+                        incoming=msg,
+                    )
                 return None
             try:
                 result = self._whisper.transcribe(
@@ -570,9 +617,10 @@ class TelegramBridge:
                             f"\n"
                             f"Попробуйте, пожалуйста, набрать текстом."
                         ),
-                    ),
-                    ctx,
-                )
+                        ),
+                        ctx,
+                        incoming=msg,
+                    )
                 return None
             return result.text
 
@@ -586,9 +634,10 @@ class TelegramBridge:
                             "\n"
                             "Подключите OPENROUTER_API_KEY в .env, чтобы включить."
                         ),
-                    ),
-                    ctx,
-                )
+                        ),
+                        ctx,
+                        incoming=msg,
+                    )
                 return None
             try:
                 result = self._vision.describe(
@@ -608,6 +657,7 @@ class TelegramBridge:
                         ),
                     ),
                     ctx,
+                    incoming=msg,
                 )
                 return None
             return result.text
@@ -630,6 +680,7 @@ class TelegramBridge:
                     ),
                 ),
                 ctx,
+                incoming=msg,
             )
             return
         try:
@@ -643,6 +694,7 @@ class TelegramBridge:
                     ),
                 ),
                 ctx,
+                incoming=msg,
             )
             return
         except Exception as exc:
@@ -655,6 +707,7 @@ class TelegramBridge:
                     ),
                 ),
                 ctx,
+                incoming=msg,
             )
             return
         self._safe_send(
@@ -663,6 +716,7 @@ class TelegramBridge:
                 text=self._sign_coordinator(reply_text),
             ),
             ctx,
+            incoming=msg,
         )
 
     def _handle_task(
@@ -681,6 +735,7 @@ class TelegramBridge:
                     ),
                 ),
                 ctx,
+                incoming=msg,
             )
             return
         try:
@@ -694,6 +749,7 @@ class TelegramBridge:
                     ),
                 ),
                 ctx,
+                incoming=msg,
             )
             return
 
@@ -704,6 +760,7 @@ class TelegramBridge:
                     text=self._sign_coordinator(DEFAULT_GENERIC_ACK),
                 ),
                 ctx,
+                incoming=msg,
             )
             return
         if not isinstance(reply, BridgeReply):
@@ -715,6 +772,7 @@ class TelegramBridge:
                     ),
                 ),
                 ctx,
+                incoming=msg,
             )
             return
 
@@ -730,6 +788,7 @@ class TelegramBridge:
                     ),
                     ctx,
                     sender_role=reply.persona_role,
+                    incoming=msg,
                 )
                 return
 
@@ -741,6 +800,7 @@ class TelegramBridge:
             ),
             ctx,
             sender_role=reply.persona_role,
+            incoming=msg,
         )
 
     def _format_ask_message(
@@ -774,14 +834,37 @@ class TelegramBridge:
         ctx: _BridgeContext,
         *,
         sender_role: str = COORDINATOR_ROLE,
+        incoming: IncomingMessage | None = None,
     ) -> None:
         """Calls send() once. Suppresses transport errors so handle() stays total."""
-        envelope = OutgoingEnvelope(message=out, sender_role=sender_role)
+        envelope = OutgoingEnvelope(
+            message=out,
+            sender_role=sender_role,
+            delivery_role=self._resolve_delivery_role(incoming, sender_role),
+        )
         try:
             self._send_envelope(envelope)
             ctx.sent_count += 1
         except Exception as exc:
             ctx.notes.append(f"send_failed:{type(exc).__name__}:{exc}")
+
+    def _resolve_delivery_role(
+        self,
+        msg: IncomingMessage | None,
+        sender_role: str,
+    ) -> str | None:
+        if msg is None or msg.incoming_bot_role is None:
+            return None
+        if not self._owner_dm_routing.is_owner_dm_message(msg):
+            return None
+        try:
+            context = self._owner_dm_routing.build_context(msg)
+            return self._owner_dm_routing.resolve_delivery_role(
+                context,
+                sender_role,
+            )
+        except ValueError:
+            return None
 
     def _adapt_legacy_send(self, send: SendMessage | None) -> SendEnvelope:
         if send is None or not callable(send):

@@ -1199,9 +1199,12 @@ def test_multi_bot_handler_routes_coordinator_inbound_through_multi_bot_bridge(t
     assert call_role == COORDINATOR_ROLE
     assert isinstance(incoming, IncomingMessage)
     assert incoming.text == "сделай задачу"
+    assert incoming.incoming_bot_role == COORDINATOR_ROLE
 
 
-def test_multi_bot_handler_routes_secondary_inbound_without_fake_reply(tmp_path):
+def test_multi_bot_handler_routes_secondary_private_dm_inbound_without_fake_reply(
+    tmp_path,
+):
     runtime = script._build_running_multi_bot_runtime(
         {
             "TELEGRAM_OWNER_CHAT_ID": "777",
@@ -1249,6 +1252,67 @@ def test_multi_bot_handler_routes_secondary_inbound_without_fake_reply(tmp_path)
     assert mock_handle.call_count == 1
     _self, call_role, _incoming = mock_handle.call_args.args
     assert call_role == "writer_agent"
+    assert _incoming.incoming_bot_role == "writer_agent"
+    context.bot.send_message.assert_not_called()
+
+
+def test_secondary_private_dm_reply_routes_back_through_same_bot_identity(
+    tmp_path,
+):
+    bridge = _multi_bridge_with_task_handler(
+        lambda _text, _msg: BridgeReply(
+            persona_role="architect_agent",
+            body="готово",
+        )
+    )
+    fake_future = MagicMock()
+
+    with patch(
+        "scripts.run_telegram_bot.build_multi_bot_bridge_from_env",
+        return_value=bridge,
+    ):
+        runtime = script._build_running_multi_bot_runtime(
+            {
+                "TELEGRAM_OWNER_CHAT_ID": "777",
+                "STATE_DB_PATH": str(tmp_path / "state.db"),
+                "TELEGRAM_AGENT_TOKENS": (
+                    "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                    "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+                ),
+                "TELEGRAM_BOT_TOKEN": "123:coord",
+                "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
+            },
+            _ImmediateLoop(),
+            ptb_runtime=_FakePTBRuntime(lambda token: _FakeApplication(token)),
+        )
+
+    assert runtime is not None
+    coordinator_app = runtime.applications_by_role[COORDINATOR_ROLE].application
+    writer_app = runtime.applications_by_role["writer_agent"].application
+    handler = writer_app.handlers[0]
+    update = SimpleNamespace(
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=777),
+            from_user=SimpleNamespace(id=777),
+            message_id=7,
+            text="сделай черновик",
+            caption=None,
+            voice=None,
+            photo=None,
+            date=None,
+        )
+    )
+    context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+
+    with patch(
+        "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+        side_effect=_close_coro_and_return(fake_future),
+    ):
+        asyncio.run(handler.callback(update, context))
+
+    writer_app.bot.send_message.assert_called_once()
+    assert writer_app.bot.send_message.call_args.kwargs["text"] == "Архитектор: готово"
+    coordinator_app.bot.send_message.assert_not_called()
     context.bot.send_message.assert_not_called()
 
 
