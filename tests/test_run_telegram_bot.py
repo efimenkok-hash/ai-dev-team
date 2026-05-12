@@ -46,6 +46,12 @@ from core.telegram_bridge import (  # noqa: E402
     OutgoingMessage,
     TelegramBridge,
 )
+from tests.support.mock_ptb import (  # noqa: E402
+    ImmediateExecutorLoop as _ImmediateLoop,
+)
+from tests.support.mock_ptb import InvalidToken  # noqa: E402
+from tests.support.mock_ptb import MockPtbApplication as _FakeApplication  # noqa: E402
+from tests.support.mock_ptb import MockPtbRuntime as _FakePTBRuntime  # noqa: E402
 
 _LIFECYCLE_SERVICE = BotIdentityLifecycleService()
 
@@ -181,119 +187,6 @@ def _multi_bridge_with_task_handler(task_handler) -> MultiBotBridge:
         runtime_spec=runtime_spec,
         primary_bridge=primary_bridge,
     )
-
-
-class _FakeFilter:
-    def __or__(self, _other):
-        return self
-
-
-class _FakeMessageHandler:
-    def __init__(self, filters, callback):
-        self.filters = filters
-        self.callback = callback
-
-
-class _FakeUpdater:
-    def __init__(self, *, fail_polling: bool = False):
-        self.start_polling = AsyncMock(
-            side_effect=(
-                RuntimeError("polling failed")
-                if fail_polling
-                else None
-            )
-        )
-        self.stop = AsyncMock(return_value=None)
-
-
-class _FakeApplication:
-    def __init__(
-        self,
-        token: str,
-        *,
-        bot_user_id: int = 1,
-        bot_username: str = "coord_bot",
-        fail_get_me: Exception | None = None,
-        fail_start: bool = False,
-        fail_initialize: bool = False,
-        fail_polling: bool = False,
-    ):
-        self.token = token
-        if fail_get_me is None:
-            get_me = AsyncMock(
-                return_value=SimpleNamespace(
-                    id=bot_user_id,
-                    username=bot_username,
-                )
-            )
-        else:
-            get_me = AsyncMock(side_effect=fail_get_me)
-        self.bot = SimpleNamespace(
-            send_message=AsyncMock(return_value=None),
-            get_me=get_me,
-        )
-        self.handlers: list[_FakeMessageHandler] = []
-        self.initialize = AsyncMock(
-            side_effect=(
-                RuntimeError("initialize failed")
-                if fail_initialize
-                else None
-            )
-        )
-        self.start = AsyncMock(
-            side_effect=(
-                RuntimeError("start failed")
-                if fail_start
-                else None
-            )
-        )
-        self.stop = AsyncMock(return_value=None)
-        self.shutdown = AsyncMock(return_value=None)
-        self.updater = _FakeUpdater(fail_polling=fail_polling)
-
-    def add_handler(self, handler) -> None:
-        self.handlers.append(handler)
-
-
-class _FakePTBRuntime:
-    def __init__(self, app_factory):
-        self._app_factory = app_factory
-        self.filters = SimpleNamespace(
-            TEXT=_FakeFilter(),
-            VOICE=_FakeFilter(),
-            PHOTO=_FakeFilter(),
-            CAPTION=_FakeFilter(),
-        )
-        self.MessageHandler = _FakeMessageHandler
-
-    def ApplicationBuilder(self):
-        app_factory = self._app_factory
-
-        class _Builder:
-            def __init__(self):
-                self._token = None
-
-            def token(self, token):
-                self._token = token
-                return self
-
-            def build(self):
-                return app_factory(self._token)
-
-        return _Builder()
-
-
-class _ImmediateLoop:
-    def __init__(self):
-        self.calls: list[tuple[object, tuple[object, ...]]] = []
-
-    async def run_in_executor(self, _executor, func, *args):
-        self.calls.append((func, args))
-        return func(*args)
-
-
-class InvalidToken(Exception):
-    pass
 
 
 # ---------------------------------------------------------------------------
