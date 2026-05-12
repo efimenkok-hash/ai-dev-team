@@ -41,6 +41,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from core.agent_dm_reply import AgentDmSingleReplyService
 from core.agent_personas import PersonaRegistry, default_registry
 from core.background_runner import BackgroundTaskRunner
 from core.bot_commands import (
@@ -2224,6 +2225,102 @@ def make_simple_task_handler(
     return _handle
 
 
+def wrap_task_handler_with_agent_dm_single_reply(
+    base_handler: TaskHandler,
+    *,
+    service: AgentDmSingleReplyService,
+    tier_store: TierSessionStore,
+    project_registry: ProjectRegistry,
+) -> TaskHandler:
+    if not callable(base_handler):
+        raise ValueError("base_handler_not_callable")
+    if not isinstance(service, AgentDmSingleReplyService):
+        raise ValueError(
+            "invalid_agent_dm_single_reply_service:"
+            f"{type(service).__name__}"
+        )
+    if not isinstance(tier_store, TierSessionStore):
+        raise ValueError(f"invalid_tier_store:{type(tier_store).__name__}")
+    if not isinstance(project_registry, ProjectRegistry):
+        raise ValueError(
+            f"invalid_project_registry:{type(project_registry).__name__}"
+        )
+
+    def _handle(text: str, msg: IncomingMessage) -> BridgeReply | None:
+        try:
+            candidate_msg = (
+                msg
+                if msg.text is not None and msg.text.strip() == text.strip()
+                else IncomingMessage(
+                    chat_id=msg.chat_id,
+                    user_id=msg.user_id,
+                    message_id=msg.message_id,
+                    text=text,
+                    voice_bytes=msg.voice_bytes,
+                    voice_mime=msg.voice_mime,
+                    voice_duration_seconds=msg.voice_duration_seconds,
+                    photo_bytes=msg.photo_bytes,
+                    photo_mime=msg.photo_mime,
+                    timestamp=msg.timestamp,
+                    project_id=msg.project_id,
+                    project_slug=msg.project_slug,
+                    project_context_source=msg.project_context_source,
+                    project_context_reason=msg.project_context_reason,
+                    incoming_bot_role=msg.incoming_bot_role,
+                )
+            )
+        except ValueError:
+            return base_handler(text, msg)
+        if not service.is_direct_reply_candidate(candidate_msg):
+            return base_handler(text, msg)
+        if candidate_msg.project_id is None:
+            return base_handler(text, msg)
+        snapshot = project_registry.get_project_snapshot(candidate_msg.project_id)
+        if snapshot is None:
+            return base_handler(text, msg)
+        try:
+            context = service.build_context(candidate_msg, snapshot)
+        except ValueError:
+            return base_handler(text, msg)
+
+        if snapshot.policy is None or not snapshot.policy.allow_agent_dm:
+            return BridgeReply(
+                persona_role=context.agent_role,
+                body=(
+                    "Личный direct DM для этого проекта сейчас выключен.\n"
+                    "\n"
+                    "Это не запускало project pipeline.\n"
+                    "\n"
+                    "Для реального выполнения используй coordinator / "
+                    "project chat."
+                ),
+            )
+
+        tier_name = tier_store.active_tier_name(context.dm_chat_id)
+        if tier_name is None:
+            return BridgeReply(
+                persona_role=context.agent_role,
+                body=(
+                    "В этом личном чате ещё не выбран tier.\n"
+                    "\n"
+                    "Сначала выбери `/tier set <имя>` прямо здесь, а затем "
+                    "напиши ещё раз.\n"
+                    "\n"
+                    "Это не запускало project pipeline."
+                ),
+            )
+
+        direct_result = service.reply_or_unavailable(
+            context,
+            tier_name=tier_name,
+        )
+        if isinstance(direct_result, BridgeReply):
+            return direct_result
+        return direct_result.reply
+
+    return _handle
+
+
 # ---------------------------------------------------------------------------
 # top-level builder
 # ---------------------------------------------------------------------------
@@ -2407,6 +2504,18 @@ def build_bridge_from_env(
             ),
         )
     )
+    if state_db is not None:
+        task_handler = wrap_task_handler_with_agent_dm_single_reply(
+            task_handler,
+            service=AgentDmSingleReplyService(
+                dispatcher=build_dispatcher_from_env(env),
+                state_db=state_db,
+                personas=personas,
+                tier_registry=tier_store.registry,
+            ),
+            tier_store=tier_store,
+            project_registry=ProjectRegistry(state_db),
+        )
     return TelegramBridge(
         owner_chat_ids=owner_chat_ids,
         send=send_callable,

@@ -4,16 +4,22 @@ Bridge is fully testable without networking — every dependency (whisper,
 vision, send-callable, task_handler, command registry) is injected.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 
+from core.agent_dm_reply import AgentDmSingleReplyService
 from core.agent_personas import default_registry
 from core.bot_commands import CommandName, CommandRegistry
+from core.bot_runner import wrap_task_handler_with_agent_dm_single_reply
 from core.confirmation_gate import (
     ActionDescriptor,
     ActionKind,
     ConfirmationGate,
 )
 from core.coordinator_role import COORDINATOR_ROLE
+from core.llm_dispatcher import LLMAttempt, LLMDispatcher, LLMResponse
+from core.model_tier import default_registry as default_tier_registry
 from core.project_context import ProjectContextResolver
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
@@ -28,6 +34,7 @@ from core.telegram_bridge import (
     OutgoingMessage,
     TelegramBridge,
 )
+from core.tier_session import TierSessionStore
 from core.vision_client import VisionError, VisionResult
 from core.whisper_client import TranscriptionResult, WhisperError
 
@@ -201,6 +208,69 @@ def _register_project(
     loaded = registry.get_project_snapshot(snapshot.project.project_id)
     assert loaded is not None
     return loaded
+
+
+def _llm_response(text="Личный ответ агента.") -> LLMResponse:
+    return LLMResponse(
+        text=text,
+        model_used="model-x",
+        prompt_tokens=10,
+        completion_tokens=5,
+        attempts=(
+            LLMAttempt(model="model-x", ok=True, reason="ok", duration_ms=1),
+        ),
+    )
+
+
+def _make_direct_dm_bridge(
+    tmp_path,
+    *,
+    allow_agent_dm=True,
+    base_handler=None,
+    commands=None,
+    dispatcher_text="Личный ответ агента.",
+    whisper=None,
+    vision=None,
+):
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    snapshot = ProjectSnapshot(
+        project=_project(),
+        policy=_policy(allow_agent_dm=allow_agent_dm),
+    )
+    registry.register_project(snapshot)
+    resolver = ProjectContextResolver(registry, (OWNER_CHAT_ID,))
+    tier_store = TierSessionStore(default_tier_registry(), state_db=db)
+    tier_store.set_active(OWNER_CHAT_ID, "STANDARD")
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(return_value=_llm_response(dispatcher_text))  # type: ignore[method-assign]
+    service = AgentDmSingleReplyService(
+        dispatcher=dispatcher,
+        state_db=db,
+        personas=default_registry(),
+        tier_registry=tier_store.registry,
+    )
+    base_calls = []
+    wrapped = wrap_task_handler_with_agent_dm_single_reply(
+        base_handler
+        or (
+            lambda text, msg: base_calls.append((text, msg.incoming_bot_role))
+            or BridgeReply(persona_role="architect_agent", body="base path")
+        ),
+        service=service,
+        tier_store=tier_store,
+        project_registry=registry,
+    )
+    sender = CapturingSender()
+    bridge = _make_bridge(
+        sender=sender,
+        whisper=whisper,
+        vision=vision,
+        commands=commands,
+        task_handler=wrapped,
+        project_context_resolver=resolver,
+    )
+    return bridge, sender, base_calls, dispatcher, db
 
 
 # ---------------------------------------------------------------------------
@@ -1204,6 +1274,92 @@ def test_private_writer_dm_task_reply_keeps_semantic_sender_and_delivery_thread(
     assert sender.sent[0].text == "Архитектор: предлагаю стек"
 
 
+def test_direct_writer_dm_reply_keeps_agent_sender_and_same_delivery_thread(
+    tmp_path,
+):
+    bridge, sender, base_calls, _dispatcher, db = _make_direct_dm_bridge(
+        tmp_path,
+        dispatcher_text="Разберу вопрос как writer.",
+    )
+
+    result = bridge.handle(
+        _msg(
+            chat_id=OWNER_CHAT_ID,
+            user_id=OWNER_CHAT_ID,
+            text="Подскажи по API",
+            incoming_bot_role="writer_agent",
+        )
+    )
+
+    assert result.handled is True
+    assert base_calls == []
+    assert sender.sent[0].sender_role == "writer_agent"
+    assert sender.sent[0].delivery_role == "writer_agent"
+    assert sender.sent[0].text.startswith("Программист:")
+    messages = db.list_agent_dm_messages(OWNER_CHAT_ID, "alpha_project", "writer_agent")
+    assert [message.sender_kind for message in messages] == ["owner", "agent"]
+
+
+def test_direct_writer_voice_dm_uses_single_shot_path_after_whisper_resolution(
+    tmp_path,
+):
+    bridge, sender, base_calls, dispatcher, db = _make_direct_dm_bridge(
+        tmp_path,
+        dispatcher_text="Разберу voice-вопрос как writer.",
+        whisper=FakeWhisper(result_text="Распознанный voice вопрос"),
+    )
+
+    result = bridge.handle(
+        _msg(
+            chat_id=OWNER_CHAT_ID,
+            user_id=OWNER_CHAT_ID,
+            voice_bytes=b"audio-data",
+            incoming_bot_role="writer_agent",
+        )
+    )
+
+    assert result.handled is True
+    assert base_calls == []
+    dispatcher.dispatch.assert_called_once()
+    assert sender.sent[0].sender_role == "writer_agent"
+    assert sender.sent[0].delivery_role == "writer_agent"
+    messages = db.list_agent_dm_messages(OWNER_CHAT_ID, "alpha_project", "writer_agent")
+    assert [message.body for message in messages] == [
+        "Распознанный voice вопрос",
+        "Разберу voice-вопрос как writer.",
+    ]
+
+
+def test_direct_writer_photo_dm_uses_single_shot_path_after_vision_resolution(
+    tmp_path,
+):
+    bridge, sender, base_calls, dispatcher, db = _make_direct_dm_bridge(
+        tmp_path,
+        dispatcher_text="Разберу photo-вопрос как writer.",
+        vision=FakeVision(result_text="Распознанный photo вопрос"),
+    )
+
+    result = bridge.handle(
+        _msg(
+            chat_id=OWNER_CHAT_ID,
+            user_id=OWNER_CHAT_ID,
+            photo_bytes=b"png-data",
+            incoming_bot_role="writer_agent",
+        )
+    )
+
+    assert result.handled is True
+    assert base_calls == []
+    dispatcher.dispatch.assert_called_once()
+    assert sender.sent[0].sender_role == "writer_agent"
+    assert sender.sent[0].delivery_role == "writer_agent"
+    messages = db.list_agent_dm_messages(OWNER_CHAT_ID, "alpha_project", "writer_agent")
+    assert [message.body for message in messages] == [
+        "Распознанный photo вопрос",
+        "Разберу photo-вопрос как writer.",
+    ]
+
+
 def test_private_writer_dm_command_reply_stays_in_same_bot_thread():
     sender = CapturingSender()
     reg = CommandRegistry()
@@ -1224,6 +1380,30 @@ def test_private_writer_dm_command_reply_stays_in_same_bot_thread():
     assert sender.sent[0].text.startswith("Координатор:")
 
 
+def test_direct_dm_wrapper_does_not_hijack_command_path(tmp_path):
+    reg = CommandRegistry()
+    reg.register(CommandName.HELP, lambda c, ctx: "/help: список")
+    bridge, sender, base_calls, dispatcher, _db = _make_direct_dm_bridge(
+        tmp_path,
+        commands=reg,
+    )
+
+    result = bridge.handle(
+        _msg(
+            chat_id=OWNER_CHAT_ID,
+            user_id=OWNER_CHAT_ID,
+            text="/help",
+            incoming_bot_role="writer_agent",
+        )
+    )
+
+    assert result.handled is True
+    assert base_calls == []
+    assert sender.sent[0].sender_role == COORDINATOR_ROLE
+    assert sender.sent[0].delivery_role == "writer_agent"
+    dispatcher.dispatch.assert_not_called()
+
+
 def test_non_owner_secondary_private_dm_denial_stays_in_same_bot_thread():
     sender = CapturingSender()
     bridge = _make_bridge(sender=sender)
@@ -1240,6 +1420,25 @@ def test_non_owner_secondary_private_dm_denial_stays_in_same_bot_thread():
     assert sender.sent[0].text == DEFAULT_DENIAL_MESSAGE
     assert sender.sent[0].sender_role == COORDINATOR_ROLE
     assert sender.sent[0].delivery_role == "reviewer_agent"
+
+
+def test_direct_dm_wrapper_does_not_hijack_coordinator_private_dm(tmp_path):
+    bridge, sender, base_calls, dispatcher, _db = _make_direct_dm_bridge(tmp_path)
+
+    result = bridge.handle(
+        _msg(
+            chat_id=OWNER_CHAT_ID,
+            user_id=OWNER_CHAT_ID,
+            text="coord path",
+            incoming_bot_role="coordinator_agent",
+        )
+    )
+
+    assert result.handled is True
+    assert base_calls == [("coord path", "coordinator_agent")]
+    assert sender.sent[0].sender_role == "architect_agent"
+    assert sender.sent[0].delivery_role == "coordinator_agent"
+    dispatcher.dispatch.assert_not_called()
 
 
 def test_group_reply_does_not_gain_delivery_role():
@@ -1263,6 +1462,29 @@ def test_group_reply_does_not_gain_delivery_role():
 
     assert sender.sent[0].sender_role == "architect_agent"
     assert sender.sent[0].delivery_role is None
+
+
+def test_direct_dm_wrapper_does_not_inject_direct_dm_semantics_into_group_reply(
+    tmp_path,
+):
+    bridge, sender, base_calls, dispatcher, _db = _make_direct_dm_bridge(
+        tmp_path,
+    )
+
+    result = bridge.handle(
+        _msg(
+            chat_id=-100123,
+            user_id=OWNER_CHAT_ID,
+            text="group path",
+            incoming_bot_role="writer_agent",
+        )
+    )
+
+    assert result.handled is False
+    assert result.reason == "project_context_missing"
+    assert base_calls == []
+    assert sender.sent[0].delivery_role is None
+    dispatcher.dispatch.assert_not_called()
 
 
 def test_task_without_handler_apologies():

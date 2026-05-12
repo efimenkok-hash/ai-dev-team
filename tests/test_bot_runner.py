@@ -1,9 +1,11 @@
-"""Tests for core.bot_runner (Step 14a Module 7 + 14b-6/7: builders + handlers)."""
+"""Tests for core.bot_runner (Step 14a Module 7 + 14b-6/7 + E4.3)."""
 
 import time
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from core.agent_dm_reply import AgentDmSingleReplyService
 from core.agent_personas import default_registry
 from core.bot_commands import (
     BotCommand,
@@ -36,9 +38,15 @@ from core.bot_runner import (
     make_switch_handler,
     make_tier_handler,
     parse_owner_chat_ids,
+    wrap_task_handler_with_agent_dm_single_reply,
 )
 from core.confirmation_gate import ConfirmationGate
 from core.coordinator_role import COORDINATOR_ROLE
+from core.llm_dispatcher import (
+    LLMAttempt,
+    LLMDispatcher,
+    LLMResponse,
+)
 from core.model_tier import default_registry as default_tier_registry
 from core.multi_bot_bridge import MultiBotBridge
 from core.project_chat_binding_service import ProjectChatBindingService
@@ -130,6 +138,33 @@ def _project_snapshot(repo_path, **overrides):
     }
     data.update(overrides)
     return ProjectSnapshot(**data)
+
+
+def _llm_response(text="Личный ответ агента."):
+    return LLMResponse(
+        text=text,
+        model_used="model-x",
+        prompt_tokens=10,
+        completion_tokens=5,
+        attempts=(
+            LLMAttempt(model="model-x", ok=True, reason="ok", duration_ms=1),
+        ),
+    )
+
+
+def _direct_dm_msg(**overrides):
+    data = {
+        "chat_id": 101,
+        "user_id": 101,
+        "message_id": 1,
+        "text": "Подскажи по API",
+        "project_id": "alpha_project",
+        "project_slug": "alpha-project",
+        "project_context_source": "owner_dm_single_project",
+        "incoming_bot_role": "writer_agent",
+    }
+    data.update(overrides)
+    return IncomingMessage(**data)
 
 # ---------------------------------------------------------------------------
 # parse_owner_chat_ids
@@ -2725,6 +2760,275 @@ def test_simple_task_handler_reports_truthful_multiple_projects_reason():
 
 
 # ---------------------------------------------------------------------------
+# wrap_task_handler_with_agent_dm_single_reply
+# ---------------------------------------------------------------------------
+
+
+def test_direct_owner_dm_reply_does_not_fall_through_to_pipeline(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=True),
+        )
+    )
+    tier_store = TierSessionStore(default_tier_registry(), state_db=db)
+    tier_store.set_active(101, "STANDARD")
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(return_value=_llm_response("Отвечаю как writer."))  # type: ignore[method-assign]
+    service = AgentDmSingleReplyService(
+        dispatcher=dispatcher,
+        state_db=db,
+        personas=default_registry(),
+        clock=lambda: 500.0,
+        tier_registry=tier_store.registry,
+    )
+    pipeline_calls: list[tuple[str, str | None]] = []
+
+    wrapped = wrap_task_handler_with_agent_dm_single_reply(
+        lambda text, msg: pipeline_calls.append((text, msg.incoming_bot_role))
+        or BridgeReply(persona_role=COORDINATOR_ROLE, body="pipeline"),
+        service=service,
+        tier_store=tier_store,
+        project_registry=registry,
+    )
+    incoming = _direct_dm_msg()
+
+    reply = wrapped("Подскажи по API", incoming)
+
+    assert isinstance(reply, BridgeReply)
+    assert reply.persona_role == "writer_agent"
+    assert pipeline_calls == []
+    assert incoming.incoming_bot_role == "writer_agent"
+    session = db.get_agent_dm_session(101, "alpha_project", "writer_agent")
+    assert session is not None
+    messages = db.list_agent_dm_messages(101, "alpha_project", "writer_agent")
+    assert [message.sender_kind for message in messages] == ["owner", "agent"]
+
+
+def test_direct_owner_voice_dm_reply_uses_resolved_text_path(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=True),
+        )
+    )
+    tier_store = TierSessionStore(default_tier_registry(), state_db=db)
+    tier_store.set_active(101, "STANDARD")
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(return_value=_llm_response("Отвечаю на voice DM."))  # type: ignore[method-assign]
+    service = AgentDmSingleReplyService(
+        dispatcher=dispatcher,
+        state_db=db,
+        personas=default_registry(),
+        clock=lambda: 600.0,
+        tier_registry=tier_store.registry,
+    )
+    pipeline_calls: list[tuple[str, str | None]] = []
+    wrapped = wrap_task_handler_with_agent_dm_single_reply(
+        lambda text, msg: pipeline_calls.append((text, msg.incoming_bot_role))
+        or BridgeReply(persona_role=COORDINATOR_ROLE, body="pipeline"),
+        service=service,
+        tier_store=tier_store,
+        project_registry=registry,
+    )
+    incoming = _direct_dm_msg(text=None, voice_bytes=b"audio-bytes")
+
+    reply = wrapped("Распознанный voice text", incoming)
+
+    assert isinstance(reply, BridgeReply)
+    assert reply.persona_role == "writer_agent"
+    assert pipeline_calls == []
+    dispatcher.dispatch.assert_called_once()
+    messages = db.list_agent_dm_messages(101, "alpha_project", "writer_agent")
+    assert [message.body for message in messages] == [
+        "Распознанный voice text",
+        "Отвечаю на voice DM.",
+    ]
+
+
+def test_direct_owner_photo_dm_reply_uses_resolved_text_path(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=True),
+        )
+    )
+    tier_store = TierSessionStore(default_tier_registry(), state_db=db)
+    tier_store.set_active(101, "STANDARD")
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(return_value=_llm_response("Отвечаю на photo DM."))  # type: ignore[method-assign]
+    service = AgentDmSingleReplyService(
+        dispatcher=dispatcher,
+        state_db=db,
+        personas=default_registry(),
+        clock=lambda: 700.0,
+        tier_registry=tier_store.registry,
+    )
+    pipeline_calls: list[tuple[str, str | None]] = []
+    wrapped = wrap_task_handler_with_agent_dm_single_reply(
+        lambda text, msg: pipeline_calls.append((text, msg.incoming_bot_role))
+        or BridgeReply(persona_role=COORDINATOR_ROLE, body="pipeline"),
+        service=service,
+        tier_store=tier_store,
+        project_registry=registry,
+    )
+    incoming = _direct_dm_msg(text=None, photo_bytes=b"png-bytes")
+
+    reply = wrapped("Распознанный photo text", incoming)
+
+    assert isinstance(reply, BridgeReply)
+    assert reply.persona_role == "writer_agent"
+    assert pipeline_calls == []
+    dispatcher.dispatch.assert_called_once()
+    messages = db.list_agent_dm_messages(101, "alpha_project", "writer_agent")
+    assert [message.body for message in messages] == [
+        "Распознанный photo text",
+        "Отвечаю на photo DM.",
+    ]
+
+
+def test_direct_owner_dm_policy_gate_returns_truthful_disabled_reply(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=False),
+        )
+    )
+    tier_store = TierSessionStore(default_tier_registry(), state_db=db)
+    tier_store.set_active(101, "STANDARD")
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(return_value=_llm_response())  # type: ignore[method-assign]
+    service = AgentDmSingleReplyService(
+        dispatcher=dispatcher,
+        state_db=db,
+        personas=default_registry(),
+        tier_registry=tier_store.registry,
+    )
+    pipeline_calls: list[str] = []
+
+    wrapped = wrap_task_handler_with_agent_dm_single_reply(
+        lambda text, msg: pipeline_calls.append(text)
+        or BridgeReply(persona_role=COORDINATOR_ROLE, body="pipeline"),
+        service=service,
+        tier_store=tier_store,
+        project_registry=registry,
+    )
+
+    reply = wrapped("Подскажи по API", _direct_dm_msg())
+
+    assert isinstance(reply, BridgeReply)
+    assert reply.persona_role == "writer_agent"
+    assert "выключен" in reply.body.lower()
+    assert pipeline_calls == []
+    assert db.get_agent_dm_session(101, "alpha_project", "writer_agent") is None
+    assert db.list_agent_dm_messages(101, "alpha_project", "writer_agent") == ()
+    dispatcher.dispatch.assert_not_called()
+
+
+def test_direct_owner_dm_tier_gate_returns_truthful_reply(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=True),
+        )
+    )
+    tier_store = TierSessionStore(default_tier_registry(), state_db=db)
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(return_value=_llm_response())  # type: ignore[method-assign]
+    service = AgentDmSingleReplyService(
+        dispatcher=dispatcher,
+        state_db=db,
+        personas=default_registry(),
+        tier_registry=tier_store.registry,
+    )
+    pipeline_calls: list[str] = []
+
+    wrapped = wrap_task_handler_with_agent_dm_single_reply(
+        lambda text, msg: pipeline_calls.append(text)
+        or BridgeReply(persona_role=COORDINATOR_ROLE, body="pipeline"),
+        service=service,
+        tier_store=tier_store,
+        project_registry=registry,
+    )
+
+    reply = wrapped("Подскажи по API", _direct_dm_msg())
+
+    assert isinstance(reply, BridgeReply)
+    assert reply.persona_role == "writer_agent"
+    assert "/tier set <имя>" in reply.body
+    assert pipeline_calls == []
+    assert db.get_agent_dm_session(101, "alpha_project", "writer_agent") is None
+    assert db.list_agent_dm_messages(101, "alpha_project", "writer_agent") == ()
+    dispatcher.dispatch.assert_not_called()
+
+
+def test_wrapper_preserves_existing_coordinator_and_non_direct_paths(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=True),
+        )
+    )
+    tier_store = TierSessionStore(default_tier_registry(), state_db=db)
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(return_value=_llm_response())  # type: ignore[method-assign]
+    service = AgentDmSingleReplyService(
+        dispatcher=dispatcher,
+        state_db=db,
+        personas=default_registry(),
+        tier_registry=tier_store.registry,
+    )
+    base_calls: list[tuple[str, str | None, str | None]] = []
+
+    wrapped = wrap_task_handler_with_agent_dm_single_reply(
+        lambda text, msg: base_calls.append(
+            (text, msg.incoming_bot_role, msg.project_context_source)
+        )
+        or BridgeReply(persona_role=COORDINATOR_ROLE, body="base path"),
+        service=service,
+        tier_store=tier_store,
+        project_registry=registry,
+    )
+
+    coordinator_reply = wrapped(
+        "coord dm",
+        _direct_dm_msg(incoming_bot_role="coordinator_agent"),
+    )
+    bound_chat_reply = wrapped(
+        "bound chat task",
+        IncomingMessage(
+            chat_id=-100123,
+            user_id=101,
+            message_id=2,
+            text="bound chat task",
+            project_id="alpha_project",
+            project_slug="alpha-project",
+            project_context_source="bound_chat",
+            incoming_bot_role="writer_agent",
+        ),
+    )
+
+    assert coordinator_reply is not None
+    assert bound_chat_reply is not None
+    assert base_calls == [
+        ("coord dm", "coordinator_agent", "owner_dm_single_project"),
+        ("bound chat task", "writer_agent", "bound_chat"),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # build_bridge_from_env (top-level integration)
 # ---------------------------------------------------------------------------
 
@@ -2811,6 +3115,99 @@ def test_build_bridge_from_env_end_to_end_flow(tmp_path):
     assert len(captured) == 1
     assert captured[0].text.startswith("Координатор:")
     assert "привет" in captured[0].text
+
+
+def test_build_bridge_from_env_wires_secondary_owner_dm_single_shot_reply(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "state.db")
+    ProjectRegistry(db).register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=True),
+        )
+    )
+    db.set_tier(101, "STANDARD", last_changed_at=1.0)
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="101",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
+    send, captured = _captured_send()
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(return_value=_llm_response("Личный ответ writer."))  # type: ignore[method-assign]
+
+    with patch("core.bot_runner.build_dispatcher_from_env", return_value=dispatcher):
+        bridge = build_bridge_from_env(env, send_callable=send)
+
+    result = bridge.handle(_direct_dm_msg())
+
+    assert result.handled is True
+    assert captured[0].text.startswith("Программист:")
+    assert "Личный ответ writer." in captured[0].text
+    assert db.get_agent_dm_session(101, "alpha_project", "writer_agent") is not None
+    messages = db.list_agent_dm_messages(101, "alpha_project", "writer_agent")
+    assert [message.sender_kind for message in messages] == ["owner", "agent"]
+
+
+def test_build_bridge_from_env_direct_dm_policy_disabled_is_truthful(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    ProjectRegistry(db).register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=False),
+        )
+    )
+    db.set_tier(101, "STANDARD", last_changed_at=1.0)
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="101",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
+    send, captured = _captured_send()
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(return_value=_llm_response())  # type: ignore[method-assign]
+
+    with patch("core.bot_runner.build_dispatcher_from_env", return_value=dispatcher):
+        bridge = build_bridge_from_env(env, send_callable=send)
+
+    result = bridge.handle(_direct_dm_msg())
+
+    assert result.handled is True
+    assert "direct dm" in captured[0].text.lower()
+    assert "выключен" in captured[0].text.lower()
+    assert db.get_agent_dm_session(101, "alpha_project", "writer_agent") is None
+    assert db.list_agent_dm_messages(101, "alpha_project", "writer_agent") == ()
+    dispatcher.dispatch.assert_not_called()
+
+
+def test_build_bridge_from_env_direct_dm_without_tier_is_truthful(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    ProjectRegistry(db).register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=True),
+        )
+    )
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="101",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
+    send, captured = _captured_send()
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(return_value=_llm_response())  # type: ignore[method-assign]
+
+    with patch("core.bot_runner.build_dispatcher_from_env", return_value=dispatcher):
+        bridge = build_bridge_from_env(env, send_callable=send)
+
+    result = bridge.handle(_direct_dm_msg())
+
+    assert result.handled is True
+    assert "/tier set <имя>" in captured[0].text
+    assert db.get_agent_dm_session(101, "alpha_project", "writer_agent") is None
+    assert db.list_agent_dm_messages(101, "alpha_project", "writer_agent") == ()
+    dispatcher.dispatch.assert_not_called()
 
 
 def test_build_bridge_from_env_command_flow(tmp_path):
