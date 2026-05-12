@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from core.agent_dm_models import AgentDmSession
 from core.project_models import (
     Project,
     ProjectChatBinding,
@@ -116,6 +118,22 @@ def _runtime_binding(repo_path: Path, **overrides: object) -> ProjectRuntimeBind
 
 def _make_db(tmp_path: Path) -> StateDB:
     return StateDB(tmp_path / "state.db")
+
+
+def _agent_dm_session(**overrides: object) -> AgentDmSession:
+    data: dict[str, object] = {
+        "owner_user_id": 101,
+        "project_id": "alpha_project",
+        "agent_role": "writer_agent",
+        "thread_bot_role": "writer_agent",
+        "dm_chat_id": 101,
+        "chat_provider": "telegram",
+        "status": "active",
+        "created_at": 1000.0,
+        "last_interaction_at": 1005.0,
+    }
+    data.update(overrides)
+    return AgentDmSession(**data)
 
 
 def _table_names(path: Path) -> set[str]:
@@ -610,6 +628,211 @@ def _build_v4_db(path: Path) -> None:
         conn.close()
 
 
+def _build_v5_db(path: Path, repo_path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO schema_meta(key, value) VALUES ('schema_version', '5')"
+        )
+        conn.execute(
+            """
+            CREATE TABLE tier_sessions (
+                chat_id INTEGER PRIMARY KEY,
+                active_tier TEXT NOT NULL,
+                last_changed_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE task_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                commit_sha TEXT,
+                final_state TEXT NOT NULL,
+                failure_reason TEXT,
+                tier_name TEXT NOT NULL,
+                finished_at REAL NOT NULL,
+                project_id TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE budget (
+                chat_id INTEGER PRIMARY KEY,
+                usd REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                owner_user_id INTEGER NOT NULL,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE project_policies (
+                project_id TEXT PRIMARY KEY,
+                allow_hiring INTEGER NOT NULL,
+                allow_agent_dm INTEGER NOT NULL,
+                require_owner_approval_for_hires INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE project_members (
+                project_id TEXT NOT NULL,
+                member_id TEXT NOT NULL,
+                member_type TEXT NOT NULL,
+                role_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY(project_id, member_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE project_chat_bindings (
+                project_id TEXT PRIMARY KEY,
+                chat_provider TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                UNIQUE(chat_provider, chat_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE project_runtime_bindings (
+                project_id TEXT PRIMARY KEY,
+                adapter_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                worktree_root TEXT,
+                base_branch TEXT NOT NULL,
+                branch_prefix TEXT NOT NULL,
+                language TEXT NOT NULL,
+                rules_json TEXT NOT NULL,
+                commands_json TEXT NOT NULL,
+                forbidden_paths_json TEXT NOT NULL,
+                forbidden_tokens_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO tier_sessions(chat_id, active_tier, last_changed_at)
+            VALUES (1, 'STANDARD', 1234.5)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO task_history(
+                task_id, branch, commit_sha, final_state,
+                failure_reason, tier_name, finished_at, project_id
+            )
+            VALUES (
+                'task-v5',
+                'feature/task-v5',
+                'f00dbabe',
+                'SUCCESS',
+                NULL,
+                'PREMIUM',
+                6666.5,
+                'alpha_project'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO budget(chat_id, usd)
+            VALUES (1, 11.5)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects(
+                project_id, slug, name, description, owner_user_id, status
+            )
+            VALUES (
+                'alpha_project',
+                'alpha-project',
+                'Alpha Project',
+                'Primary AI Office project.',
+                101,
+                'active'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO project_policies(
+                project_id, allow_hiring, allow_agent_dm,
+                require_owner_approval_for_hires
+            )
+            VALUES ('alpha_project', 1, 0, 1)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO project_members(
+                project_id, member_id, member_type, role_name, status
+            )
+            VALUES (
+                'alpha_project',
+                'coordinator_01',
+                'agent',
+                'coordinator_agent',
+                'active'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO project_chat_bindings(project_id, chat_provider, chat_id)
+            VALUES ('alpha_project', 'telegram', -1001234567890)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO project_runtime_bindings(
+                project_id, adapter_name, repo_path, worktree_root, base_branch,
+                branch_prefix, language, rules_json, commands_json,
+                forbidden_paths_json, forbidden_tokens_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "alpha_project",
+                "alpha_adapter",
+                str(repo_path),
+                str(repo_path.parent / "worktrees"),
+                "main",
+                "feature/",
+                "python",
+                json.dumps([]),
+                json.dumps([]),
+                json.dumps(["secrets/"]),
+                json.dumps(["API_KEY"]),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Construction / schema
 # ---------------------------------------------------------------------------
@@ -639,12 +862,12 @@ def test_constructor_creates_database_file(tmp_path: Path):
 
 def test_schema_version_is_current(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 5
+    assert db.schema_version() == 6
 
 
 def test_fresh_schema_creates_project_tables(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 5
+    assert db.schema_version() == 6
     assert _table_names(db.path) >= {
         "schema_meta",
         "tier_sessions",
@@ -655,6 +878,7 @@ def test_fresh_schema_creates_project_tables(tmp_path: Path):
         "project_members",
         "project_chat_bindings",
         "project_runtime_bindings",
+        "agent_dm_sessions",
     }
     assert _table_columns(db.path, "task_history") == [
         "id",
@@ -705,6 +929,17 @@ def test_fresh_schema_creates_project_tables(tmp_path: Path):
         "commands_json",
         "forbidden_paths_json",
         "forbidden_tokens_json",
+    ]
+    assert _table_columns(db.path, "agent_dm_sessions") == [
+        "owner_user_id",
+        "project_id",
+        "agent_role",
+        "thread_bot_role",
+        "dm_chat_id",
+        "chat_provider",
+        "status",
+        "created_at",
+        "last_interaction_at",
     ]
 
 
@@ -1479,7 +1714,121 @@ def test_get_project_runtime_binding_rejects_invalid_project_id(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v1 -> v5
+# Agent DM sessions
+# ---------------------------------------------------------------------------
+
+
+def test_agent_dm_session_round_trip(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    session = _agent_dm_session()
+
+    db.upsert_agent_dm_session(session)
+
+    assert db.get_agent_dm_session(101, "alpha_project", "writer_agent") == session
+
+
+def test_list_agent_dm_sessions_for_owner_returns_deterministic_order(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project(project_id="alpha_project", slug="alpha-project"))
+    db.upsert_project(_project(project_id="beta_project", slug="beta-project"))
+    db.upsert_agent_dm_session(
+        _agent_dm_session(
+            project_id="beta_project",
+            agent_role="reviewer_agent",
+            thread_bot_role="reviewer_agent",
+        )
+    )
+    db.upsert_agent_dm_session(
+        _agent_dm_session(
+            project_id="alpha_project",
+            agent_role="writer_agent",
+            thread_bot_role="writer_agent",
+        )
+    )
+    db.upsert_agent_dm_session(
+        _agent_dm_session(
+            project_id="alpha_project",
+            agent_role="architect_agent",
+            thread_bot_role="architect_agent",
+        )
+    )
+
+    sessions = db.list_agent_dm_sessions_for_owner(101)
+
+    assert tuple(
+        (session.project_id, session.agent_role) for session in sessions
+    ) == (
+        ("alpha_project", "architect_agent"),
+        ("alpha_project", "writer_agent"),
+        ("beta_project", "reviewer_agent"),
+    )
+
+
+def test_upsert_agent_dm_session_overwrites_existing_row(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_agent_dm_session(_agent_dm_session())
+    updated = _agent_dm_session(
+        thread_bot_role="reviewer_agent",
+        status="closed",
+        created_at=2000.0,
+        last_interaction_at=2005.0,
+    )
+
+    db.upsert_agent_dm_session(updated)
+
+    assert db.get_agent_dm_session(101, "alpha_project", "writer_agent") == updated
+
+
+def test_get_agent_dm_session_returns_none_for_missing_session(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+
+    assert db.get_agent_dm_session(101, "alpha_project", "writer_agent") is None
+
+
+def test_upsert_agent_dm_session_rejects_non_session(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_agent_dm_session_type:str"):
+        db.upsert_agent_dm_session("bad")  # type: ignore[arg-type]
+
+
+def test_upsert_agent_dm_session_rejects_unknown_project(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="unknown_project_id:alpha_project"):
+        db.upsert_agent_dm_session(_agent_dm_session())
+
+
+def test_upsert_agent_dm_session_rejects_owner_project_mismatch(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project(owner_user_id=999))
+
+    with pytest.raises(
+        ValueError,
+        match="agent_dm_session_owner_project_mismatch:101!=999",
+    ):
+        db.upsert_agent_dm_session(_agent_dm_session())
+
+
+def test_get_agent_dm_session_rejects_invalid_args(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_owner_user_id"):
+        db.get_agent_dm_session(0, "alpha_project", "writer_agent")
+    with pytest.raises(ValueError, match="invalid_project_id"):
+        db.get_agent_dm_session(101, "bad-id", "writer_agent")
+    with pytest.raises(ValueError, match="invalid_agent_role"):
+        db.get_agent_dm_session(101, "alpha_project", "writer-agent")
+
+
+def test_list_agent_dm_sessions_for_owner_rejects_invalid_owner_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_owner_user_id"):
+        db.list_agent_dm_sessions_for_owner(0)
+
+
+# ---------------------------------------------------------------------------
+# Migration v1 -> v6
 # ---------------------------------------------------------------------------
 
 
@@ -1489,7 +1838,7 @@ def test_migrates_v1_schema_with_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 5
+    assert db.schema_version() == 6
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v1")
     assert task is not None
@@ -1510,7 +1859,7 @@ def test_migrates_v1_schema_without_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 5
+    assert db.schema_version() == 6
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(7.5)
 
@@ -1548,7 +1897,7 @@ def test_v1_migration_adds_autoincrement_id_to_task_history(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v2 -> v5
+# Migration v2 -> v6
 # ---------------------------------------------------------------------------
 
 
@@ -1558,7 +1907,7 @@ def test_migrates_v2_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 5
+    assert db.schema_version() == 6
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v2")
     assert task is not None
@@ -1583,7 +1932,7 @@ def test_v2_migration_adds_project_tables(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v3 -> v5
+# Migration v3 -> v6
 # ---------------------------------------------------------------------------
 
 
@@ -1593,7 +1942,7 @@ def test_migrates_v3_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 5
+    assert db.schema_version() == 6
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(9.5)
     task = db.get_task("task-v3")
@@ -1616,7 +1965,7 @@ def test_v3_migration_adds_project_runtime_bindings_table(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v4 -> v5
+# Migration v4 -> v6
 # ---------------------------------------------------------------------------
 
 
@@ -1626,7 +1975,7 @@ def test_migrates_v4_schema_to_v5_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 5
+    assert db.schema_version() == 6
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(10.5)
     task = db.get_task("task-v4")
@@ -1643,3 +1992,39 @@ def test_v4_migration_adds_task_history_project_id_column(tmp_path: Path):
     StateDB(db_path)
 
     assert "project_id" in _table_columns(db_path, "task_history")
+
+
+# ---------------------------------------------------------------------------
+# Migration v5 -> v6
+# ---------------------------------------------------------------------------
+
+
+def test_migrates_v5_schema_to_v6_and_preserves_existing_data(tmp_path: Path):
+    db_path = tmp_path / "v5.db"
+    repo = _git_repo(tmp_path, "v5-repo")
+    _build_v5_db(db_path, repo)
+
+    db = StateDB(db_path)
+
+    assert db.schema_version() == 6
+    assert db.get_tier(1) == "STANDARD"
+    assert db.get_budget(1) == pytest.approx(11.5)
+    task = db.get_task("task-v5")
+    assert task is not None
+    assert task.branch == "feature/task-v5"
+    assert task.project_id == "alpha_project"
+    assert db.get_project("alpha_project") == _project()
+    assert db.get_project_policy("alpha_project") == _policy()
+    assert db.list_project_memberships("alpha_project") == [_membership()]
+    assert db.get_project_chat_binding("alpha_project") == _binding()
+    assert db.get_project_runtime_binding("alpha_project") == _runtime_binding(repo)
+
+
+def test_v5_migration_adds_agent_dm_sessions_table(tmp_path: Path):
+    db_path = tmp_path / "v5-dm.db"
+    repo = _git_repo(tmp_path, "v5-dm-repo")
+    _build_v5_db(db_path, repo)
+
+    StateDB(db_path)
+
+    assert "agent_dm_sessions" in _table_names(db_path)

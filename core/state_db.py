@@ -2,7 +2,8 @@
 core/state_db.py
 
 SQLite-backed persistent state for chat tier selection, completed task
-history, per-chat budget, and the AI Office project model.
+history, per-chat budget, the AI Office project model, and owner-agent
+DM session state.
 
 Design goals:
 1. Single-file stdlib-only storage (`sqlite3`), safe for bot restarts.
@@ -17,13 +18,13 @@ Design goals:
 CONTRACTS:
 1. StateDB(path) requires a Path; constructor creates parent directories and
    initializes/migrates the schema eagerly.
-2. Current schema version is 5. Unknown future versions raise ValueError.
+2. Current schema version is 6. Unknown future versions raise ValueError.
 3. Every public method validates arguments via isinstance/ValueError.
 4. Writes are serialized with a process-local lock; reads use independent
    SQLite connections and remain safe under concurrent access.
 5. task_history keeps an append-only audit log. get_task(task_id) returns the
    newest record for that task_id; recent_tasks(n) returns newest-last order.
-6. schema migration supports v1 -> v2 -> v3 -> v4 -> v5:
+6. schema migration supports v1 -> v2 -> v3 -> v4 -> v5 -> v6:
    - v1 -> v2: tier_sessions.tier_name -> active_tier
    - v1 -> v2: task_history gains AUTOINCREMENT id for stable append-order
      semantics
@@ -31,6 +32,7 @@ CONTRACTS:
      project_chat_bindings
    - v3 -> v4: adds project_runtime_bindings
    - v4 -> v5: adds task_history.project_id for project-aware task identity
+   - v5 -> v6: adds agent_dm_sessions for typed owner-agent DM session state
 7. Identity model is explicit:
    - Project.owner_user_id is a positive Telegram owner user id stored in
      projects.owner_user_id.
@@ -53,6 +55,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from core.adapter import ProjectCommand, ProjectRule
+from core.agent_dm_models import AgentDmSession
 from core.project_models import (
     VALID_CHAT_PROVIDERS,
     Project,
@@ -63,7 +66,7 @@ from core.project_models import (
 from core.project_runtime import ProjectRuntimeBinding
 from core.task_history import TaskSummary
 
-_CURRENT_SCHEMA_VERSION = 5
+_CURRENT_SCHEMA_VERSION = 6
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -159,6 +162,21 @@ CREATE TABLE IF NOT EXISTS project_runtime_bindings (
     commands_json TEXT NOT NULL,
     forbidden_paths_json TEXT NOT NULL,
     forbidden_tokens_json TEXT NOT NULL
+)
+"""
+
+_CREATE_AGENT_DM_SESSIONS = """
+CREATE TABLE IF NOT EXISTS agent_dm_sessions (
+    owner_user_id INTEGER NOT NULL,
+    project_id TEXT NOT NULL,
+    agent_role TEXT NOT NULL,
+    thread_bot_role TEXT NOT NULL,
+    dm_chat_id INTEGER NOT NULL,
+    chat_provider TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    last_interaction_at REAL NOT NULL,
+    PRIMARY KEY(owner_user_id, project_id, agent_role)
 )
 """
 
@@ -601,6 +619,75 @@ class StateDB:
         return self._row_to_project_runtime_binding(row)
 
     # ------------------------------------------------------------------
+    # Agent DM sessions
+    # ------------------------------------------------------------------
+
+    def upsert_agent_dm_session(self, session: AgentDmSession) -> None:
+        if not isinstance(session, AgentDmSession):
+            raise ValueError(
+                "invalid_agent_dm_session_type:"
+                f"{type(session).__name__}"
+            )
+        self._run_write_transaction(
+            lambda conn: self._upsert_agent_dm_session_conn(conn, session)
+        )
+
+    def get_agent_dm_session(
+        self,
+        owner_user_id: int,
+        project_id: str,
+        agent_role: str,
+    ) -> AgentDmSession | None:
+        self._validate_positive_int(owner_user_id, "owner_user_id")
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_agent_role = self._normalize_project_identifier(
+            agent_role,
+            field_name="agent_role",
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT owner_user_id, project_id, agent_role, thread_bot_role,
+                       dm_chat_id, chat_provider, status, created_at,
+                       last_interaction_at
+                FROM agent_dm_sessions
+                WHERE owner_user_id = ? AND project_id = ? AND agent_role = ?
+                """,
+                (
+                    owner_user_id,
+                    normalized_project_id,
+                    normalized_agent_role,
+                ),
+            ).fetchone()
+        return self._row_to_agent_dm_session(row)
+
+    def list_agent_dm_sessions_for_owner(
+        self,
+        owner_user_id: int,
+    ) -> tuple[AgentDmSession, ...]:
+        self._validate_positive_int(owner_user_id, "owner_user_id")
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT owner_user_id, project_id, agent_role, thread_bot_role,
+                       dm_chat_id, chat_provider, status, created_at,
+                       last_interaction_at
+                FROM agent_dm_sessions
+                WHERE owner_user_id = ?
+                ORDER BY project_id ASC, agent_role ASC
+                """,
+                (owner_user_id,),
+            ).fetchall()
+        return tuple(
+            session
+            for row in rows
+            if (session := self._row_to_agent_dm_session(row)) is not None
+        )
+
+    # ------------------------------------------------------------------
     # Schema management
     # ------------------------------------------------------------------
 
@@ -608,7 +695,7 @@ class StateDB:
         with self._lock, self._connect() as conn:
             version = self._detect_schema_version(conn)
             if version == 0:
-                self._create_v5_schema(conn)
+                self._create_v6_schema(conn)
                 return
             if version > _CURRENT_SCHEMA_VERSION:
                 raise ValueError(
@@ -631,9 +718,13 @@ class StateDB:
                     self._migrate_v4_to_v5(conn)
                     version = 5
                     continue
+                if version == 5:
+                    self._migrate_v5_to_v6(conn)
+                    version = 6
+                    continue
                 raise ValueError(f"unsupported_schema_version:{version}")
 
-    def _create_v5_schema(self, conn: sqlite3.Connection) -> None:
+    def _create_v6_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE_SCHEMA_META)
         conn.execute(_CREATE_TIER_SESSIONS)
         conn.execute(_CREATE_TASK_HISTORY)
@@ -643,6 +734,7 @@ class StateDB:
         conn.execute(_CREATE_PROJECT_MEMBERS)
         conn.execute(_CREATE_PROJECT_CHAT_BINDINGS)
         conn.execute(_CREATE_PROJECT_RUNTIME_BINDINGS)
+        conn.execute(_CREATE_AGENT_DM_SESSIONS)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_TASK_ID)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_FINISHED)
         self._set_schema_version(conn, _CURRENT_SCHEMA_VERSION)
@@ -672,6 +764,10 @@ class StateDB:
         if "project_id" not in columns:
             conn.execute("ALTER TABLE task_history ADD COLUMN project_id TEXT")
         self._set_schema_version(conn, 5)
+
+    def _migrate_v5_to_v6(self, conn: sqlite3.Connection) -> None:
+        conn.execute(_CREATE_AGENT_DM_SESSIONS)
+        self._set_schema_version(conn, 6)
 
     def _migrate_tier_sessions_to_v2(self, conn: sqlite3.Connection) -> None:
         columns = self._table_columns(conn, "tier_sessions")
@@ -945,6 +1041,24 @@ class StateDB:
             forbidden_tokens=tuple(str(item) for item in forbidden_tokens_data),
         )
 
+    @staticmethod
+    def _row_to_agent_dm_session(
+        row: sqlite3.Row | None,
+    ) -> AgentDmSession | None:
+        if row is None:
+            return None
+        return AgentDmSession(
+            owner_user_id=int(row["owner_user_id"]),
+            project_id=str(row["project_id"]),
+            agent_role=str(row["agent_role"]),
+            thread_bot_role=str(row["thread_bot_role"]),
+            dm_chat_id=int(row["dm_chat_id"]),
+            chat_provider=str(row["chat_provider"]),
+            status=str(row["status"]),
+            created_at=float(row["created_at"]),
+            last_interaction_at=float(row["last_interaction_at"]),
+        )
+
     def _upsert_project_conn(
         self,
         conn: sqlite3.Connection,
@@ -1151,6 +1265,69 @@ class StateDB:
                 json.dumps(list(binding.forbidden_tokens)),
             ),
         )
+
+    def _upsert_agent_dm_session_conn(
+        self,
+        conn: sqlite3.Connection,
+        session: AgentDmSession,
+    ) -> None:
+        project = self._get_project_row_by_id(conn, session.project_id)
+        if project is None:
+            raise ValueError(f"unknown_project_id:{session.project_id}")
+        project_owner_user_id = int(project["owner_user_id"])
+        if session.owner_user_id != project_owner_user_id:
+            raise ValueError(
+                "agent_dm_session_owner_project_mismatch:"
+                f"{session.owner_user_id}!={project_owner_user_id}"
+            )
+        conn.execute(
+            """
+            INSERT INTO agent_dm_sessions(
+                owner_user_id,
+                project_id,
+                agent_role,
+                thread_bot_role,
+                dm_chat_id,
+                chat_provider,
+                status,
+                created_at,
+                last_interaction_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_user_id, project_id, agent_role) DO UPDATE SET
+                thread_bot_role = excluded.thread_bot_role,
+                dm_chat_id = excluded.dm_chat_id,
+                chat_provider = excluded.chat_provider,
+                status = excluded.status,
+                created_at = excluded.created_at,
+                last_interaction_at = excluded.last_interaction_at
+            """,
+            (
+                session.owner_user_id,
+                session.project_id,
+                session.agent_role,
+                session.thread_bot_role,
+                session.dm_chat_id,
+                session.chat_provider,
+                session.status,
+                session.created_at,
+                session.last_interaction_at,
+            ),
+        )
+
+    def _get_project_row_by_id(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT project_id, slug, name, description, owner_user_id, status
+            FROM projects
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()
 
     def _project_exists_conn(
         self,
