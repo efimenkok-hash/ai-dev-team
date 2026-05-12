@@ -53,6 +53,10 @@ if str(ROOT) not in sys.path:
 
 from dotenv import load_dotenv  # noqa: E402
 
+from core.bot_identity_lifecycle import (  # noqa: E402
+    BotIdentityLifecycleService,
+    MultiBotLifecycleReport,
+)
 from core.bot_runner import (  # noqa: E402
     build_bridge_from_env,
     build_multi_bot_bridge_from_env,
@@ -74,6 +78,30 @@ from core.telegram_bridge import (  # noqa: E402
 )
 
 logger = logging.getLogger("ai_dev_team.bot")
+_LIFECYCLE_SERVICE = BotIdentityLifecycleService()
+
+
+class _StartupLifecycleError(RuntimeError):
+    def __init__(self, reason: str, report: MultiBotLifecycleReport) -> None:
+        super().__init__(reason)
+        self.report = report
+
+
+def _log_lifecycle_report(
+    report: MultiBotLifecycleReport,
+    *,
+    level: str = "info",
+    prefix: str = "Lifecycle summary",
+) -> None:
+    log_fn = getattr(logger, level)
+    log_fn("%s\n%s", prefix, _LIFECYCLE_SERVICE.format_report(report))
+
+
+def _classify_reachability_failure(role: str, exc: Exception) -> str:
+    exc_name = type(exc).__name__
+    if exc_name in {"InvalidToken", "Unauthorized"}:
+        return f"bot_token_invalid:{role}"
+    return f"bot_reachable_check_failed:{role}"
 
 
 @dataclass(frozen=True)
@@ -100,6 +128,7 @@ class RunningMultiBotRuntime:
     applications_by_role: Mapping[str, RunningBotApplication]
     outbound_sender: MultiBotOutboundSender
     progress_sender: MultiBotOutboundSender
+    lifecycle_report: MultiBotLifecycleReport
     primary_role: str
 
     def __post_init__(self) -> None:
@@ -118,6 +147,11 @@ class RunningMultiBotRuntime:
                 "invalid_multi_bot_progress_sender_type:"
                 f"{type(self.progress_sender).__name__}"
             )
+        if not isinstance(self.lifecycle_report, MultiBotLifecycleReport):
+            raise ValueError(
+                "invalid_multi_bot_lifecycle_report_type:"
+                f"{type(self.lifecycle_report).__name__}"
+            )
         if not isinstance(self.applications_by_role, Mapping):
             raise ValueError(
                 "invalid_running_multi_bot_applications_type:"
@@ -134,6 +168,8 @@ class RunningMultiBotRuntime:
             raise ValueError("running_multi_bot_outbound_sender_role_mismatch")
         if self.progress_sender.enabled_roles() != expected_roles:
             raise ValueError("running_multi_bot_progress_sender_role_mismatch")
+        if tuple(self.lifecycle_report.states_by_role.keys()) != expected_roles:
+            raise ValueError("running_multi_bot_lifecycle_report_role_mismatch")
         raw_roles = tuple(self.applications_by_role.keys())
         if not raw_roles:
             raise ValueError("empty_running_multi_bot_applications")
@@ -165,6 +201,23 @@ class RunningMultiBotRuntime:
             "applications_by_role",
             MappingProxyType(normalized),
         )
+
+
+def _set_runtime_lifecycle_report(
+    runtime: RunningMultiBotRuntime,
+    report: MultiBotLifecycleReport,
+) -> None:
+    if not isinstance(runtime, RunningMultiBotRuntime):
+        raise ValueError(
+            "invalid_running_multi_bot_runtime_type:"
+            f"{type(runtime).__name__}"
+        )
+    if not isinstance(report, MultiBotLifecycleReport):
+        raise ValueError(
+            "invalid_multi_bot_lifecycle_report_type:"
+            f"{type(report).__name__}"
+        )
+    object.__setattr__(runtime, "lifecycle_report", report)
 
 
 def _setup_logging(level: str) -> None:
@@ -306,6 +359,36 @@ def _build_send_progress_envelope_callable(application, loop):
             )
 
     return _send_progress_envelope
+
+
+async def _probe_bot_identity(running_app: RunningBotApplication) -> tuple[int, str]:
+    if not isinstance(running_app, RunningBotApplication):
+        raise ValueError(
+            "invalid_running_bot_application_type:"
+            f"{type(running_app).__name__}"
+        )
+    me = await running_app.application.bot.get_me()
+    return int(me.id), str(me.username)
+
+
+async def _shutdown_single_application(
+    application,
+    *,
+    initialized: bool,
+    started: bool,
+    polling_started: bool,
+) -> None:
+    if polling_started:
+        updater = getattr(application, "updater", None)
+        if updater is not None:
+            with contextlib.suppress(Exception):
+                await updater.stop()
+    if started:
+        with contextlib.suppress(Exception):
+            await application.stop()
+    if initialized:
+        with contextlib.suppress(Exception):
+            await application.shutdown()
 
 
 def _ptb_update_to_incoming(update) -> IncomingMessage | None:
@@ -531,11 +614,14 @@ def _build_running_multi_bot_runtime(
             )
         )
 
+    lifecycle_report = _LIFECYCLE_SERVICE.build_initial_report(runtime_spec)
+
     return RunningMultiBotRuntime(
         bridge=bridge,
         applications_by_role=applications_by_role,
         outbound_sender=outbound_sender,
         progress_sender=progress_sender,
+        lifecycle_report=lifecycle_report,
         primary_role=COORDINATOR_ROLE,
     )
 
@@ -546,30 +632,72 @@ async def _start_running_multi_bot_runtime(
     initialized_roles: list[str] = []
     started_roles: list[str] = []
     polling_roles: list[str] = []
+    report = runtime.lifecycle_report
     try:
+        logger.info(
+            "Probing enabled bot identities: %s",
+            ", ".join(runtime.applications_by_role.keys()),
+        )
+        for role, running_app in runtime.applications_by_role.items():
+            try:
+                bot_user_id, bot_username = await _probe_bot_identity(running_app)
+                report = _LIFECYCLE_SERVICE.mark_reachable(
+                    report,
+                    role,
+                    bot_user_id=bot_user_id,
+                    bot_username=bot_username,
+                )
+                _set_runtime_lifecycle_report(runtime, report)
+            except Exception as exc:
+                reason = _classify_reachability_failure(role, exc)
+                report = _LIFECYCLE_SERVICE.mark_failure(report, role, reason)
+                _set_runtime_lifecycle_report(runtime, report)
+                raise RuntimeError(reason) from exc
+            logger.info(
+                "Bot identity %s reachable as @%s (id=%s)",
+                role,
+                bot_username,
+                bot_user_id,
+            )
+
         for role, running_app in runtime.applications_by_role.items():
             try:
                 await running_app.application.initialize()
                 initialized_roles.append(role)
+                report = _LIFECYCLE_SERVICE.mark_initialized(report, role)
+                _set_runtime_lifecycle_report(runtime, report)
+            except Exception as exc:
+                reason = f"multi_bot_application_initialize_failed:{role}"
+                report = _LIFECYCLE_SERVICE.mark_failure(report, role, reason)
+                _set_runtime_lifecycle_report(runtime, report)
+                raise RuntimeError(reason) from exc
+            try:
                 await running_app.application.start()
                 started_roles.append(role)
             except Exception as exc:
-                raise RuntimeError(
-                    f"multi_bot_application_start_failed:{role}"
-                ) from exc
+                reason = f"multi_bot_application_start_failed:{role}"
+                report = _LIFECYCLE_SERVICE.mark_failure(report, role, reason)
+                _set_runtime_lifecycle_report(runtime, report)
+                raise RuntimeError(reason) from exc
+            report = _LIFECYCLE_SERVICE.mark_started(report, role)
+            _set_runtime_lifecycle_report(runtime, report)
 
             updater = getattr(running_app.application, "updater", None)
             if updater is None:
-                raise RuntimeError(
-                    f"multi_bot_application_polling_failed:{role}"
-                )
+                reason = f"multi_bot_application_polling_failed:{role}"
+                report = _LIFECYCLE_SERVICE.mark_failure(report, role, reason)
+                _set_runtime_lifecycle_report(runtime, report)
+                raise RuntimeError(reason)
             polling_roles.append(role)
             try:
                 await updater.start_polling()
             except Exception as exc:
-                raise RuntimeError(
-                    f"multi_bot_application_polling_failed:{role}"
-                ) from exc
+                reason = f"multi_bot_application_polling_failed:{role}"
+                report = _LIFECYCLE_SERVICE.mark_failure(report, role, reason)
+                _set_runtime_lifecycle_report(runtime, report)
+                raise RuntimeError(reason) from exc
+            report = _LIFECYCLE_SERVICE.mark_polling_started(report, role)
+            _set_runtime_lifecycle_report(runtime, report)
     except Exception:
         await _shutdown_running_multi_bot_runtime(
             runtime,
@@ -578,6 +706,10 @@ async def _start_running_multi_bot_runtime(
             polling_roles=tuple(polling_roles),
         )
         raise
+    _log_lifecycle_report(
+        runtime.lifecycle_report,
+        prefix="Multi-bot lifecycle summary",
+    )
 
 
 async def _shutdown_running_multi_bot_runtime(
@@ -621,6 +753,134 @@ async def _shutdown_running_multi_bot_runtime(
     for role in reversed(resolved_initialized):
         with contextlib.suppress(Exception):
             await runtime.applications_by_role[role].application.shutdown()
+
+
+async def _start_single_bot_application(
+    application,
+    *,
+    identity: BotIdentity,
+    report: MultiBotLifecycleReport,
+) -> MultiBotLifecycleReport:
+    initialized = False
+    started = False
+    polling_started = False
+    updated_report = report
+    role = identity.agent_role
+    try:
+        bot_user_id, bot_username = await _probe_bot_identity(
+            RunningBotApplication(
+                identity=identity,
+                application=application,
+                send_callable=lambda _out: None,
+            )
+        )
+        updated_report = _LIFECYCLE_SERVICE.mark_reachable(
+            updated_report,
+            role,
+            bot_user_id=bot_user_id,
+            bot_username=bot_username,
+        )
+        logger.info(
+            "Bot identity %s reachable as @%s (id=%s)",
+            role,
+            bot_username,
+            bot_user_id,
+        )
+    except Exception as exc:
+        reason = _classify_reachability_failure(role, exc)
+        updated_report = _LIFECYCLE_SERVICE.mark_failure(
+            updated_report,
+            role,
+            reason,
+        )
+        raise _StartupLifecycleError(reason, updated_report) from exc
+
+    try:
+        await application.initialize()
+        initialized = True
+        updated_report = _LIFECYCLE_SERVICE.mark_initialized(
+            updated_report,
+            role,
+        )
+    except Exception as exc:
+        reason = f"multi_bot_application_initialize_failed:{role}"
+        updated_report = _LIFECYCLE_SERVICE.mark_failure(
+            updated_report,
+            role,
+            reason,
+        )
+        await _shutdown_single_application(
+            application,
+            initialized=initialized,
+            started=started,
+            polling_started=polling_started,
+        )
+        raise _StartupLifecycleError(reason, updated_report) from exc
+
+    try:
+        await application.start()
+        started = True
+        updated_report = _LIFECYCLE_SERVICE.mark_started(
+            updated_report,
+            role,
+        )
+    except Exception as exc:
+        reason = f"multi_bot_application_start_failed:{role}"
+        updated_report = _LIFECYCLE_SERVICE.mark_failure(
+            updated_report,
+            role,
+            reason,
+        )
+        await _shutdown_single_application(
+            application,
+            initialized=initialized,
+            started=started,
+            polling_started=polling_started,
+        )
+        raise _StartupLifecycleError(reason, updated_report) from exc
+
+    updater = getattr(application, "updater", None)
+    if updater is None:
+        reason = f"multi_bot_application_polling_failed:{role}"
+        updated_report = _LIFECYCLE_SERVICE.mark_failure(
+            updated_report,
+            role,
+            reason,
+        )
+        await _shutdown_single_application(
+            application,
+            initialized=initialized,
+            started=started,
+            polling_started=polling_started,
+        )
+        raise _StartupLifecycleError(reason, updated_report)
+    try:
+        await updater.start_polling()
+        polling_started = True
+        updated_report = _LIFECYCLE_SERVICE.mark_polling_started(
+            updated_report,
+            role,
+        )
+    except Exception as exc:
+        reason = f"multi_bot_application_polling_failed:{role}"
+        updated_report = _LIFECYCLE_SERVICE.mark_failure(
+            updated_report,
+            role,
+            reason,
+        )
+        await _shutdown_single_application(
+            application,
+            initialized=initialized,
+            started=started,
+            polling_started=polling_started,
+        )
+        raise _StartupLifecycleError(reason, updated_report) from exc
+
+    _log_lifecycle_report(
+        updated_report,
+        prefix="Single-bot lifecycle summary",
+    )
+    return updated_report
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -688,6 +948,11 @@ async def main(argv: list[str] | None = None) -> int:
             await _start_running_multi_bot_runtime(multi_runtime)
         except Exception as exc:
             logger.error("Multi-bot startup failed: %s", exc)
+            _log_lifecycle_report(
+                multi_runtime.lifecycle_report,
+                level="error",
+                prefix="Multi-bot lifecycle failure report",
+            )
             return 5
         try:
             stop_event = asyncio.Event()
@@ -702,7 +967,13 @@ async def main(argv: list[str] | None = None) -> int:
         logger.error("Configuration error: %s", exc)
         return 2
 
+    legacy_runtime_spec = build_multi_bot_runtime_spec_from_env(env)
+    if legacy_runtime_spec is None:
+        logger.error("Legacy runtime spec could not be built from TELEGRAM_BOT_TOKEN")
+        return 2
+
     application = ptb_runtime.ApplicationBuilder().token(token).build()
+    legacy_report = _LIFECYCLE_SERVICE.build_initial_report(legacy_runtime_spec)
 
     send_callable = _build_send_callable(application, loop)
     send_progress_callable = _build_send_progress_callable(application, loop)
@@ -740,10 +1011,22 @@ async def main(argv: list[str] | None = None) -> int:
         "Real LLM pipeline: %s",
         bool(env.get("OPENROUTER_API_KEY") and env.get("REPO_PATH")),
     )
-
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
+    try:
+        legacy_report = await _start_single_bot_application(
+            application,
+            identity=legacy_runtime_spec.primary_bot,
+            report=legacy_report,
+        )
+    except Exception as exc:
+        if isinstance(exc, _StartupLifecycleError):
+            legacy_report = exc.report
+        logger.error("Single-bot startup failed: %s", exc)
+        _log_lifecycle_report(
+            legacy_report,
+            level="error",
+            prefix="Single-bot lifecycle failure report",
+        )
+        return 5
 
     # Keep alive until user interrupts (Ctrl+C)
     try:

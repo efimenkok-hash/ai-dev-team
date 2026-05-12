@@ -22,6 +22,10 @@ if str(ROOT) not in sys.path:
 
 import scripts.run_telegram_bot as script  # noqa: E402
 from core.agent_personas import default_registry  # noqa: E402
+from core.bot_identity_lifecycle import (  # noqa: E402
+    BotIdentityLifecycleService,
+    MultiBotLifecycleReport,
+)
 from core.coordinator_role import COORDINATOR_ROLE  # noqa: E402
 from core.multi_bot_bridge import MultiBotBridge  # noqa: E402
 from core.multi_bot_runtime import (  # noqa: E402
@@ -42,6 +46,8 @@ from core.telegram_bridge import (  # noqa: E402
     OutgoingMessage,
     TelegramBridge,
 )
+
+_LIFECYCLE_SERVICE = BotIdentityLifecycleService()
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -142,6 +148,10 @@ def _progress_sender_for_bridge(bridge: MultiBotBridge) -> MultiBotOutboundSende
     return _outbound_sender_for_bridge(bridge)
 
 
+def _lifecycle_report_for_bridge(bridge: MultiBotBridge) -> MultiBotLifecycleReport:
+    return _LIFECYCLE_SERVICE.build_initial_report(bridge.runtime_spec)
+
+
 def _multi_bridge_with_task_handler(task_handler) -> MultiBotBridge:
     coordinator = _identity(
         token_env_key="TELEGRAM_BOT_TOKEN",
@@ -201,13 +211,35 @@ class _FakeApplication:
         self,
         token: str,
         *,
+        bot_user_id: int = 1,
+        bot_username: str = "coord_bot",
+        fail_get_me: Exception | None = None,
         fail_start: bool = False,
+        fail_initialize: bool = False,
         fail_polling: bool = False,
     ):
         self.token = token
-        self.bot = SimpleNamespace(send_message=AsyncMock(return_value=None))
+        if fail_get_me is None:
+            get_me = AsyncMock(
+                return_value=SimpleNamespace(
+                    id=bot_user_id,
+                    username=bot_username,
+                )
+            )
+        else:
+            get_me = AsyncMock(side_effect=fail_get_me)
+        self.bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=None),
+            get_me=get_me,
+        )
         self.handlers: list[_FakeMessageHandler] = []
-        self.initialize = AsyncMock(return_value=None)
+        self.initialize = AsyncMock(
+            side_effect=(
+                RuntimeError("initialize failed")
+                if fail_initialize
+                else None
+            )
+        )
         self.start = AsyncMock(
             side_effect=(
                 RuntimeError("start failed")
@@ -258,6 +290,10 @@ class _ImmediateLoop:
     async def run_in_executor(self, _executor, func, *args):
         self.calls.append((func, args))
         return func(*args)
+
+
+class InvalidToken(Exception):
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +356,7 @@ def test_running_multi_bot_runtime_happy_path():
         },
         outbound_sender=_outbound_sender_for_bridge(bridge),
         progress_sender=_progress_sender_for_bridge(bridge),
+        lifecycle_report=_lifecycle_report_for_bridge(bridge),
         primary_role=COORDINATOR_ROLE,
     )
 
@@ -346,6 +383,7 @@ def test_running_multi_bot_runtime_rejects_missing_role():
             applications_by_role={COORDINATOR_ROLE: coordinator},
             outbound_sender=_outbound_sender_for_bridge(bridge),
             progress_sender=_progress_sender_for_bridge(bridge),
+            lifecycle_report=_lifecycle_report_for_bridge(bridge),
             primary_role=COORDINATOR_ROLE,
         )
 
@@ -370,6 +408,7 @@ def test_running_multi_bot_runtime_rejects_role_identity_mismatch():
             },
             outbound_sender=_outbound_sender_for_bridge(bridge),
             progress_sender=_progress_sender_for_bridge(bridge),
+            lifecycle_report=_lifecycle_report_for_bridge(bridge),
             primary_role=COORDINATOR_ROLE,
         )
 
@@ -859,6 +898,8 @@ def test_build_running_multi_bot_runtime_builds_application_per_enabled_role(tmp
         COORDINATOR_ROLE,
         "writer_agent",
     )
+    assert runtime.lifecycle_report.states_by_role[COORDINATOR_ROLE].application_built is True
+    assert runtime.lifecycle_report.states_by_role["writer_agent"].application_built is True
     assert len(runtime.applications_by_role[COORDINATOR_ROLE].application.handlers) == 1
     assert len(runtime.applications_by_role["writer_agent"].application.handlers) == 1
 
@@ -1366,7 +1407,7 @@ def test_multi_bot_handler_suppresses_attachment_error_reply_for_secondary_role(
     mock_handle.assert_not_called()
 
 
-def test_start_and_shutdown_running_multi_bot_runtime_cover_all_apps(tmp_path):
+def test_start_and_shutdown_running_multi_bot_runtime_cover_all_apps(tmp_path, caplog):
     runtime = script._build_running_multi_bot_runtime(
         {
             "TELEGRAM_OWNER_CHAT_ID": "777",
@@ -1383,16 +1424,59 @@ def test_start_and_shutdown_running_multi_bot_runtime_cover_all_apps(tmp_path):
     )
     assert runtime is not None
 
-    asyncio.run(script._start_running_multi_bot_runtime(runtime))
+    with caplog.at_level("INFO", logger="ai_dev_team.bot"):
+        asyncio.run(script._start_running_multi_bot_runtime(runtime))
     asyncio.run(script._shutdown_running_multi_bot_runtime(runtime))
 
     for running in runtime.applications_by_role.values():
+        running.application.bot.get_me.assert_awaited_once()
         running.application.initialize.assert_awaited_once()
         running.application.start.assert_awaited_once()
         running.application.updater.start_polling.assert_awaited_once()
         running.application.updater.stop.assert_awaited_once()
         running.application.stop.assert_awaited_once()
         running.application.shutdown.assert_awaited_once()
+
+    assert runtime.lifecycle_report.states_by_role[COORDINATOR_ROLE].reachability.reachable is True
+    assert runtime.lifecycle_report.states_by_role[COORDINATOR_ROLE].reachability.bot_username == "coord_bot"
+    assert runtime.lifecycle_report.states_by_role["writer_agent"].polling_started is True
+    assert "Multi-bot lifecycle summary" in caplog.text
+    assert "@coord_bot" in caplog.text
+
+
+def test_start_single_bot_application_tracks_legacy_lifecycle_report():
+    app = _FakeApplication(
+        "123:legacy",
+        bot_user_id=777001,
+        bot_username="coord_legacy_bot",
+    )
+    identity = _identity(
+        token_env_key="TELEGRAM_BOT_TOKEN",
+        token="123:legacy",
+    )
+    report = _LIFECYCLE_SERVICE.build_initial_report(
+        MultiBotRuntimeSpec(
+            primary_bot=identity,
+            role_map=_role_map(identity),
+            source="single_token_legacy",
+        )
+    )
+
+    updated = asyncio.run(
+        script._start_single_bot_application(
+            app,
+            identity=identity,
+            report=report,
+        )
+    )
+
+    state = updated.states_by_role[COORDINATOR_ROLE]
+    assert state.reachability.token_valid is True
+    assert state.reachability.reachable is True
+    assert state.reachability.bot_user_id == 777001
+    assert state.reachability.bot_username == "coord_legacy_bot"
+    assert state.started is True
+    assert state.polling_started is True
 
 
 def test_start_running_multi_bot_runtime_rolls_back_when_second_app_start_fails(tmp_path):
@@ -1436,6 +1520,12 @@ def test_start_running_multi_bot_runtime_rolls_back_when_second_app_start_fails(
     built_apps["writer_agent"].updater.stop.assert_not_awaited()
     built_apps["writer_agent"].stop.assert_not_awaited()
     built_apps["writer_agent"].shutdown.assert_awaited_once()
+    assert runtime.lifecycle_report.states_by_role[COORDINATOR_ROLE].started is True
+    assert runtime.lifecycle_report.states_by_role["writer_agent"].started is False
+    assert (
+        runtime.lifecycle_report.states_by_role["writer_agent"].failure_reason
+        == "multi_bot_application_start_failed:writer_agent"
+    )
 
 
 def test_start_running_multi_bot_runtime_rolls_back_when_second_app_polling_fails(
@@ -1481,6 +1571,108 @@ def test_start_running_multi_bot_runtime_rolls_back_when_second_app_polling_fail
     built_apps["writer_agent"].updater.stop.assert_awaited_once()
     built_apps["writer_agent"].stop.assert_awaited_once()
     built_apps["writer_agent"].shutdown.assert_awaited_once()
+    assert runtime.lifecycle_report.states_by_role[COORDINATOR_ROLE].polling_started is True
+    assert runtime.lifecycle_report.states_by_role["writer_agent"].started is True
+    assert runtime.lifecycle_report.states_by_role["writer_agent"].polling_started is False
+    assert (
+        runtime.lifecycle_report.states_by_role["writer_agent"].failure_reason
+        == "multi_bot_application_polling_failed:writer_agent"
+    )
+
+
+def test_start_running_multi_bot_runtime_fails_fast_on_secondary_invalid_token_probe(
+    tmp_path,
+):
+    built_apps: dict[str, _FakeApplication] = {}
+    token_roles = {
+        "123:coord": COORDINATOR_ROLE,
+        "456:writer": "writer_agent",
+    }
+
+    def _app_factory(token):
+        role = token_roles[token]
+        app = _FakeApplication(
+            token,
+            fail_get_me=InvalidToken("bad token") if role == "writer_agent" else None,
+        )
+        built_apps[role] = app
+        return app
+
+    runtime = script._build_running_multi_bot_runtime(
+        {
+            "TELEGRAM_OWNER_CHAT_ID": "777",
+            "STATE_DB_PATH": str(tmp_path / "state.db"),
+            "TELEGRAM_AGENT_TOKENS": (
+                "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+            ),
+            "TELEGRAM_BOT_TOKEN": "123:coord",
+            "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
+        },
+        _ImmediateLoop(),
+        ptb_runtime=_FakePTBRuntime(_app_factory),
+    )
+    assert runtime is not None
+
+    with pytest.raises(RuntimeError, match="bot_token_invalid:writer_agent"):
+        asyncio.run(script._start_running_multi_bot_runtime(runtime))
+
+    built_apps[COORDINATOR_ROLE].bot.get_me.assert_awaited_once()
+    built_apps["writer_agent"].bot.get_me.assert_awaited_once()
+    built_apps[COORDINATOR_ROLE].initialize.assert_not_awaited()
+    built_apps["writer_agent"].initialize.assert_not_awaited()
+    assert runtime.lifecycle_report.states_by_role[COORDINATOR_ROLE].reachability.reachable is True
+    assert runtime.lifecycle_report.states_by_role["writer_agent"].reachability.reachable is False
+    assert (
+        runtime.lifecycle_report.states_by_role["writer_agent"].failure_reason
+        == "bot_token_invalid:writer_agent"
+    )
+
+
+def test_start_running_multi_bot_runtime_marks_generic_probe_failure_as_unreachable(
+    tmp_path,
+):
+    built_apps: dict[str, _FakeApplication] = {}
+    token_roles = {
+        "123:coord": COORDINATOR_ROLE,
+        "456:writer": "writer_agent",
+    }
+
+    def _app_factory(token):
+        role = token_roles[token]
+        app = _FakeApplication(
+            token,
+            fail_get_me=RuntimeError("network down") if role == "writer_agent" else None,
+        )
+        built_apps[role] = app
+        return app
+
+    runtime = script._build_running_multi_bot_runtime(
+        {
+            "TELEGRAM_OWNER_CHAT_ID": "777",
+            "STATE_DB_PATH": str(tmp_path / "state.db"),
+            "TELEGRAM_AGENT_TOKENS": (
+                "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+            ),
+            "TELEGRAM_BOT_TOKEN": "123:coord",
+            "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
+        },
+        _ImmediateLoop(),
+        ptb_runtime=_FakePTBRuntime(_app_factory),
+    )
+    assert runtime is not None
+
+    with pytest.raises(
+        RuntimeError,
+        match="bot_reachable_check_failed:writer_agent",
+    ):
+        asyncio.run(script._start_running_multi_bot_runtime(runtime))
+
+    assert (
+        runtime.lifecycle_report.states_by_role["writer_agent"].failure_reason
+        == "bot_reachable_check_failed:writer_agent"
+    )
 
 
 def test_main_multi_bot_mode_starts_multiple_applications_and_cleans_orphans_once(tmp_path):
@@ -1526,6 +1718,7 @@ def test_main_multi_bot_mode_starts_multiple_applications_and_cleans_orphans_onc
     assert [app.token for app in built_apps] == ["123:coord", "456:writer"]
     mock_cleanup.assert_called_once_with(env)
     for app in built_apps:
+        app.bot.get_me.assert_awaited_once()
         app.initialize.assert_awaited_once()
         app.start.assert_awaited_once()
         app.updater.start_polling.assert_awaited_once()
@@ -1576,6 +1769,59 @@ def test_main_multi_bot_start_failure_returns_error_and_stops_started_apps(tmp_p
     built_apps[COORDINATOR_ROLE].updater.stop.assert_awaited_once()
     built_apps[COORDINATOR_ROLE].stop.assert_awaited_once()
     built_apps[COORDINATOR_ROLE].shutdown.assert_awaited_once()
+    built_apps["writer_agent"].bot.get_me.assert_awaited_once()
+
+
+def test_main_multi_bot_invalid_secondary_token_returns_error_without_fallback(
+    tmp_path,
+):
+    built_apps: dict[str, _FakeApplication] = {}
+    token_roles = {
+        "123:coord": COORDINATOR_ROLE,
+        "456:writer": "writer_agent",
+    }
+
+    def _app_factory(token):
+        role = token_roles[token]
+        app = _FakeApplication(
+            token,
+            fail_get_me=InvalidToken("bad token") if role == "writer_agent" else None,
+        )
+        built_apps[role] = app
+        return app
+
+    env = {
+        "TELEGRAM_OWNER_CHAT_ID": "777",
+        "STATE_DB_PATH": str(tmp_path / "state.db"),
+        "TELEGRAM_AGENT_TOKENS": (
+            "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+            "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+        ),
+        "TELEGRAM_BOT_TOKEN": "123:coord",
+        "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
+    }
+
+    with (
+        patch("scripts.run_telegram_bot.load_dotenv"),
+        patch("scripts.run_telegram_bot.os.environ", env),
+        patch(
+            "scripts.run_telegram_bot._load_ptb_runtime",
+            return_value=_FakePTBRuntime(_app_factory),
+        ),
+        patch(
+            "core.bot_runner.cleanup_orphan_worktrees_from_env",
+            return_value=0,
+        ),
+        patch("scripts.run_telegram_bot.build_bridge_from_env") as mock_single_bridge,
+    ):
+        rc = asyncio.run(script.main([]))
+
+    assert rc == 5
+    mock_single_bridge.assert_not_called()
+    built_apps[COORDINATOR_ROLE].bot.get_me.assert_awaited_once()
+    built_apps["writer_agent"].bot.get_me.assert_awaited_once()
+    built_apps[COORDINATOR_ROLE].initialize.assert_not_awaited()
+    built_apps["writer_agent"].initialize.assert_not_awaited()
 
 
 def test_main_legacy_mode_still_builds_single_application(tmp_path):
@@ -1619,4 +1865,8 @@ def test_main_legacy_mode_still_builds_single_application(tmp_path):
     assert rc == 0
     assert len(built_apps) == 1
     assert built_apps[0].token == "123:legacy"
+    built_apps[0].bot.get_me.assert_awaited_once()
+    built_apps[0].initialize.assert_awaited_once()
+    built_apps[0].start.assert_awaited_once()
+    built_apps[0].updater.start_polling.assert_awaited_once()
     mock_build_bridge.assert_called_once()
