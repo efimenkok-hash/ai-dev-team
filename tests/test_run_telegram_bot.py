@@ -38,6 +38,8 @@ from core.telegram_bridge import (  # noqa: E402
     BridgeReply,
     BridgeResult,
     IncomingMessage,
+    OutgoingEnvelope,
+    OutgoingMessage,
     TelegramBridge,
 )
 
@@ -134,6 +136,10 @@ def _outbound_sender_for_bridge(bridge: MultiBotBridge) -> MultiBotOutboundSende
             },
         )
     )
+
+
+def _progress_sender_for_bridge(bridge: MultiBotBridge) -> MultiBotOutboundSender:
+    return _outbound_sender_for_bridge(bridge)
 
 
 def _multi_bridge_with_task_handler(task_handler) -> MultiBotBridge:
@@ -313,6 +319,7 @@ def test_running_multi_bot_runtime_happy_path():
             COORDINATOR_ROLE: coordinator,
         },
         outbound_sender=_outbound_sender_for_bridge(bridge),
+        progress_sender=_progress_sender_for_bridge(bridge),
         primary_role=COORDINATOR_ROLE,
     )
 
@@ -338,6 +345,7 @@ def test_running_multi_bot_runtime_rejects_missing_role():
             bridge=bridge,
             applications_by_role={COORDINATOR_ROLE: coordinator},
             outbound_sender=_outbound_sender_for_bridge(bridge),
+            progress_sender=_progress_sender_for_bridge(bridge),
             primary_role=COORDINATOR_ROLE,
         )
 
@@ -361,6 +369,7 @@ def test_running_multi_bot_runtime_rejects_role_identity_mismatch():
                 "writer_agent": coordinator,
             },
             outbound_sender=_outbound_sender_for_bridge(bridge),
+            progress_sender=_progress_sender_for_bridge(bridge),
             primary_role=COORDINATOR_ROLE,
         )
 
@@ -564,6 +573,94 @@ def test_send_progress_does_not_block_worker_on_slow_telegram():
 
 
 # ---------------------------------------------------------------------------
+# _build_send_progress_envelope_callable — thread-safe scheduling
+# ---------------------------------------------------------------------------
+
+
+def test_send_progress_envelope_schedules_run_coroutine_threadsafe():
+    app, loop = _make_app_and_loop()
+    try:
+        fn = script._build_send_progress_envelope_callable(app, loop)
+        fake_future = MagicMock()
+        envelope = OutgoingEnvelope(
+            message=OutgoingMessage(chat_id=42, text="writer update"),
+            sender_role="writer_agent",
+        )
+
+        with patch(
+            "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+            side_effect=_close_coro_and_return(fake_future),
+        ) as mock_rctf:
+            app.bot.send_message = AsyncMock(return_value=None)
+            fn(envelope)
+
+        assert mock_rctf.call_count == 1
+        _coro_arg, loop_arg = mock_rctf.call_args.args
+        assert loop_arg is loop
+        fake_future.add_done_callback.assert_called_once()
+        fake_future.result.assert_not_called()
+    finally:
+        loop.close()
+
+
+def test_send_progress_envelope_routes_message_fields_without_rewriting_text():
+    app, loop = _make_app_and_loop()
+    try:
+        fn = script._build_send_progress_envelope_callable(app, loop)
+        fake_future = MagicMock()
+        app.bot.send_message = AsyncMock(return_value=None)
+        envelope = OutgoingEnvelope(
+            message=OutgoingMessage(
+                chat_id=99,
+                text="Архитектор: progress update",
+                reply_to_message_id=7,
+            ),
+            sender_role="architect_agent",
+        )
+
+        with patch(
+            "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+            side_effect=_close_coro_and_return(fake_future),
+        ):
+            fn(envelope)
+
+        app.bot.send_message.assert_called_once_with(
+            chat_id=99,
+            text="Архитектор: progress update",
+            reply_to_message_id=7,
+        )
+    finally:
+        loop.close()
+
+
+def test_send_progress_envelope_does_not_block_worker_on_slow_telegram():
+    import time
+
+    app, loop = _make_app_and_loop()
+    try:
+        fn = script._build_send_progress_envelope_callable(app, loop)
+        fake_future = MagicMock()
+        envelope = OutgoingEnvelope(
+            message=OutgoingMessage(chat_id=1, text="fire and forget"),
+            sender_role=COORDINATOR_ROLE,
+        )
+
+        with patch(
+            "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+            side_effect=_close_coro_and_return(fake_future),
+        ):
+            app.bot.send_message = AsyncMock(return_value=None)
+            start = time.monotonic()
+            fn(envelope)
+            elapsed = time.monotonic() - start
+
+        assert elapsed < 1.0
+        fake_future.result.assert_not_called()
+    finally:
+        loop.close()
+
+
+# ---------------------------------------------------------------------------
 # _build_send_callable — sanity (existing behaviour, not regressed)
 # ---------------------------------------------------------------------------
 
@@ -653,8 +750,17 @@ def test_main_wires_send_progress_callable_into_build_bridge(tmp_path):
 
     captured: dict = {}
 
-    def _fake_build_bridge(env_arg, *, send_callable, send_progress_callable=None):
+    def _fake_build_bridge(
+        env_arg,
+        *,
+        send_callable,
+        send_progress_callable=None,
+        send_progress_envelope_callable=None,
+    ):
         captured["send_progress_callable"] = send_progress_callable
+        captured["send_progress_envelope_callable"] = (
+            send_progress_envelope_callable
+        )
         raise SystemExit(0)  # stop main() early
 
     # Build a minimal fake telegram.ext module so the lazy import succeeds.
@@ -693,6 +799,8 @@ def test_main_wires_send_progress_callable_into_build_bridge(tmp_path):
 
     assert captured.get("send_progress_callable") is not None
     assert callable(captured["send_progress_callable"])
+    assert captured.get("send_progress_envelope_callable") is not None
+    assert callable(captured["send_progress_envelope_callable"])
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +852,10 @@ def test_build_running_multi_bot_runtime_builds_application_per_enabled_role(tmp
         "writer_agent",
     )
     assert runtime.outbound_sender.enabled_roles() == (
+        COORDINATOR_ROLE,
+        "writer_agent",
+    )
+    assert runtime.progress_sender.enabled_roles() == (
         COORDINATOR_ROLE,
         "writer_agent",
     )
@@ -910,7 +1022,7 @@ def test_multi_bot_runtime_unknown_role_falls_back_to_coordinator_sender(tmp_pat
     assert "[неизвестная роль 'ghost_agent']" in sent_text
 
 
-def test_build_running_multi_bot_runtime_keeps_progress_sender_on_coordinator(
+def test_build_running_multi_bot_runtime_wires_envelope_progress_sender_into_bridge(
     tmp_path,
 ):
     captured: dict[str, object] = {}
@@ -920,8 +1032,10 @@ def test_build_running_multi_bot_runtime_keeps_progress_sender_on_coordinator(
         *,
         send_callable,
         send_progress_callable=None,
+        send_progress_envelope_callable=None,
     ):
         captured["send_progress_callable"] = send_progress_callable
+        captured["send_progress_envelope_callable"] = send_progress_envelope_callable
         captured["send_callable"] = send_callable
         return _multi_bridge()
 
@@ -946,22 +1060,93 @@ def test_build_running_multi_bot_runtime_keeps_progress_sender_on_coordinator(
 
     assert runtime is not None
     assert callable(captured["send_progress_callable"])
+    assert callable(captured["send_progress_envelope_callable"])
+
+
+def test_multi_bot_progress_sender_routes_writer_envelope_through_writer_application(
+    tmp_path,
+):
+    runtime = script._build_running_multi_bot_runtime(
+        {
+            "TELEGRAM_OWNER_CHAT_ID": "777",
+            "STATE_DB_PATH": str(tmp_path / "state.db"),
+            "TELEGRAM_AGENT_TOKENS": (
+                "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+            ),
+            "TELEGRAM_BOT_TOKEN": "123:coord",
+            "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
+        },
+        _ImmediateLoop(),
+        ptb_runtime=_FakePTBRuntime(lambda token: _FakeApplication(token)),
+    )
+    assert runtime is not None
     coordinator_app = runtime.applications_by_role[COORDINATOR_ROLE].application
     writer_app = runtime.applications_by_role["writer_agent"].application
     fake_future = MagicMock()
-    fake_future.result.return_value = None
 
     with patch(
         "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
         side_effect=_close_coro_and_return(fake_future),
     ):
-        captured["send_progress_callable"](777, "progress update")
+        used_role = runtime.progress_sender.send(
+            OutgoingEnvelope(
+                message=OutgoingMessage(chat_id=-100123, text="Программист: update"),
+                sender_role="writer_agent",
+            )
+        )
 
+    assert used_role == "writer_agent"
+    writer_app.bot.send_message.assert_called_once_with(
+        chat_id=-100123,
+        text="Программист: update",
+        reply_to_message_id=None,
+    )
+    coordinator_app.bot.send_message.assert_not_called()
+    fake_future.result.assert_not_called()
+
+
+def test_multi_bot_progress_sender_falls_back_to_coordinator_for_unknown_role(
+    tmp_path,
+):
+    runtime = script._build_running_multi_bot_runtime(
+        {
+            "TELEGRAM_OWNER_CHAT_ID": "777",
+            "STATE_DB_PATH": str(tmp_path / "state.db"),
+            "TELEGRAM_AGENT_TOKENS": (
+                "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                "writer_agent=TELEGRAM_WRITER_BOT_TOKEN"
+            ),
+            "TELEGRAM_BOT_TOKEN": "123:coord",
+            "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
+        },
+        _ImmediateLoop(),
+        ptb_runtime=_FakePTBRuntime(lambda token: _FakeApplication(token)),
+    )
+    assert runtime is not None
+    coordinator_app = runtime.applications_by_role[COORDINATOR_ROLE].application
+    writer_app = runtime.applications_by_role["writer_agent"].application
+    fake_future = MagicMock()
+
+    with patch(
+        "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+        side_effect=_close_coro_and_return(fake_future),
+    ):
+        used_role = runtime.progress_sender.send(
+            OutgoingEnvelope(
+                message=OutgoingMessage(chat_id=-100123, text="Архитектор: update"),
+                sender_role="architect_agent",
+            )
+        )
+
+    assert used_role == COORDINATOR_ROLE
     coordinator_app.bot.send_message.assert_called_once_with(
-        chat_id=777,
-        text="progress update",
+        chat_id=-100123,
+        text="Архитектор: update",
+        reply_to_message_id=None,
     )
     writer_app.bot.send_message.assert_not_called()
+    fake_future.result.assert_not_called()
 
 
 def test_multi_bot_handler_routes_coordinator_inbound_through_multi_bot_bridge(tmp_path):

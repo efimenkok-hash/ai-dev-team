@@ -54,6 +54,7 @@ from core.task_history import TaskHistory
 from core.telegram_bridge import (
     BridgeReply,
     IncomingMessage,
+    OutgoingEnvelope,
     TelegramBridge,
 )
 from core.tier_session import TierSessionStore
@@ -677,6 +678,21 @@ def test_build_real_task_handler_rejects_non_callable_progress():
             tier_store=store,
             send_progress="not callable",  # type: ignore[arg-type]
         )
+
+
+def test_build_real_task_handler_accepts_envelope_progress_callable(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    store = TierSessionStore(default_tier_registry())
+
+    result = build_real_task_handler_from_env(
+        {"OPENROUTER_API_KEY": "sk-or-test", "REPO_PATH": str(repo)},
+        tier_store=store,
+        send_progress_envelope=lambda _env: None,
+    )
+
+    assert callable(result)
 
 
 def test_build_real_task_handler_shuts_down_runner_on_factory_failure(tmp_path):
@@ -3365,6 +3381,27 @@ def test_build_bridge_from_env_accepts_send_progress_callable(tmp_path):
     assert isinstance(bridge, TelegramBridge)
 
 
+def test_build_bridge_from_env_accepts_send_progress_envelope_callable(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    progress_log: list[OutgoingEnvelope] = []
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+        REPO_PATH=str(repo),
+    )
+    send, _ = _captured_send()
+    bridge = build_bridge_from_env(
+        env,
+        send_callable=send,
+        send_progress_envelope_callable=lambda env: progress_log.append(env),
+    )
+
+    assert isinstance(bridge, TelegramBridge)
+
+
 def test_build_bridge_from_env_requires_send_progress_when_real_pipeline(tmp_path):
     """Real pipeline active (API key + REPO_PATH set) but send_progress_callable
     omitted → ValueError so caller is not silently losing 30+ seconds of events.
@@ -3381,6 +3418,29 @@ def test_build_bridge_from_env_requires_send_progress_when_real_pipeline(tmp_pat
     send, _ = _captured_send()
     with pytest.raises(ValueError, match="send_progress_required_for_real_pipeline"):
         build_bridge_from_env(env, send_callable=send)  # no send_progress_callable
+
+
+def test_build_bridge_from_env_envelope_progress_satisfies_real_pipeline_guard(
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="777",
+        OPENROUTER_API_KEY="sk-or-test",
+        REPO_PATH=str(repo),
+    )
+    send, _ = _captured_send()
+
+    bridge = build_bridge_from_env(
+        env,
+        send_callable=send,
+        send_progress_envelope_callable=lambda envelope: None,
+    )
+
+    assert isinstance(bridge, TelegramBridge)
 
 
 def test_build_bridge_from_env_no_send_progress_ok_without_real_pipeline(tmp_path):

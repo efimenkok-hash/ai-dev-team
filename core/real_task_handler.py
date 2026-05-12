@@ -97,6 +97,11 @@ from core.progress_emitter import (
     ProgressEvent,
     wrap_registry_with_progress,
 )
+from core.project_chat_posting import (
+    ProjectChatPostingContext,
+    ProjectChatPostingService,
+    format_progress_event,
+)
 from core.project_runtime_router import (
     ProjectRuntimeRouter,
     ResolvedProjectRuntime,
@@ -110,7 +115,13 @@ from core.sandbox_workspace import (
     WorktreeHandle,
 )
 from core.task_history import TaskHistory, TaskSummary
-from core.telegram_bridge import BridgeReply, IncomingMessage, TaskHandler
+from core.telegram_bridge import (
+    BridgeReply,
+    IncomingMessage,
+    OutgoingEnvelope,
+    OutgoingMessage,
+    TaskHandler,
+)
 from core.tier_session import TierSessionStore
 
 # Same shape as sandbox_workspace._TASK_ID_RE — duplicated to avoid a
@@ -119,6 +130,7 @@ _TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 # Streaming format chosen to be readable in Telegram with fixed-width spans.
 SendProgress = Callable[[int, str], None]
+SendProgressEnvelope = Callable[[OutgoingEnvelope], None]
 AgentRegistryFactory = Callable[[TierConfig], AgentRegistry]
 
 
@@ -177,25 +189,7 @@ def generate_task_id(
 
 def _format_event(event: ProgressEvent) -> str:
     """Translate a ProgressEvent into a single short Russian-language line."""
-    kind = event.kind
-    agent = event.agent_role or "—"
-    detail = (event.detail or "").strip()
-    if kind == "task_started":
-        return f"🚀 Старт{(' · ' + detail) if detail else ''}"
-    if kind == "agent_started":
-        return f"▶︎ {agent} начал"
-    if kind == "agent_finished":
-        ms = event.duration_ms or 0
-        return f"✓ {agent} закончил ({ms} мс)"
-    if kind == "agent_failed":
-        return f"⚠️ {agent} упал — {detail[:160]}"
-    if kind == "fsm_transition":
-        return f"⤳ {detail}" if detail else "⤳ переход"
-    if kind == "task_completed":
-        return f"🏁 Готово{(' · ' + detail) if detail else ''}"
-    if kind == "task_failed":
-        return f"💥 Провалена: {detail or 'причина не указана'}"
-    return f"[{kind}] {detail}"
+    return format_progress_event(event)
 
 
 def _default_agent_registry_factory(_tier: TierConfig) -> AgentRegistry:
@@ -215,7 +209,8 @@ def make_real_task_handler(
     sandbox: SandboxWorkspace | None = None,
     runtime_router: ProjectRuntimeRouter | None = None,
     tier_store: TierSessionStore,
-    send_progress: SendProgress,
+    send_progress: SendProgress | None = None,
+    send_progress_envelope: SendProgressEnvelope | None = None,
     agent_registry_factory: AgentRegistryFactory = _default_agent_registry_factory,
     config: RealTaskHandlerConfig | None = None,
     observability: Observability | None = None,
@@ -253,7 +248,11 @@ def make_real_task_handler(
         raise ValueError("sandbox_or_runtime_router_required")
     if not isinstance(tier_store, TierSessionStore):
         raise ValueError(f"invalid_tier_store:{type(tier_store).__name__}")
-    if not callable(send_progress):
+    if send_progress is not None and not callable(send_progress):
+        raise ValueError("send_progress_not_callable")
+    if send_progress_envelope is not None and not callable(send_progress_envelope):
+        raise ValueError("send_progress_envelope_not_callable")
+    if send_progress is None and send_progress_envelope is None:
         raise ValueError("send_progress_not_callable")
     if not callable(agent_registry_factory):
         raise ValueError("agent_registry_factory_not_callable")
@@ -285,18 +284,49 @@ def make_real_task_handler(
     team_assembly_service = CoordinatorTeamAssemblyService()
     owner_escalation_service = CoordinatorOwnerEscalationService()
     team_proposal_service = CoordinatorTeamProposalService()
+    posting_service = ProjectChatPostingService()
 
     available_tiers = ", ".join(tier_store.registry.list_names())
 
+    def _adapt_legacy_send_progress(
+        legacy_send_progress: SendProgress | None,
+    ) -> SendProgressEnvelope:
+        if legacy_send_progress is None or not callable(legacy_send_progress):
+            raise ValueError("send_progress_not_callable")
+
+        def _send(envelope: OutgoingEnvelope) -> None:
+            legacy_send_progress(
+                envelope.message.chat_id,
+                envelope.message.text,
+            )
+
+        return _send
+
+    _send_progress_envelope: SendProgressEnvelope = (
+        send_progress_envelope
+        if send_progress_envelope is not None
+        else _adapt_legacy_send_progress(send_progress)
+    )
+
+    def _safe_send_envelope(envelope: OutgoingEnvelope) -> None:
+        with contextlib.suppress(Exception):
+            _send_progress_envelope(envelope)
+
     def _safe_send(chat_id: int, text: str) -> None:
         with contextlib.suppress(Exception):
-            send_progress(chat_id, text)
+            _send_progress_envelope(
+                OutgoingEnvelope(
+                    message=OutgoingMessage(chat_id=chat_id, text=text),
+                    sender_role=COORDINATOR_ROLE,
+                )
+            )
 
     def _build_run_fn(
         chat_id: int,
         task_id: str,
         owner_task_text: str,
         onboarding_context: ProjectCaptainOnboardingContext | None,
+        posting_context: ProjectChatPostingContext | None,
         pipeline_task_prompt: str,
         initial_artifacts: dict[str, str] | None,
         tier_name: str,
@@ -322,7 +352,13 @@ def make_real_task_handler(
             def _on_event(evt: ProgressEvent) -> None:
                 if token.is_set() and evt.kind not in _TERMINAL_EVENTS:
                     return
-                _safe_send(chat_id, _format_event(evt))
+                _safe_send_envelope(
+                    _build_event_envelope(
+                        chat_id=chat_id,
+                        event=evt,
+                        posting_context=posting_context,
+                    )
+                )
 
             emitter = ProgressEmitter(_on_event)
             emitter.emit_task_started(
@@ -343,13 +379,16 @@ def make_real_task_handler(
                 raise
 
             try:
-                _safe_send(
-                    chat_id,
-                    (
+                _safe_send_envelope(
+                    _build_system_envelope(
+                        chat_id=chat_id,
+                        posting_context=posting_context,
+                        text=(
                         f"🌳 worktree готов\n"
                         f"  branch  `{handle.branch}`\n"
                         f"  path    `{handle.path.name}`"
-                    ),
+                        ),
+                    )
                 )
 
                 memory = memory_factory()
@@ -567,6 +606,80 @@ def make_real_task_handler(
             ),
         }
 
+    def _build_project_chat_posting_context(
+        onboarding_context: ProjectCaptainOnboardingContext | None,
+    ) -> ProjectChatPostingContext | None:
+        if onboarding_context is None:
+            return None
+        return ProjectChatPostingContext(
+            snapshot=onboarding_context.snapshot,
+            chat_id=onboarding_context.chat_id,
+            context_source=onboarding_context.context_source,
+        )
+
+    def _fallback_progress_event_envelope(
+        chat_id: int,
+        event: ProgressEvent,
+    ) -> OutgoingEnvelope:
+        return OutgoingEnvelope(
+            message=OutgoingMessage(
+                chat_id=chat_id,
+                text=_format_event(event),
+            ),
+            sender_role=COORDINATOR_ROLE,
+        )
+
+    def _build_event_envelope(
+        *,
+        chat_id: int,
+        event: ProgressEvent,
+        posting_context: ProjectChatPostingContext | None,
+    ) -> OutgoingEnvelope:
+        if posting_context is None:
+            return _fallback_progress_event_envelope(chat_id, event)
+        try:
+            return posting_service.build_event_envelope(posting_context, event)
+        except ValueError:
+            return _fallback_progress_event_envelope(chat_id, event)
+
+    def _build_system_envelope(
+        *,
+        chat_id: int,
+        text: str,
+        posting_context: ProjectChatPostingContext | None,
+    ) -> OutgoingEnvelope:
+        if posting_context is None:
+            return OutgoingEnvelope(
+                message=OutgoingMessage(chat_id=chat_id, text=text),
+                sender_role=COORDINATOR_ROLE,
+            )
+        try:
+            return posting_service.build_system_envelope(posting_context, text)
+        except ValueError:
+            return OutgoingEnvelope(
+                message=OutgoingMessage(chat_id=chat_id, text=text),
+                sender_role=COORDINATOR_ROLE,
+            )
+
+    def _build_terminal_envelope(
+        *,
+        chat_id: int,
+        text: str,
+        posting_context: ProjectChatPostingContext | None,
+    ) -> OutgoingEnvelope:
+        if posting_context is None:
+            return OutgoingEnvelope(
+                message=OutgoingMessage(chat_id=chat_id, text=text),
+                sender_role=COORDINATOR_ROLE,
+            )
+        try:
+            return posting_service.build_terminal_envelope(posting_context, text)
+        except ValueError:
+            return OutgoingEnvelope(
+                message=OutgoingMessage(chat_id=chat_id, text=text),
+                sender_role=COORDINATOR_ROLE,
+            )
+
     def _fallback_owner_escalation_reply(
         *,
         onboarding_context: ProjectCaptainOnboardingContext,
@@ -639,26 +752,33 @@ def make_real_task_handler(
         chat_id: int,
         *,
         project_id: str | None,
+        posting_context: ProjectChatPostingContext | None,
     ) -> Callable[..., None]:
         def _on_complete(handle: TaskHandle, result, error) -> None:
             if error is not None:
-                _safe_send(
-                    chat_id,
-                    (
+                _safe_send_envelope(
+                    _build_terminal_envelope(
+                        chat_id=chat_id,
+                        posting_context=posting_context,
+                        text=(
                         f"❌ Воркер упал\n"
                         f"  task-id `{handle.task_id}`\n"
                         f"  {type(error).__name__}: {str(error)[:200]}"
-                    ),
+                        ),
+                    )
                 )
                 return
             if not isinstance(result, dict):
-                _safe_send(
-                    chat_id,
-                    (
+                _safe_send_envelope(
+                    _build_terminal_envelope(
+                        chat_id=chat_id,
+                        posting_context=posting_context,
+                        text=(
                         f"❌ Воркер вернул неожиданный результат\n"
                         f"  task-id `{handle.task_id}`\n"
                         f"  type={type(result).__name__}"
-                    ),
+                        ),
+                    )
                 )
                 return
             final_state = result.get("final_state", "?")
@@ -684,20 +804,25 @@ def make_real_task_handler(
                     )
 
             if final_state == "CANCELLED":
-                _safe_send(
-                    chat_id,
-                    (
+                _safe_send_envelope(
+                    _build_terminal_envelope(
+                        chat_id=chat_id,
+                        posting_context=posting_context,
+                        text=(
                         f"⏹ Отменено пользователем\n"
                         f"\n"
                         f"  task-id `{handle.task_id}`\n"
                         f"  тариф   `{tier_name}`\n"
                         f"  Коммит не сделан."
-                    ),
+                        ),
+                    )
                 )
             elif final_state == State.SUCCESS.value:
-                _safe_send(
-                    chat_id,
-                    (
+                _safe_send_envelope(
+                    _build_terminal_envelope(
+                        chat_id=chat_id,
+                        posting_context=posting_context,
+                        text=(
                         f"✅ Готово\n"
                         f"\n"
                         f"  task-id `{handle.task_id}`\n"
@@ -706,13 +831,16 @@ def make_real_task_handler(
                         + (f"  commit  `{sha_short}`\n" if sha_short else "")
                         + f"\n"
                         f"Запуш в GitHub:  /push {handle.task_id}"
-                    ),
+                        ),
+                    )
                 )
             else:
                 owner_escalation_reply = result.get("owner_escalation_reply")
-                _safe_send(
-                    chat_id,
-                    (
+                _safe_send_envelope(
+                    _build_terminal_envelope(
+                        chat_id=chat_id,
+                        posting_context=posting_context,
+                        text=(
                         f"❌ Не получилось\n"
                         f"\n"
                         f"  task-id `{handle.task_id}`\n"
@@ -724,7 +852,8 @@ def make_real_task_handler(
                             else ""
                         )
                         + f"  reason  `{result.get('failure_reason', '?')}`"
-                    ),
+                        ),
+                    )
                 )
 
         return _on_complete
@@ -782,6 +911,9 @@ def make_real_task_handler(
                 msg=msg,
                 resolved_runtime=resolved_runtime,
             )
+            posting_context = _build_project_chat_posting_context(
+                onboarding_context
+            )
             pipeline_task_prompt = _build_pipeline_task_prompt(
                 onboarding_context,
                 owner_task_text=text,
@@ -819,12 +951,17 @@ def make_real_task_handler(
             task_id,
             text,
             onboarding_context,
+            posting_context,
             pipeline_task_prompt,
             initial_artifacts,
             tier_name,
             sandbox_workspace,
         )
-        on_complete = _build_on_complete(chat_id, project_id=project_id)
+        on_complete = _build_on_complete(
+            chat_id,
+            project_id=project_id,
+            posting_context=posting_context,
+        )
         try:
             runner.submit(
                 task_id=task_id,

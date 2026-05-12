@@ -28,6 +28,8 @@ network or PTB dependencies.
 Threading contract:
     send_callable        — called from executor threads via bridge.handle()
     send_progress_callable — called from BackgroundTaskRunner worker thread
+    send_progress_envelope_callable — same worker-thread path, but preserves
+    sender_role until transport selection
     Both use asyncio.run_coroutine_threadsafe to safely schedule PTB coroutines
     onto the main event loop. Errors in send_progress are logged and swallowed
     so the worker thread stays alive.
@@ -97,6 +99,7 @@ class RunningMultiBotRuntime:
     bridge: MultiBotBridge
     applications_by_role: Mapping[str, RunningBotApplication]
     outbound_sender: MultiBotOutboundSender
+    progress_sender: MultiBotOutboundSender
     primary_role: str
 
     def __post_init__(self) -> None:
@@ -110,6 +113,11 @@ class RunningMultiBotRuntime:
                 "invalid_multi_bot_outbound_sender_type:"
                 f"{type(self.outbound_sender).__name__}"
             )
+        if not isinstance(self.progress_sender, MultiBotOutboundSender):
+            raise ValueError(
+                "invalid_multi_bot_progress_sender_type:"
+                f"{type(self.progress_sender).__name__}"
+            )
         if not isinstance(self.applications_by_role, Mapping):
             raise ValueError(
                 "invalid_running_multi_bot_applications_type:"
@@ -122,6 +130,10 @@ class RunningMultiBotRuntime:
             )
 
         expected_roles = self.bridge.enabled_roles()
+        if self.outbound_sender.enabled_roles() != expected_roles:
+            raise ValueError("running_multi_bot_outbound_sender_role_mismatch")
+        if self.progress_sender.enabled_roles() != expected_roles:
+            raise ValueError("running_multi_bot_progress_sender_role_mismatch")
         raw_roles = tuple(self.applications_by_role.keys())
         if not raw_roles:
             raise ValueError("empty_running_multi_bot_applications")
@@ -256,6 +268,44 @@ def _build_send_progress_callable(application, loop):
             )
 
     return _send_progress
+
+
+def _build_send_progress_envelope_callable(application, loop):
+    """Create a sync `send_progress_envelope(OutgoingEnvelope)` callable.
+
+    This path is intentionally fire-and-forget: used for worker progress and
+    project updates where blocking the worker thread on Telegram delivery would
+    serialize the whole pipeline on network I/O.
+    """
+
+    def _on_send_done(future) -> None:
+        exc = future.exception()
+        if exc is not None:
+            logger.error("send_progress_envelope send_message failed: %s", exc)
+
+    def _send_progress_envelope(envelope: OutgoingEnvelope) -> None:
+        if not isinstance(envelope, OutgoingEnvelope):
+            raise ValueError(
+                "invalid_outgoing_envelope_type:"
+                f"{type(envelope).__name__}"
+            )
+        coro = application.bot.send_message(
+            chat_id=envelope.message.chat_id,
+            text=envelope.message.text,
+            reply_to_message_id=envelope.message.reply_to_message_id,
+        )
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            future.add_done_callback(_on_send_done)
+        except Exception:
+            coro.close()
+            logger.exception(
+                "send_progress_envelope submission failed for chat_id=%s; "
+                "worker continues",
+                envelope.message.chat_id,
+            )
+
+    return _send_progress_envelope
 
 
 def _ptb_update_to_incoming(update) -> IncomingMessage | None:
@@ -421,6 +471,21 @@ def _build_running_multi_bot_runtime(
         )
 
     coordinator_app = applications_by_role[COORDINATOR_ROLE]
+    progress_sender = MultiBotOutboundSender(
+        PerRoleOutboundSender(
+            primary_role=COORDINATOR_ROLE,
+            senders_by_role={
+                role: RoleBoundSender(
+                    identity=running_app.identity,
+                    send_envelope=_build_send_progress_envelope_callable(
+                        running_app.application,
+                        loop,
+                    ),
+                )
+                for role, running_app in applications_by_role.items()
+            },
+        )
+    )
     bridge = build_multi_bot_bridge_from_env(
         env,
         send_callable=coordinator_app.send_callable,
@@ -428,6 +493,7 @@ def _build_running_multi_bot_runtime(
             coordinator_app.application,
             loop,
         ),
+        send_progress_envelope_callable=progress_sender.send,
     )
     if bridge is None:
         raise RuntimeError("multi_bot_bridge_build_failed")
@@ -466,6 +532,7 @@ def _build_running_multi_bot_runtime(
         bridge=bridge,
         applications_by_role=applications_by_role,
         outbound_sender=outbound_sender,
+        progress_sender=progress_sender,
         primary_role=COORDINATOR_ROLE,
     )
 
@@ -636,11 +703,16 @@ async def main(argv: list[str] | None = None) -> int:
 
     send_callable = _build_send_callable(application, loop)
     send_progress_callable = _build_send_progress_callable(application, loop)
+    send_progress_envelope_callable = _build_send_progress_envelope_callable(
+        application,
+        loop,
+    )
     try:
         bridge = build_bridge_from_env(
             env,
             send_callable=send_callable,
             send_progress_callable=send_progress_callable,
+            send_progress_envelope_callable=send_progress_envelope_callable,
         )
     except ValueError as exc:
         logger.error("Bridge construction failed: %s", exc)

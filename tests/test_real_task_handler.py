@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from core.background_runner import BackgroundTaskRunner
+from core.coordinator_role import COORDINATOR_ROLE
 from core.memory import PipelineMemory
 from core.model_tier import default_registry as default_tier_registry
 from core.observability import Observability
@@ -37,7 +38,11 @@ from core.sandbox_workspace import (
     _SubprocessRunner,
 )
 from core.state_db import StateDB
-from core.telegram_bridge import BridgeReply, IncomingMessage
+from core.telegram_bridge import (
+    BridgeReply,
+    IncomingMessage,
+    OutgoingEnvelope,
+)
 from core.tier_session import TierSessionStore
 
 # ---------------------------------------------------------------------------
@@ -191,6 +196,17 @@ def _make_progress_capture():
     def _send(chat_id: int, text: str) -> None:
         with lock:
             captured.append((chat_id, text))
+
+    return _send, captured
+
+
+def _make_progress_envelope_capture():
+    captured: list[OutgoingEnvelope] = []
+    lock = threading.Lock()
+
+    def _send(envelope: OutgoingEnvelope) -> None:
+        with lock:
+            captured.append(envelope)
 
     return _send, captured
 
@@ -427,6 +443,22 @@ def test_make_handler_rejects_non_callable_send(runner, sandbox, tier_store):
             sandbox=sandbox,
             tier_store=tier_store,
             send_progress="not callable",  # type: ignore[arg-type]
+        )
+
+
+def test_make_handler_rejects_non_callable_send_progress_envelope(
+    runner,
+    sandbox,
+    tier_store,
+):
+    send, _ = _make_progress_capture()
+    with pytest.raises(ValueError, match="send_progress_envelope_not_callable"):
+        make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send,
+            send_progress_envelope="not callable",  # type: ignore[arg-type]
         )
 
 
@@ -1245,6 +1277,219 @@ def test_project_aware_cancelled_path_does_not_seed_owner_escalation(
         _wait_for_count(captured, lambda c: any("Отменено" in t for _, t in c))
 
     assert memory.get_artifact(task_id, "owner_escalation") is None
+
+
+def test_bound_project_chat_progress_posts_use_agent_and_coordinator_roles(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send_envelope, captured = _make_progress_envelope_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="posting-bound-success.db",
+    )
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="feedface12345678"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress_envelope=send_envelope,
+            agent_registry_factory=happy_agents,
+            task_id_factory=lambda: "task-posting-bound-success-001",
+        )
+        handler(
+            "Ship the notification command.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Ship the notification command.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        _wait_until_idle(runner)
+
+    assert any(
+        env.sender_role == COORDINATOR_ROLE
+        and env.message.text.startswith("🚀 Старт")
+        for env in captured
+    )
+    assert any(
+        env.sender_role == "architect_agent"
+        and "architect_agent начал" in env.message.text
+        for env in captured
+    )
+    assert any(
+        env.sender_role == "writer_agent"
+        and "writer_agent закончил" in env.message.text
+        for env in captured
+    )
+    assert any(
+        env.sender_role == COORDINATOR_ROLE
+        and "🌳 worktree готов" in env.message.text
+        for env in captured
+    )
+    assert any(
+        env.sender_role == COORDINATOR_ROLE
+        and "✅ Готово" in env.message.text
+        for env in captured
+    )
+
+
+def test_bound_project_chat_agent_failed_post_uses_agent_role(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send_envelope, captured = _make_progress_envelope_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="posting-bound-fail.db",
+    )
+
+    with patch("core.project_runtime_router._build_sandbox", return_value=sandbox):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress_envelope=send_envelope,
+            agent_registry_factory=exploding_agents,
+            task_id_factory=lambda: "task-posting-bound-fail-001",
+        )
+        handler(
+            "Break planning.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Break planning.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        _wait_until_idle(runner)
+        _wait_for_count(captured, lambda c: any("❌ Не получилось" in env.message.text for env in c))
+
+    assert any(
+        env.sender_role == "planning_agent"
+        and "planning_agent упал" in env.message.text
+        for env in captured
+    )
+    assert any(
+        env.sender_role == COORDINATOR_ROLE
+        and "❌ Не получилось" in env.message.text
+        for env in captured
+    )
+
+
+def test_owner_dm_fallback_progress_posts_remain_coordinator_owned(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(101, "STANDARD")
+    send_envelope, captured = _make_progress_envelope_capture()
+    snapshot = _project_snapshot(fake_repo)
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="posting-owner-dm.db",
+    )
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="0123456789abcdef"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress_envelope=send_envelope,
+            agent_registry_factory=happy_agents,
+            task_id_factory=lambda: "task-posting-owner-dm-001",
+        )
+        handler(
+            "Prepare the release branch.",
+            IncomingMessage(
+                chat_id=101,
+                user_id=101,
+                message_id=1,
+                text="Prepare the release branch.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="owner_dm_single_project",
+            ),
+        )
+        _wait_until_idle(runner)
+
+    assert any("writer_agent начал" in env.message.text for env in captured)
+    assert all(env.sender_role == COORDINATOR_ROLE for env in captured)
+
+
+def test_legacy_progress_posts_remain_coordinator_owned_and_sender_failure_is_swallowed(
+    runner,
+    sandbox,
+    tier_store,
+):
+    tier_store.set_active(42, "STANDARD")
+    captured: list[OutgoingEnvelope] = []
+
+    def _flaky_send(envelope: OutgoingEnvelope) -> None:
+        captured.append(envelope)
+        raise RuntimeError("telegram down")
+
+    handler = make_real_task_handler(
+        runner=runner,
+        sandbox=sandbox,
+        tier_store=tier_store,
+        send_progress_envelope=_flaky_send,
+        agent_registry_factory=happy_agents,
+        task_id_factory=lambda: "task-posting-legacy-001",
+    )
+    reply = handler("build me a thing", _msg(chat_id=42))
+    assert isinstance(reply, BridgeReply)
+    _wait_until_idle(runner)
+
+    assert captured
+    assert all(env.sender_role == COORDINATOR_ROLE for env in captured)
 
 
 def test_busy_message_keeps_original_owner_task_text_for_project_aware_tasks(

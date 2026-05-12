@@ -89,6 +89,7 @@ from core.task_history import TaskHistory
 from core.telegram_bridge import (
     BridgeReply,
     IncomingMessage,
+    OutgoingEnvelope,
     TaskHandler,
     TelegramBridge,
 )
@@ -196,6 +197,7 @@ def build_multi_bot_bridge_from_env(
     *,
     send_callable=None,
     send_progress_callable: Callable[[int, str], None] | None = None,
+    send_progress_envelope_callable: Callable[[OutgoingEnvelope], None] | None = None,
 ) -> MultiBotBridge | None:
     resolved_env = dict(os.environ) if env is None else env
     runtime_spec = build_multi_bot_runtime_spec_from_env(resolved_env)
@@ -205,6 +207,7 @@ def build_multi_bot_bridge_from_env(
         resolved_env,
         send_callable=send_callable,
         send_progress_callable=send_progress_callable,
+        send_progress_envelope_callable=send_progress_envelope_callable,
     )
     return MultiBotBridge(
         runtime_spec=runtime_spec,
@@ -494,7 +497,8 @@ def build_real_task_handler_from_env(
     env: Mapping[str, str],
     *,
     tier_store: TierSessionStore,
-    send_progress: Callable[[int, str], None],
+    send_progress: Callable[[int, str], None] | None = None,
+    send_progress_envelope: Callable[[OutgoingEnvelope], None] | None = None,
     sandbox: SandboxWorkspace | None = None,
     task_history: TaskHistory | None = None,
     runner: BackgroundTaskRunner | None = None,
@@ -537,7 +541,11 @@ def build_real_task_handler_from_env(
         raise ValueError("env_must_be_mapping")
     if not isinstance(tier_store, TierSessionStore):
         raise ValueError(f"invalid_tier_store:{type(tier_store).__name__}")
-    if not callable(send_progress):
+    if send_progress is not None and not callable(send_progress):
+        raise ValueError("send_progress_not_callable")
+    if send_progress_envelope is not None and not callable(send_progress_envelope):
+        raise ValueError("send_progress_envelope_not_callable")
+    if send_progress is None and send_progress_envelope is None:
         raise ValueError("send_progress_not_callable")
     if state_db is not None and not isinstance(state_db, StateDB):
         raise ValueError(f"invalid_state_db:{type(state_db).__name__}")
@@ -586,6 +594,7 @@ def build_real_task_handler_from_env(
             ),
             tier_store=tier_store,
             send_progress=send_progress,
+            send_progress_envelope=send_progress_envelope,
             agent_registry_factory=factory,
             config=RealTaskHandlerConfig(),
             task_history=task_history,
@@ -2225,6 +2234,7 @@ def build_bridge_from_env(
     *,
     send_callable=None,
     send_progress_callable: Callable[[int, str], None] | None = None,
+    send_progress_envelope_callable: Callable[[OutgoingEnvelope], None] | None = None,
 ) -> TelegramBridge:
     """Top-level builder. Reads env, assembles all components, returns
     a ready TelegramBridge.
@@ -2354,17 +2364,31 @@ def build_bridge_from_env(
         bootstrap_result=bootstrap_result,
         runtime_router=runtime_router,
     )
-    if pipeline_unavailable_reason is None and send_progress_callable is None:
+    if (
+        pipeline_unavailable_reason is None
+        and send_progress_callable is None
+        and send_progress_envelope_callable is None
+    ):
         raise ValueError("send_progress_required_for_real_pipeline")
 
-    _send_progress: Callable[[int, str], None] = (
+    _send_progress: Callable[[int, str], None] | None = (
         send_progress_callable if send_progress_callable is not None
-        else lambda _cid, _txt: None
+        else (
+            (lambda _cid, _txt: None)
+            if send_progress_envelope_callable is None
+            else None
+        )
+    )
+    _send_progress_envelope: Callable[[OutgoingEnvelope], None] | None = (
+        send_progress_envelope_callable
+        if send_progress_envelope_callable is not None
+        else None
     )
     real_task_handler = build_real_task_handler_from_env(
         env,
         tier_store=tier_store,
         send_progress=_send_progress,
+        send_progress_envelope=_send_progress_envelope,
         task_history=task_history,
         runner=runner,
         state_db=state_db,

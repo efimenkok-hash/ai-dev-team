@@ -2,7 +2,7 @@
 
 AI Dev Team is a Telegram-driven multi-agent engineering bot for autonomous work on real git repositories. It runs a fixed FSM pipeline over specialised agents, writes changes into isolated git worktrees, validates them with `ruff` and `pytest`, and can commit, push, and open draft PRs.
 
-Current production scope: coordinator-led Telegram control plane, one active worker, real OpenRouter pipeline, SQLite-backed state, project-aware execution resolved from bound project chats or the single-project owner-DM/bootstrap fallback, and an entrypoint that can launch multiple Telegram bot identities from `TELEGRAM_AGENT_TOKENS` with role-aware outbound sending plus coordinator fallback when a specific identity is unavailable.
+Current production scope: coordinator-led Telegram control plane, one active worker, real OpenRouter pipeline, SQLite-backed state, project-aware execution resolved from bound project chats or the single-project owner-DM/bootstrap fallback, and an entrypoint that can launch multiple Telegram bot identities from `TELEGRAM_AGENT_TOKENS` with role-aware outbound sending plus coordinator fallback when a specific identity is unavailable. Bound project chats now also receive agent lifecycle progress from the matching bot identity when that sender exists; owner-DM fallback remains coordinator-owned.
 
 ## Status
 
@@ -112,7 +112,7 @@ Project runtime resolution for the full pipeline:
 Optional:
 
 - `OPENAI_API_KEY` - enables Whisper voice transcription.
-- `TELEGRAM_AGENT_TOKENS` - optional role-to-env-key mapping for multi-bot runtime startup. Format: `coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN`. The values inside this string are env-var names, not raw Telegram tokens. When present, the entrypoint starts one PTB `Application` per configured identity, routes inbound messages through `MultiBotBridge`, and chooses outbound bot identity from the envelope `sender_role` with coordinator fallback if a specific sender is unavailable. Secondary inbound identities still currently resolve to `secondary_bot_inbound_not_enabled`, and progress events remain coordinator-routed at this step.
+- `TELEGRAM_AGENT_TOKENS` - optional role-to-env-key mapping for multi-bot runtime startup. Format: `coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN`. The values inside this string are env-var names, not raw Telegram tokens. When present, the entrypoint starts one PTB `Application` per configured identity, routes inbound messages through `MultiBotBridge`, and chooses outbound bot identity from the envelope `sender_role` with coordinator fallback if a specific sender is unavailable. Secondary inbound identities still currently resolve to `secondary_bot_inbound_not_enabled`. Bound project chats can now emit agent lifecycle progress through the matching bot identity; owner-DM fallback and terminal/system posts remain coordinator-owned at this step.
 - `REPO_PATH` - legacy bootstrap/fallback for single-project compatibility. It is no longer the sole source of runtime selection once projects with runtime bindings already exist in `StateDB`.
 - `WORKTREE_ROOT` - optional legacy bootstrap override for the worktree root.
 - `STATE_DB_PATH` - SQLite path for tier sessions, task history, budget state, and the project registry/runtime bindings.
