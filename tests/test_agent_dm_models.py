@@ -5,8 +5,11 @@ from __future__ import annotations
 import pytest
 
 from core.agent_dm_models import (
+    DEFAULT_AGENT_DM_MESSAGE_MAXLEN,
     VALID_AGENT_DM_CHAT_PROVIDERS,
+    VALID_AGENT_DM_MESSAGE_SENDER_KINDS,
     VALID_AGENT_DM_SESSION_STATUSES,
+    AgentDmMessage,
     AgentDmSession,
 )
 
@@ -27,9 +30,25 @@ def _session(**overrides: object) -> AgentDmSession:
     return AgentDmSession(**data)
 
 
+def _message(**overrides: object) -> AgentDmMessage:
+    data: dict[str, object] = {
+        "owner_user_id": 101,
+        "project_id": "alpha_project",
+        "agent_role": "writer_agent",
+        "sender_kind": "owner",
+        "sender_role": "owner",
+        "body": "Need a first draft",
+        "created_at": 1001.0,
+    }
+    data.update(overrides)
+    return AgentDmMessage(**data)
+
+
 def test_valid_agent_dm_constants_are_stable():
     assert VALID_AGENT_DM_CHAT_PROVIDERS == {"telegram"}
     assert VALID_AGENT_DM_SESSION_STATUSES == {"active", "closed"}
+    assert VALID_AGENT_DM_MESSAGE_SENDER_KINDS == {"owner", "agent"}
+    assert DEFAULT_AGENT_DM_MESSAGE_MAXLEN == 20
 
 
 def test_agent_dm_session_happy_path_normalizes_fields():
@@ -143,3 +162,103 @@ def test_agent_dm_session_rejects_telegram_session_with_dm_chat_mismatch():
         match="telegram_dm_chat_must_match_owner_user_id:202!=101",
     ):
         _session(dm_chat_id=202)
+
+
+def test_agent_dm_message_owner_happy_path_normalizes_fields():
+    message = _message(
+        project_id="  Alpha_Project  ",
+        agent_role="  Writer_Agent  ",
+        sender_kind="  Owner  ",
+        sender_role="  Owner  ",
+        body="  Need a first draft  ",
+        created_at=1234,
+    )
+
+    assert message.project_id == "alpha_project"
+    assert message.agent_role == "writer_agent"
+    assert message.sender_kind == "owner"
+    assert message.sender_role == "owner"
+    assert message.body == "Need a first draft"
+    assert message.created_at == 1234.0
+
+
+def test_agent_dm_message_agent_happy_path():
+    message = _message(
+        sender_kind="agent",
+        sender_role="writer_agent",
+        body="Draft is ready",
+    )
+
+    assert message.sender_kind == "agent"
+    assert message.sender_role == "writer_agent"
+    assert message.body == "Draft is ready"
+
+
+def test_agent_dm_message_is_frozen():
+    message = _message()
+    with pytest.raises(Exception):
+        message.body = "mutated"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5, "7"])
+def test_agent_dm_message_rejects_invalid_owner_user_id(bad: object):
+    with pytest.raises(ValueError, match="invalid_owner_user_id"):
+        _message(owner_user_id=bad)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "  ", None, "alpha-project", "123alpha", "русский"],
+)
+def test_agent_dm_message_rejects_invalid_project_id(bad: object):
+    with pytest.raises(ValueError):
+        _message(project_id=bad)
+
+
+@pytest.mark.parametrize("bad", ["", "  ", None, "writer-agent", "русский"])
+def test_agent_dm_message_rejects_invalid_agent_role(bad: object):
+    with pytest.raises(ValueError):
+        _message(agent_role=bad)
+
+
+@pytest.mark.parametrize("bad", ["", "  ", None, "system", "русский"])
+def test_agent_dm_message_rejects_invalid_sender_kind(bad: object):
+    with pytest.raises(ValueError):
+        _message(sender_kind=bad)
+
+
+@pytest.mark.parametrize("bad", ["", "  ", None, "writer-agent", "русский"])
+def test_agent_dm_message_rejects_invalid_sender_role(bad: object):
+    with pytest.raises(ValueError):
+        _message(sender_role=bad)
+
+
+@pytest.mark.parametrize("bad", ["", "  ", None, 123])
+def test_agent_dm_message_rejects_empty_body(bad: object):
+    with pytest.raises(ValueError, match="empty_body"):
+        _message(body=bad)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [0, -1, True, float("nan"), float("inf"), "123.4"],
+)
+def test_agent_dm_message_rejects_invalid_created_at(bad: object):
+    with pytest.raises(ValueError, match="invalid_created_at"):
+        _message(created_at=bad)
+
+
+def test_agent_dm_message_rejects_owner_sender_role_mismatch():
+    with pytest.raises(
+        ValueError,
+        match="owner_sender_role_must_be_owner:writer_agent",
+    ):
+        _message(sender_kind="owner", sender_role="writer_agent")
+
+
+def test_agent_dm_message_rejects_agent_sender_role_mismatch():
+    with pytest.raises(
+        ValueError,
+        match="agent_sender_role_must_match_agent_role:reviewer_agent!=writer_agent",
+    ):
+        _message(sender_kind="agent", sender_role="reviewer_agent")

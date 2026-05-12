@@ -1,13 +1,13 @@
 """
 core/agent_dm_models.py
 
-Typed owner-agent DM session model for the AI Office domain.
+Typed owner-agent DM foundation models for the AI Office domain.
 
-Scope for roadmap step E4.1:
-1. Define immutable owner-agent DM session entities only.
+Scope through roadmap step E4.2:
+1. Define immutable owner-agent DM session and transcript message entities.
 2. Validate and normalize every field eagerly in __post_init__.
 3. Keep the model persistence- and runtime-agnostic: no StateDB wiring,
-   no TelegramBridge integration, no DM message history, and no reply queue.
+   no TelegramBridge integration, no live DM capture, and no reply queue.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 VALID_AGENT_DM_CHAT_PROVIDERS = frozenset({"telegram"})
 VALID_AGENT_DM_SESSION_STATUSES = frozenset({"active", "closed"})
+VALID_AGENT_DM_MESSAGE_SENDER_KINDS = frozenset({"owner", "agent"})
+DEFAULT_AGENT_DM_MESSAGE_MAXLEN = 20
 
 
 def _normalize_identifier(value: str, *, field_name: str) -> str:
@@ -146,4 +148,70 @@ class AgentDmSession:
             raise ValueError(
                 "telegram_dm_chat_must_match_owner_user_id:"
                 f"{self.dm_chat_id}!={self.owner_user_id}"
+            )
+
+
+@dataclass(frozen=True)
+class AgentDmMessage:
+    owner_user_id: int
+    project_id: str
+    agent_role: str
+    sender_kind: str
+    sender_role: str
+    body: str
+    created_at: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "owner_user_id",
+            _validate_positive_int(
+                self.owner_user_id,
+                field_name="owner_user_id",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "project_id",
+            _normalize_identifier(self.project_id, field_name="project_id"),
+        )
+        object.__setattr__(
+            self,
+            "agent_role",
+            _normalize_identifier(self.agent_role, field_name="agent_role"),
+        )
+        object.__setattr__(
+            self,
+            "sender_kind",
+            _normalize_choice(
+                self.sender_kind,
+                field_name="sender_kind",
+                allowed=VALID_AGENT_DM_MESSAGE_SENDER_KINDS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "sender_role",
+            _normalize_identifier(
+                self.sender_role,
+                field_name="sender_role",
+            ),
+        )
+        if not isinstance(self.body, str) or not self.body.strip():
+            raise ValueError("empty_body")
+        object.__setattr__(self, "body", self.body.strip())
+        object.__setattr__(
+            self,
+            "created_at",
+            _normalize_timestamp(self.created_at, field_name="created_at"),
+        )
+        if self.sender_kind == "owner" and self.sender_role != "owner":
+            raise ValueError(
+                "owner_sender_role_must_be_owner:"
+                f"{self.sender_role}"
+            )
+        if self.sender_kind == "agent" and self.sender_role != self.agent_role:
+            raise ValueError(
+                "agent_sender_role_must_match_agent_role:"
+                f"{self.sender_role}!={self.agent_role}"
             )

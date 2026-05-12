@@ -10,7 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from core.agent_dm_models import AgentDmSession
+from core.agent_dm_models import (
+    DEFAULT_AGENT_DM_MESSAGE_MAXLEN,
+    AgentDmMessage,
+    AgentDmSession,
+)
 from core.project_models import (
     Project,
     ProjectChatBinding,
@@ -134,6 +138,20 @@ def _agent_dm_session(**overrides: object) -> AgentDmSession:
     }
     data.update(overrides)
     return AgentDmSession(**data)
+
+
+def _agent_dm_message(**overrides: object) -> AgentDmMessage:
+    data: dict[str, object] = {
+        "owner_user_id": 101,
+        "project_id": "alpha_project",
+        "agent_role": "writer_agent",
+        "sender_kind": "owner",
+        "sender_role": "owner",
+        "body": "Need a first draft",
+        "created_at": 1001.0,
+    }
+    data.update(overrides)
+    return AgentDmMessage(**data)
 
 
 def _table_names(path: Path) -> set[str]:
@@ -833,6 +851,65 @@ def _build_v5_db(path: Path, repo_path: Path) -> None:
         conn.close()
 
 
+def _build_v6_db(path: Path, repo_path: Path) -> None:
+    _build_v5_db(path, repo_path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE agent_dm_sessions (
+                owner_user_id INTEGER NOT NULL,
+                project_id TEXT NOT NULL,
+                agent_role TEXT NOT NULL,
+                thread_bot_role TEXT NOT NULL,
+                dm_chat_id INTEGER NOT NULL,
+                chat_provider TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                last_interaction_at REAL NOT NULL,
+                PRIMARY KEY(owner_user_id, project_id, agent_role)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_dm_sessions(
+                owner_user_id,
+                project_id,
+                agent_role,
+                thread_bot_role,
+                dm_chat_id,
+                chat_provider,
+                status,
+                created_at,
+                last_interaction_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                101,
+                "alpha_project",
+                "writer_agent",
+                "writer_agent",
+                101,
+                "telegram",
+                "active",
+                1000.0,
+                1005.0,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE schema_meta
+            SET value = '6'
+            WHERE key = 'schema_version'
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Construction / schema
 # ---------------------------------------------------------------------------
@@ -862,12 +939,12 @@ def test_constructor_creates_database_file(tmp_path: Path):
 
 def test_schema_version_is_current(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 6
+    assert db.schema_version() == 7
 
 
 def test_fresh_schema_creates_project_tables(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 6
+    assert db.schema_version() == 7
     assert _table_names(db.path) >= {
         "schema_meta",
         "tier_sessions",
@@ -879,6 +956,7 @@ def test_fresh_schema_creates_project_tables(tmp_path: Path):
         "project_chat_bindings",
         "project_runtime_bindings",
         "agent_dm_sessions",
+        "agent_dm_messages",
     }
     assert _table_columns(db.path, "task_history") == [
         "id",
@@ -940,6 +1018,16 @@ def test_fresh_schema_creates_project_tables(tmp_path: Path):
         "status",
         "created_at",
         "last_interaction_at",
+    ]
+    assert _table_columns(db.path, "agent_dm_messages") == [
+        "id",
+        "owner_user_id",
+        "project_id",
+        "agent_role",
+        "sender_kind",
+        "sender_role",
+        "body",
+        "created_at",
     ]
 
 
@@ -1828,7 +1916,189 @@ def test_list_agent_dm_sessions_for_owner_rejects_invalid_owner_id(tmp_path: Pat
 
 
 # ---------------------------------------------------------------------------
-# Migration v1 -> v6
+# Agent DM messages
+# ---------------------------------------------------------------------------
+
+
+def test_record_agent_dm_message_round_trip_returns_chronological_transcript(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_agent_dm_session(_agent_dm_session())
+    owner_message = _agent_dm_message(
+        sender_kind="owner",
+        sender_role="owner",
+        body="Need a first draft",
+        created_at=1001.0,
+    )
+    agent_message = _agent_dm_message(
+        sender_kind="agent",
+        sender_role="writer_agent",
+        body="Draft is ready",
+        created_at=1002.0,
+    )
+
+    db.record_agent_dm_message(owner_message)
+    db.record_agent_dm_message(agent_message)
+
+    assert db.list_agent_dm_messages(
+        101,
+        "alpha_project",
+        "writer_agent",
+    ) == (
+        owner_message,
+        agent_message,
+    )
+
+
+def test_list_agent_dm_messages_returns_empty_tuple_for_missing_transcript(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_agent_dm_session(_agent_dm_session())
+
+    assert db.list_agent_dm_messages(101, "alpha_project", "writer_agent") == ()
+
+
+def test_record_agent_dm_message_enforces_default_retention_per_transcript(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_agent_dm_session(_agent_dm_session())
+
+    for index in range(DEFAULT_AGENT_DM_MESSAGE_MAXLEN + 5):
+        db.record_agent_dm_message(
+            _agent_dm_message(
+                body=f"owner message {index}",
+                created_at=1000.0 + index,
+            )
+        )
+
+    messages = db.list_agent_dm_messages(101, "alpha_project", "writer_agent")
+
+    assert len(messages) == DEFAULT_AGENT_DM_MESSAGE_MAXLEN
+    assert messages[0].body == "owner message 5"
+    assert messages[-1].body == "owner message 24"
+    assert tuple(message.created_at for message in messages) == tuple(
+        1000.0 + index
+        for index in range(5, 25)
+    )
+
+
+def test_agent_dm_message_retention_does_not_affect_other_transcripts(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_project(_project(project_id="beta_project", slug="beta-project"))
+    db.upsert_agent_dm_session(_agent_dm_session())
+    db.upsert_agent_dm_session(
+        _agent_dm_session(
+            project_id="beta_project",
+            agent_role="reviewer_agent",
+            thread_bot_role="reviewer_agent",
+        )
+    )
+
+    for index in range(DEFAULT_AGENT_DM_MESSAGE_MAXLEN + 3):
+        db.record_agent_dm_message(
+            _agent_dm_message(
+                body=f"writer message {index}",
+                created_at=1000.0 + index,
+            )
+        )
+    reviewer_message = _agent_dm_message(
+        project_id="beta_project",
+        agent_role="reviewer_agent",
+        sender_kind="agent",
+        sender_role="reviewer_agent",
+        body="Review is ready",
+        created_at=2000.0,
+    )
+    db.record_agent_dm_message(reviewer_message)
+
+    writer_messages = db.list_agent_dm_messages(101, "alpha_project", "writer_agent")
+    reviewer_messages = db.list_agent_dm_messages(
+        101,
+        "beta_project",
+        "reviewer_agent",
+    )
+
+    assert len(writer_messages) == DEFAULT_AGENT_DM_MESSAGE_MAXLEN
+    assert writer_messages[0].body == "writer message 3"
+    assert reviewer_messages == (reviewer_message,)
+
+
+def test_record_agent_dm_message_rejects_non_message_type(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_agent_dm_message_type:str"):
+        db.record_agent_dm_message("bad")  # type: ignore[arg-type]
+
+
+def test_record_agent_dm_message_rejects_missing_session(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+
+    with pytest.raises(
+        ValueError,
+        match="missing_agent_dm_session:101:alpha_project:writer_agent",
+    ):
+        db.record_agent_dm_message(_agent_dm_message())
+
+
+def test_record_agent_dm_message_rejects_closed_session(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_agent_dm_session(_agent_dm_session(status="closed"))
+
+    with pytest.raises(
+        ValueError,
+        match="inactive_agent_dm_session:101:alpha_project:writer_agent:closed",
+    ):
+        db.record_agent_dm_message(_agent_dm_message())
+
+
+def test_list_agent_dm_messages_rejects_invalid_args(tmp_path: Path):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError, match="invalid_owner_user_id"):
+        db.list_agent_dm_messages(0, "alpha_project", "writer_agent")
+    with pytest.raises(ValueError, match="invalid_project_id"):
+        db.list_agent_dm_messages(101, "bad-id", "writer_agent")
+    with pytest.raises(ValueError, match="invalid_agent_role"):
+        db.list_agent_dm_messages(101, "alpha_project", "writer-agent")
+    with pytest.raises(ValueError, match="invalid_limit"):
+        db.list_agent_dm_messages(101, "alpha_project", "writer_agent", limit=0)
+
+
+def test_trim_agent_dm_messages_supports_manual_windowing(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_agent_dm_session(_agent_dm_session())
+    for index in range(5):
+        db.record_agent_dm_message(
+            _agent_dm_message(
+                body=f"message {index}",
+                created_at=1000.0 + index,
+            ),
+            max_entries=10,
+        )
+
+    db.trim_agent_dm_messages(101, "alpha_project", "writer_agent", 2)
+
+    assert tuple(
+        message.body
+        for message in db.list_agent_dm_messages(101, "alpha_project", "writer_agent")
+    ) == (
+        "message 3",
+        "message 4",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Migration v1 -> v7
 # ---------------------------------------------------------------------------
 
 
@@ -1838,7 +2108,7 @@ def test_migrates_v1_schema_with_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 6
+    assert db.schema_version() == 7
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v1")
     assert task is not None
@@ -1859,7 +2129,7 @@ def test_migrates_v1_schema_without_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 6
+    assert db.schema_version() == 7
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(7.5)
 
@@ -1897,7 +2167,7 @@ def test_v1_migration_adds_autoincrement_id_to_task_history(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v2 -> v6
+# Migration v2 -> v7
 # ---------------------------------------------------------------------------
 
 
@@ -1907,7 +2177,7 @@ def test_migrates_v2_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 6
+    assert db.schema_version() == 7
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v2")
     assert task is not None
@@ -1932,7 +2202,7 @@ def test_v2_migration_adds_project_tables(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v3 -> v6
+# Migration v3 -> v7
 # ---------------------------------------------------------------------------
 
 
@@ -1942,7 +2212,7 @@ def test_migrates_v3_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 6
+    assert db.schema_version() == 7
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(9.5)
     task = db.get_task("task-v3")
@@ -1965,7 +2235,7 @@ def test_v3_migration_adds_project_runtime_bindings_table(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v4 -> v6
+# Migration v4 -> v7
 # ---------------------------------------------------------------------------
 
 
@@ -1975,7 +2245,7 @@ def test_migrates_v4_schema_to_v5_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 6
+    assert db.schema_version() == 7
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(10.5)
     task = db.get_task("task-v4")
@@ -1995,7 +2265,7 @@ def test_v4_migration_adds_task_history_project_id_column(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v5 -> v6
+# Migration v5 -> v7
 # ---------------------------------------------------------------------------
 
 
@@ -2006,7 +2276,7 @@ def test_migrates_v5_schema_to_v6_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 6
+    assert db.schema_version() == 7
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -2028,3 +2298,42 @@ def test_v5_migration_adds_agent_dm_sessions_table(tmp_path: Path):
     StateDB(db_path)
 
     assert "agent_dm_sessions" in _table_names(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Migration v6 -> v7
+# ---------------------------------------------------------------------------
+
+
+def test_migrates_v6_schema_to_v7_and_preserves_existing_data(tmp_path: Path):
+    db_path = tmp_path / "v6.db"
+    repo = _git_repo(tmp_path, "v6-repo")
+    _build_v6_db(db_path, repo)
+
+    db = StateDB(db_path)
+
+    assert db.schema_version() == 7
+    assert db.get_tier(1) == "STANDARD"
+    assert db.get_budget(1) == pytest.approx(11.5)
+    task = db.get_task("task-v5")
+    assert task is not None
+    assert task.branch == "feature/task-v5"
+    assert task.project_id == "alpha_project"
+    assert db.get_project("alpha_project") == _project()
+    assert db.get_project_policy("alpha_project") == _policy()
+    assert db.list_project_memberships("alpha_project") == [_membership()]
+    assert db.get_project_chat_binding("alpha_project") == _binding()
+    assert db.get_project_runtime_binding("alpha_project") == _runtime_binding(repo)
+    assert db.get_agent_dm_session(101, "alpha_project", "writer_agent") == (
+        _agent_dm_session()
+    )
+
+
+def test_v6_migration_adds_agent_dm_messages_table(tmp_path: Path):
+    db_path = tmp_path / "v6-messages.db"
+    repo = _git_repo(tmp_path, "v6-messages-repo")
+    _build_v6_db(db_path, repo)
+
+    StateDB(db_path)
+
+    assert "agent_dm_messages" in _table_names(db_path)

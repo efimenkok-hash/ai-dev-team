@@ -3,7 +3,7 @@ core/state_db.py
 
 SQLite-backed persistent state for chat tier selection, completed task
 history, per-chat budget, the AI Office project model, and owner-agent
-DM session state.
+DM session/message state.
 
 Design goals:
 1. Single-file stdlib-only storage (`sqlite3`), safe for bot restarts.
@@ -18,13 +18,13 @@ Design goals:
 CONTRACTS:
 1. StateDB(path) requires a Path; constructor creates parent directories and
    initializes/migrates the schema eagerly.
-2. Current schema version is 6. Unknown future versions raise ValueError.
+2. Current schema version is 7. Unknown future versions raise ValueError.
 3. Every public method validates arguments via isinstance/ValueError.
 4. Writes are serialized with a process-local lock; reads use independent
    SQLite connections and remain safe under concurrent access.
 5. task_history keeps an append-only audit log. get_task(task_id) returns the
    newest record for that task_id; recent_tasks(n) returns newest-last order.
-6. schema migration supports v1 -> v2 -> v3 -> v4 -> v5 -> v6:
+6. schema migration supports v1 -> v2 -> v3 -> v4 -> v5 -> v6 -> v7:
    - v1 -> v2: tier_sessions.tier_name -> active_tier
    - v1 -> v2: task_history gains AUTOINCREMENT id for stable append-order
      semantics
@@ -33,6 +33,7 @@ CONTRACTS:
    - v3 -> v4: adds project_runtime_bindings
    - v4 -> v5: adds task_history.project_id for project-aware task identity
    - v5 -> v6: adds agent_dm_sessions for typed owner-agent DM session state
+   - v6 -> v7: adds agent_dm_messages for typed owner-agent DM transcripts
 7. Identity model is explicit:
    - Project.owner_user_id is a positive Telegram owner user id stored in
      projects.owner_user_id.
@@ -55,7 +56,11 @@ from pathlib import Path
 from typing import TypeVar
 
 from core.adapter import ProjectCommand, ProjectRule
-from core.agent_dm_models import AgentDmSession
+from core.agent_dm_models import (
+    DEFAULT_AGENT_DM_MESSAGE_MAXLEN,
+    AgentDmMessage,
+    AgentDmSession,
+)
 from core.project_models import (
     VALID_CHAT_PROVIDERS,
     Project,
@@ -66,7 +71,7 @@ from core.project_models import (
 from core.project_runtime import ProjectRuntimeBinding
 from core.task_history import TaskSummary
 
-_CURRENT_SCHEMA_VERSION = 6
+_CURRENT_SCHEMA_VERSION = 7
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -180,6 +185,19 @@ CREATE TABLE IF NOT EXISTS agent_dm_sessions (
 )
 """
 
+_CREATE_AGENT_DM_MESSAGES = """
+CREATE TABLE IF NOT EXISTS agent_dm_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER NOT NULL,
+    project_id TEXT NOT NULL,
+    agent_role TEXT NOT NULL,
+    sender_kind TEXT NOT NULL,
+    sender_role TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at REAL NOT NULL
+)
+"""
+
 _CREATE_INDEX_TASK_HISTORY_TASK_ID = """
 CREATE INDEX IF NOT EXISTS idx_task_history_task_id_id
 ON task_history(task_id, id DESC)
@@ -188,6 +206,11 @@ ON task_history(task_id, id DESC)
 _CREATE_INDEX_TASK_HISTORY_FINISHED = """
 CREATE INDEX IF NOT EXISTS idx_task_history_finished_id
 ON task_history(finished_at DESC, id DESC)
+"""
+
+_CREATE_INDEX_AGENT_DM_MESSAGES_TRANSCRIPT_ID = """
+CREATE INDEX IF NOT EXISTS idx_agent_dm_messages_transcript_id_desc
+ON agent_dm_messages(owner_user_id, project_id, agent_role, id DESC)
 """
 
 
@@ -688,6 +711,103 @@ class StateDB:
         )
 
     # ------------------------------------------------------------------
+    # Agent DM messages
+    # ------------------------------------------------------------------
+
+    def record_agent_dm_message(
+        self,
+        message: AgentDmMessage,
+        *,
+        max_entries: int = DEFAULT_AGENT_DM_MESSAGE_MAXLEN,
+    ) -> None:
+        if not isinstance(message, AgentDmMessage):
+            raise ValueError(
+                "invalid_agent_dm_message_type:"
+                f"{type(message).__name__}"
+            )
+        self._validate_positive_int(max_entries, "max_entries")
+        self._run_write_transaction(
+            lambda conn: self._record_agent_dm_message_conn(
+                conn,
+                message,
+                max_entries=max_entries,
+            )
+        )
+
+    def list_agent_dm_messages(
+        self,
+        owner_user_id: int,
+        project_id: str,
+        agent_role: str,
+        *,
+        limit: int = DEFAULT_AGENT_DM_MESSAGE_MAXLEN,
+    ) -> tuple[AgentDmMessage, ...]:
+        self._validate_positive_int(owner_user_id, "owner_user_id")
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_agent_role = self._normalize_project_identifier(
+            agent_role,
+            field_name="agent_role",
+        )
+        self._validate_positive_int(limit, "limit")
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, owner_user_id, project_id, agent_role, sender_kind,
+                       sender_role, body, created_at
+                FROM (
+                    SELECT id, owner_user_id, project_id, agent_role, sender_kind,
+                           sender_role, body, created_at
+                    FROM agent_dm_messages
+                    WHERE owner_user_id = ? AND project_id = ? AND agent_role = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id ASC
+                """,
+                (
+                    owner_user_id,
+                    normalized_project_id,
+                    normalized_agent_role,
+                    limit,
+                ),
+            ).fetchall()
+        return tuple(
+            message
+            for row in rows
+            if (message := self._row_to_agent_dm_message(row)) is not None
+        )
+
+    def trim_agent_dm_messages(
+        self,
+        owner_user_id: int,
+        project_id: str,
+        agent_role: str,
+        max_entries: int,
+    ) -> None:
+        self._validate_positive_int(owner_user_id, "owner_user_id")
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_agent_role = self._normalize_project_identifier(
+            agent_role,
+            field_name="agent_role",
+        )
+        self._validate_positive_int(max_entries, "max_entries")
+        self._run_write_transaction(
+            lambda conn: self._trim_agent_dm_messages_conn(
+                conn,
+                owner_user_id,
+                normalized_project_id,
+                normalized_agent_role,
+                max_entries,
+            )
+        )
+
+    # ------------------------------------------------------------------
     # Schema management
     # ------------------------------------------------------------------
 
@@ -695,7 +815,7 @@ class StateDB:
         with self._lock, self._connect() as conn:
             version = self._detect_schema_version(conn)
             if version == 0:
-                self._create_v6_schema(conn)
+                self._create_v7_schema(conn)
                 return
             if version > _CURRENT_SCHEMA_VERSION:
                 raise ValueError(
@@ -722,9 +842,13 @@ class StateDB:
                     self._migrate_v5_to_v6(conn)
                     version = 6
                     continue
+                if version == 6:
+                    self._migrate_v6_to_v7(conn)
+                    version = 7
+                    continue
                 raise ValueError(f"unsupported_schema_version:{version}")
 
-    def _create_v6_schema(self, conn: sqlite3.Connection) -> None:
+    def _create_v7_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE_SCHEMA_META)
         conn.execute(_CREATE_TIER_SESSIONS)
         conn.execute(_CREATE_TASK_HISTORY)
@@ -735,8 +859,10 @@ class StateDB:
         conn.execute(_CREATE_PROJECT_CHAT_BINDINGS)
         conn.execute(_CREATE_PROJECT_RUNTIME_BINDINGS)
         conn.execute(_CREATE_AGENT_DM_SESSIONS)
+        conn.execute(_CREATE_AGENT_DM_MESSAGES)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_TASK_ID)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_FINISHED)
+        conn.execute(_CREATE_INDEX_AGENT_DM_MESSAGES_TRANSCRIPT_ID)
         self._set_schema_version(conn, _CURRENT_SCHEMA_VERSION)
 
     def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
@@ -768,6 +894,11 @@ class StateDB:
     def _migrate_v5_to_v6(self, conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE_AGENT_DM_SESSIONS)
         self._set_schema_version(conn, 6)
+
+    def _migrate_v6_to_v7(self, conn: sqlite3.Connection) -> None:
+        conn.execute(_CREATE_AGENT_DM_MESSAGES)
+        conn.execute(_CREATE_INDEX_AGENT_DM_MESSAGES_TRANSCRIPT_ID)
+        self._set_schema_version(conn, 7)
 
     def _migrate_tier_sessions_to_v2(self, conn: sqlite3.Connection) -> None:
         columns = self._table_columns(conn, "tier_sessions")
@@ -1059,6 +1190,22 @@ class StateDB:
             last_interaction_at=float(row["last_interaction_at"]),
         )
 
+    @staticmethod
+    def _row_to_agent_dm_message(
+        row: sqlite3.Row | None,
+    ) -> AgentDmMessage | None:
+        if row is None:
+            return None
+        return AgentDmMessage(
+            owner_user_id=int(row["owner_user_id"]),
+            project_id=str(row["project_id"]),
+            agent_role=str(row["agent_role"]),
+            sender_kind=str(row["sender_kind"]),
+            sender_role=str(row["sender_role"]),
+            body=str(row["body"]),
+            created_at=float(row["created_at"]),
+        )
+
     def _upsert_project_conn(
         self,
         conn: sqlite3.Connection,
@@ -1315,6 +1462,93 @@ class StateDB:
             ),
         )
 
+    def _record_agent_dm_message_conn(
+        self,
+        conn: sqlite3.Connection,
+        message: AgentDmMessage,
+        *,
+        max_entries: int,
+    ) -> None:
+        session = self._get_agent_dm_session_row(
+            conn,
+            owner_user_id=message.owner_user_id,
+            project_id=message.project_id,
+            agent_role=message.agent_role,
+        )
+        if session is None:
+            raise ValueError(
+                "missing_agent_dm_session:"
+                f"{message.owner_user_id}:{message.project_id}:{message.agent_role}"
+            )
+        session_status = str(session["status"])
+        if session_status != "active":
+            raise ValueError(
+                "inactive_agent_dm_session:"
+                f"{message.owner_user_id}:{message.project_id}:"
+                f"{message.agent_role}:{session_status}"
+            )
+        conn.execute(
+            """
+            INSERT INTO agent_dm_messages(
+                owner_user_id,
+                project_id,
+                agent_role,
+                sender_kind,
+                sender_role,
+                body,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message.owner_user_id,
+                message.project_id,
+                message.agent_role,
+                message.sender_kind,
+                message.sender_role,
+                message.body,
+                message.created_at,
+            ),
+        )
+        self._trim_agent_dm_messages_conn(
+            conn,
+            message.owner_user_id,
+            message.project_id,
+            message.agent_role,
+            max_entries,
+        )
+
+    def _trim_agent_dm_messages_conn(
+        self,
+        conn: sqlite3.Connection,
+        owner_user_id: int,
+        project_id: str,
+        agent_role: str,
+        max_entries: int,
+    ) -> None:
+        conn.execute(
+            """
+            DELETE FROM agent_dm_messages
+            WHERE owner_user_id = ? AND project_id = ? AND agent_role = ?
+              AND id NOT IN (
+                  SELECT id
+                  FROM agent_dm_messages
+                  WHERE owner_user_id = ? AND project_id = ? AND agent_role = ?
+                  ORDER BY id DESC
+                  LIMIT ?
+              )
+            """,
+            (
+                owner_user_id,
+                project_id,
+                agent_role,
+                owner_user_id,
+                project_id,
+                agent_role,
+                max_entries,
+            ),
+        )
+
     def _get_project_row_by_id(
         self,
         conn: sqlite3.Connection,
@@ -1327,6 +1561,25 @@ class StateDB:
             WHERE project_id = ?
             """,
             (project_id,),
+        ).fetchone()
+
+    def _get_agent_dm_session_row(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_user_id: int,
+        project_id: str,
+        agent_role: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT owner_user_id, project_id, agent_role, thread_bot_role,
+                   dm_chat_id, chat_provider, status, created_at,
+                   last_interaction_at
+            FROM agent_dm_sessions
+            WHERE owner_user_id = ? AND project_id = ? AND agent_role = ?
+            """,
+            (owner_user_id, project_id, agent_role),
         ).fetchone()
 
     def _project_exists_conn(
