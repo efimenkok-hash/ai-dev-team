@@ -13,6 +13,7 @@ Scope for roadmap step P4.1:
 from __future__ import annotations
 
 import re
+import sqlite3
 from dataclasses import replace
 
 from core.agent_bus_models import (
@@ -22,8 +23,11 @@ from core.agent_bus_models import (
     AgentRequest,
     ProjectThread,
 )
+from core.state_db import StateDB
 
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_THREAD_ID_PREFIX = "thread_"
+_MESSAGE_ID_PREFIX = "msg_"
 
 
 def _normalize_identifier(value: str, *, field_name: str) -> str:
@@ -35,6 +39,31 @@ def _normalize_identifier(value: str, *, field_name: str) -> str:
     if not _IDENTIFIER_RE.fullmatch(normalized):
         raise ValueError(f"invalid_{field_name}:{normalized}")
     return normalized
+
+
+def _next_sequenced_identifier(
+    existing_ids: tuple[str, ...],
+    *,
+    prefix: str,
+    field_name: str,
+) -> str:
+    next_number = 1
+    for existing_id in existing_ids:
+        normalized_id = _normalize_identifier(
+            existing_id,
+            field_name=field_name,
+        )
+        if not normalized_id.startswith(prefix):
+            raise ValueError(
+                f"invalid_persisted_{field_name}:{normalized_id}"
+            )
+        suffix = normalized_id[len(prefix):]
+        if not suffix or not suffix.isdigit():
+            raise ValueError(
+                f"invalid_persisted_{field_name}:{normalized_id}"
+            )
+        next_number = max(next_number, int(suffix) + 1)
+    return f"{prefix}{next_number:06d}"
 
 
 class InMemoryAgentBus:
@@ -210,3 +239,227 @@ class InMemoryAgentBus:
             thread,
             last_message_at=message.created_at,
         )
+
+
+class StateBackedAgentBus:
+    def __init__(self, state_db: StateDB) -> None:
+        if not isinstance(state_db, StateDB):
+            raise ValueError(
+                f"invalid_state_db_type:{type(state_db).__name__}"
+            )
+        self._state_db = state_db
+
+    @property
+    def state_db(self) -> StateDB:
+        return self._state_db
+
+    def open_thread(
+        self,
+        *,
+        project_id: str,
+        opened_by_role: str,
+        created_at: float,
+        task_id: str | None = None,
+    ) -> ProjectThread:
+        normalized_project_id = self._state_db._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_opened_by_role = _normalize_identifier(
+            opened_by_role,
+            field_name="opened_by_role",
+        )
+        return self._state_db._run_write_transaction(
+            lambda conn: self._open_thread_conn(
+                conn,
+                project_id=normalized_project_id,
+                opened_by_role=normalized_opened_by_role,
+                created_at=created_at,
+                task_id=task_id,
+            )
+        )
+
+    def publish_request(self, request: AgentRequest) -> AgentMessage:
+        if not isinstance(request, AgentRequest):
+            raise ValueError(
+                f"invalid_request_type:{type(request).__name__}"
+            )
+        return self._state_db._run_write_transaction(
+            lambda conn: self._publish_request_conn(conn, request)
+        )
+
+    def publish_reply(self, reply: AgentReply) -> AgentMessage:
+        if not isinstance(reply, AgentReply):
+            raise ValueError(f"invalid_reply_type:{type(reply).__name__}")
+        return self._state_db._run_write_transaction(
+            lambda conn: self._publish_reply_conn(conn, reply)
+        )
+
+    def get_thread(
+        self,
+        project_id: str,
+        thread_id: str,
+    ) -> ProjectThread | None:
+        return self._state_db.get_project_thread(project_id, thread_id)
+
+    def list_thread_messages(
+        self,
+        project_id: str,
+        thread_id: str,
+    ) -> tuple[AgentMessage, ...]:
+        return self._state_db.list_agent_bus_messages(project_id, thread_id)
+
+    def list_inbox(
+        self,
+        project_id: str,
+        recipient_role: str,
+    ) -> tuple[AgentMessage, ...]:
+        return self._state_db.list_agent_bus_inbox(project_id, recipient_role)
+
+    def _open_thread_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+        opened_by_role: str,
+        created_at: float,
+        task_id: str | None,
+    ) -> ProjectThread:
+        self._state_db._ensure_project_exists(conn, project_id)
+        thread = ProjectThread(
+            project_id=project_id,
+            thread_id=self._allocate_thread_id_conn(conn),
+            opened_by_role=opened_by_role,
+            status="open",
+            created_at=created_at,
+            last_message_at=created_at,
+            task_id=task_id,
+        )
+        self._state_db._upsert_project_thread_conn(conn, thread)
+        return thread
+
+    def _publish_request_conn(
+        self,
+        conn: sqlite3.Connection,
+        request: AgentRequest,
+    ) -> AgentMessage:
+        thread = self._require_open_thread_conn(
+            conn,
+            request.project_id,
+            request.thread_id,
+        )
+        message = AgentMessage(
+            project_id=request.project_id,
+            thread_id=request.thread_id,
+            message_id=self._allocate_message_id_conn(
+                conn,
+                thread.project_id,
+                thread.thread_id,
+            ),
+            sender_role=request.sender_role,
+            recipient_role=request.recipient_role,
+            message_kind="request",
+            body=request.body,
+            created_at=request.created_at,
+            in_reply_to=None,
+        )
+        self._state_db._insert_agent_bus_message_conn(conn, message)
+        return message
+
+    def _publish_reply_conn(
+        self,
+        conn: sqlite3.Connection,
+        reply: AgentReply,
+    ) -> AgentMessage:
+        thread = self._require_open_thread_conn(
+            conn,
+            reply.project_id,
+            reply.thread_id,
+        )
+        message = AgentMessage(
+            project_id=reply.project_id,
+            thread_id=reply.thread_id,
+            message_id=self._allocate_message_id_conn(
+                conn,
+                thread.project_id,
+                thread.thread_id,
+            ),
+            sender_role=reply.sender_role,
+            recipient_role=reply.recipient_role,
+            message_kind="reply",
+            body=reply.body,
+            created_at=reply.created_at,
+            in_reply_to=AgentMessageRef(
+                project_id=reply.in_reply_to.project_id,
+                thread_id=reply.in_reply_to.thread_id,
+                message_id=reply.in_reply_to.message_id,
+            ),
+        )
+        self._state_db._insert_agent_bus_message_conn(conn, message)
+        return message
+
+    def _allocate_thread_id_conn(self, conn: sqlite3.Connection) -> str:
+        rows = conn.execute(
+            """
+            SELECT thread_id
+            FROM project_threads
+            ORDER BY project_id ASC, thread_id ASC
+            """
+        ).fetchall()
+        return _next_sequenced_identifier(
+            tuple(str(row["thread_id"]) for row in rows),
+            prefix=_THREAD_ID_PREFIX,
+            field_name="thread_id",
+        )
+
+    def _allocate_message_id_conn(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+        thread_id: str,
+    ) -> str:
+        rows = conn.execute(
+            """
+            SELECT message_id
+            FROM agent_bus_messages
+            WHERE project_id = ? AND thread_id = ?
+            ORDER BY id ASC
+            """,
+            (project_id, thread_id),
+        ).fetchall()
+        return _next_sequenced_identifier(
+            tuple(str(row["message_id"]) for row in rows),
+            prefix=_MESSAGE_ID_PREFIX,
+            field_name="message_id",
+        )
+
+    def _require_open_thread_conn(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+        thread_id: str,
+    ) -> ProjectThread:
+        normalized_project_id = self._state_db._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_thread_id = self._state_db._normalize_project_identifier(
+            thread_id,
+            field_name="thread_id",
+        )
+        row = self._state_db._get_project_thread_row(
+            conn,
+            normalized_project_id,
+            normalized_thread_id,
+        )
+        thread = self._state_db._row_to_project_thread(row)
+        if thread is None:
+            raise ValueError(
+                f"unknown_thread:{normalized_project_id}:{normalized_thread_id}"
+            )
+        if thread.status != "open":
+            raise ValueError(
+                "project_thread_closed:"
+                f"{normalized_project_id}:{normalized_thread_id}"
+            )
+        return thread
