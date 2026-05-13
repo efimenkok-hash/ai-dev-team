@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from core.agent_bus_models import AgentMessage, ProjectThread
 from core.agent_dm_models import (
     DEFAULT_AGENT_DM_MESSAGE_MAXLEN,
     AgentDmMessage,
@@ -170,6 +171,36 @@ def _agent_owner_notification(**overrides: object) -> AgentOwnerNotification:
     }
     data.update(overrides)
     return AgentOwnerNotification(**data)
+
+
+def _project_thread(**overrides: object) -> ProjectThread:
+    data: dict[str, object] = {
+        "project_id": "alpha_project",
+        "thread_id": "thread_000001",
+        "opened_by_role": "coordinator_agent",
+        "status": "open",
+        "created_at": 1000.0,
+        "last_message_at": 1000.0,
+        "task_id": None,
+    }
+    data.update(overrides)
+    return ProjectThread(**data)
+
+
+def _agent_bus_message(**overrides: object) -> AgentMessage:
+    data: dict[str, object] = {
+        "project_id": "alpha_project",
+        "thread_id": "thread_000001",
+        "message_id": "msg_000001",
+        "sender_role": "coordinator_agent",
+        "recipient_role": "writer_agent",
+        "message_kind": "request",
+        "body": "Need a first draft",
+        "created_at": 1001.0,
+        "in_reply_to": None,
+    }
+    data.update(overrides)
+    return AgentMessage(**data)
 
 
 def _table_names(path: Path) -> set[str]:
@@ -987,6 +1018,78 @@ def _build_v7_db(path: Path, repo_path: Path) -> None:
         conn.close()
 
 
+def _build_v8_db(path: Path, repo_path: Path) -> None:
+    _build_v7_db(path, repo_path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE agent_owner_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER NOT NULL,
+                project_id TEXT NOT NULL,
+                agent_role TEXT NOT NULL,
+                thread_bot_role TEXT NOT NULL,
+                body TEXT NOT NULL,
+                chat_provider TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                delivered_at REAL NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX idx_agent_owner_notifications_queue
+            ON agent_owner_notifications(
+                owner_user_id,
+                project_id,
+                agent_role,
+                thread_bot_role,
+                status,
+                id ASC
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_owner_notifications(
+                owner_user_id,
+                project_id,
+                agent_role,
+                thread_bot_role,
+                body,
+                chat_provider,
+                status,
+                created_at,
+                delivered_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                101,
+                "alpha_project",
+                "writer_agent",
+                "writer_agent",
+                "Need owner review",
+                "telegram",
+                "queued",
+                1002.0,
+                None,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE schema_meta
+            SET value = '8'
+            WHERE key = 'schema_version'
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Construction / schema
 # ---------------------------------------------------------------------------
@@ -1016,12 +1119,12 @@ def test_constructor_creates_database_file(tmp_path: Path):
 
 def test_schema_version_is_current(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 8
+    assert db.schema_version() == 9
 
 
 def test_fresh_schema_creates_project_tables(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 8
+    assert db.schema_version() == 9
     assert _table_names(db.path) >= {
         "schema_meta",
         "tier_sessions",
@@ -1035,6 +1138,8 @@ def test_fresh_schema_creates_project_tables(tmp_path: Path):
         "agent_dm_sessions",
         "agent_dm_messages",
         "agent_owner_notifications",
+        "project_threads",
+        "agent_bus_messages",
     }
     assert _table_columns(db.path, "task_history") == [
         "id",
@@ -1119,6 +1224,29 @@ def test_fresh_schema_creates_project_tables(tmp_path: Path):
         "created_at",
         "delivered_at",
     ]
+    assert _table_columns(db.path, "project_threads") == [
+        "project_id",
+        "thread_id",
+        "opened_by_role",
+        "status",
+        "created_at",
+        "last_message_at",
+        "task_id",
+    ]
+    assert _table_columns(db.path, "agent_bus_messages") == [
+        "id",
+        "project_id",
+        "thread_id",
+        "message_id",
+        "sender_role",
+        "recipient_role",
+        "message_kind",
+        "body",
+        "created_at",
+        "in_reply_to_project_id",
+        "in_reply_to_thread_id",
+        "in_reply_to_message_id",
+    ]
 
 
 def test_wal_mode_enabled(tmp_path: Path):
@@ -1135,6 +1263,39 @@ def test_path_property_returns_normalized_path(tmp_path: Path):
     db_path = tmp_path / "state.db"
     db = StateDB(db_path)
     assert db.path == db_path.expanduser()
+
+
+def test_bus_guardrails_reject_invalid_types_and_missing_scope(tmp_path: Path):
+    db = _make_db(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid_project_thread_type:str"):
+        db.upsert_project_thread("bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="invalid_agent_bus_message_type:str"):
+        db.insert_agent_bus_message("bad")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="unknown_project_id:alpha_project"):
+        db.upsert_project_thread(_project_thread())
+
+    db.upsert_project(_project())
+
+    with pytest.raises(
+        ValueError,
+        match="unknown_project_thread:alpha_project:thread_000001",
+    ):
+        db.insert_agent_bus_message(_agent_bus_message())
+
+
+def test_bus_guardrails_reject_duplicate_message_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.upsert_project_thread(_project_thread())
+    db.insert_agent_bus_message(_agent_bus_message())
+
+    with pytest.raises(
+        ValueError,
+        match="duplicate_agent_bus_message:alpha_project:thread_000001:msg_000001",
+    ):
+        db.insert_agent_bus_message(_agent_bus_message())
 
 
 def test_constructor_rejects_partial_legacy_schema(tmp_path: Path):
@@ -2358,7 +2519,7 @@ def test_trim_agent_dm_messages_supports_manual_windowing(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v1 -> v8
+# Migration v1 -> v9
 # ---------------------------------------------------------------------------
 
 
@@ -2368,7 +2529,7 @@ def test_migrates_v1_schema_with_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 8
+    assert db.schema_version() == 9
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v1")
     assert task is not None
@@ -2389,7 +2550,7 @@ def test_migrates_v1_schema_without_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 8
+    assert db.schema_version() == 9
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(7.5)
 
@@ -2427,7 +2588,7 @@ def test_v1_migration_adds_autoincrement_id_to_task_history(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v2 -> v8
+# Migration v2 -> v9
 # ---------------------------------------------------------------------------
 
 
@@ -2437,7 +2598,7 @@ def test_migrates_v2_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 8
+    assert db.schema_version() == 9
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v2")
     assert task is not None
@@ -2462,7 +2623,7 @@ def test_v2_migration_adds_project_tables(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v3 -> v8
+# Migration v3 -> v9
 # ---------------------------------------------------------------------------
 
 
@@ -2472,7 +2633,7 @@ def test_migrates_v3_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 8
+    assert db.schema_version() == 9
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(9.5)
     task = db.get_task("task-v3")
@@ -2495,7 +2656,7 @@ def test_v3_migration_adds_project_runtime_bindings_table(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v4 -> v8
+# Migration v4 -> v9
 # ---------------------------------------------------------------------------
 
 
@@ -2505,7 +2666,7 @@ def test_migrates_v4_schema_to_v5_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 8
+    assert db.schema_version() == 9
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(10.5)
     task = db.get_task("task-v4")
@@ -2525,7 +2686,7 @@ def test_v4_migration_adds_task_history_project_id_column(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v5 -> v8
+# Migration v5 -> v9
 # ---------------------------------------------------------------------------
 
 
@@ -2536,7 +2697,7 @@ def test_migrates_v5_schema_to_v6_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 8
+    assert db.schema_version() == 9
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -2561,7 +2722,7 @@ def test_v5_migration_adds_agent_dm_sessions_table(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v6 -> v8
+# Migration v6 -> v9
 # ---------------------------------------------------------------------------
 
 
@@ -2572,7 +2733,7 @@ def test_migrates_v6_schema_to_v7_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 8
+    assert db.schema_version() == 9
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -2600,18 +2761,18 @@ def test_v6_migration_adds_agent_dm_messages_table(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v7 -> v8
+# Migration v7 -> v9
 # ---------------------------------------------------------------------------
 
 
-def test_migrates_v7_schema_to_v8_and_preserves_existing_data(tmp_path: Path):
+def test_migrates_v7_schema_to_v9_and_preserves_existing_data(tmp_path: Path):
     db_path = tmp_path / "v7.db"
     repo = _git_repo(tmp_path, "v7-repo")
     _build_v7_db(db_path, repo)
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 8
+    assert db.schema_version() == 9
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -2645,3 +2806,52 @@ def test_v7_migration_adds_agent_owner_notifications_table(tmp_path: Path):
     StateDB(db_path)
 
     assert "agent_owner_notifications" in _table_names(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Migration v8 -> v9
+# ---------------------------------------------------------------------------
+
+
+def test_migrates_v8_schema_to_v9_and_preserves_existing_data(tmp_path: Path):
+    db_path = tmp_path / "v8.db"
+    repo = _git_repo(tmp_path, "v8-repo")
+    _build_v8_db(db_path, repo)
+
+    db = StateDB(db_path)
+
+    assert db.schema_version() == 9
+    assert db.get_tier(1) == "STANDARD"
+    assert db.get_budget(1) == pytest.approx(11.5)
+    task = db.get_task("task-v5")
+    assert task is not None
+    assert task.branch == "feature/task-v5"
+    assert task.project_id == "alpha_project"
+    assert db.get_project("alpha_project") == _project()
+    assert db.get_project_policy("alpha_project") == _policy()
+    assert db.list_project_memberships("alpha_project") == [_membership()]
+    assert db.get_project_chat_binding("alpha_project") == _binding()
+    assert db.get_project_runtime_binding("alpha_project") == _runtime_binding(repo)
+    assert db.get_agent_dm_session(101, "alpha_project", "writer_agent") == (
+        _agent_dm_session()
+    )
+    assert db.list_agent_dm_messages(101, "alpha_project", "writer_agent") == (
+        _agent_dm_message(body="Need a draft"),
+    )
+    assert db.list_queued_agent_owner_notifications(
+        101,
+        "alpha_project",
+        "writer_agent",
+        "writer_agent",
+    ) == (_agent_owner_notification(notification_id=1),)
+
+
+def test_v8_migration_adds_agent_bus_tables(tmp_path: Path):
+    db_path = tmp_path / "v8-bus.db"
+    repo = _git_repo(tmp_path, "v8-bus-repo")
+    _build_v8_db(db_path, repo)
+
+    StateDB(db_path)
+
+    assert "project_threads" in _table_names(db_path)
+    assert "agent_bus_messages" in _table_names(db_path)

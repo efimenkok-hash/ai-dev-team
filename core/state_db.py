@@ -3,7 +3,8 @@ core/state_db.py
 
 SQLite-backed persistent state for chat tier selection, completed task
 history, per-chat budget, the AI Office project model, and owner-agent
-DM session/message state, plus queued agent-owner notifications.
+DM session/message state, queued agent-owner notifications, and durable
+backend agent-bus threads/messages.
 
 Design goals:
 1. Single-file stdlib-only storage (`sqlite3`), safe for bot restarts.
@@ -18,13 +19,14 @@ Design goals:
 CONTRACTS:
 1. StateDB(path) requires a Path; constructor creates parent directories and
    initializes/migrates the schema eagerly.
-2. Current schema version is 8. Unknown future versions raise ValueError.
+2. Current schema version is 9. Unknown future versions raise ValueError.
 3. Every public method validates arguments via isinstance/ValueError.
 4. Writes are serialized with a process-local lock; reads use independent
    SQLite connections and remain safe under concurrent access.
 5. task_history keeps an append-only audit log. get_task(task_id) returns the
    newest record for that task_id; recent_tasks(n) returns newest-last order.
-6. schema migration supports v1 -> v2 -> v3 -> v4 -> v5 -> v6 -> v7 -> v8:
+6. schema migration supports v1 -> v2 -> v3 -> v4 -> v5 -> v6 -> v7 -> v8
+   -> v9:
    - v1 -> v2: tier_sessions.tier_name -> active_tier
    - v1 -> v2: task_history gains AUTOINCREMENT id for stable append-order
      semantics
@@ -36,6 +38,8 @@ CONTRACTS:
    - v6 -> v7: adds agent_dm_messages for typed owner-agent DM transcripts
    - v7 -> v8: adds agent_owner_notifications for queued personal DM
      notifications that can be delivered later into an active agent thread
+   - v8 -> v9: adds project_threads and agent_bus_messages for durable
+     backend agent-bus history
 7. Identity model is explicit:
    - Project.owner_user_id is a positive Telegram owner user id stored in
      projects.owner_user_id.
@@ -58,6 +62,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from core.adapter import ProjectCommand, ProjectRule
+from core.agent_bus_models import AgentMessage, AgentMessageRef, ProjectThread
 from core.agent_dm_models import (
     DEFAULT_AGENT_DM_MESSAGE_MAXLEN,
     AgentDmMessage,
@@ -74,7 +79,7 @@ from core.project_models import (
 from core.project_runtime import ProjectRuntimeBinding
 from core.task_history import TaskSummary
 
-_CURRENT_SCHEMA_VERSION = 8
+_CURRENT_SCHEMA_VERSION = 9
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -216,6 +221,37 @@ CREATE TABLE IF NOT EXISTS agent_owner_notifications (
 )
 """
 
+_CREATE_PROJECT_THREADS = """
+CREATE TABLE IF NOT EXISTS project_threads (
+    project_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    opened_by_role TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    last_message_at REAL NOT NULL,
+    task_id TEXT NULL,
+    PRIMARY KEY(project_id, thread_id)
+)
+"""
+
+_CREATE_AGENT_BUS_MESSAGES = """
+CREATE TABLE IF NOT EXISTS agent_bus_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    sender_role TEXT NOT NULL,
+    recipient_role TEXT NOT NULL,
+    message_kind TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    in_reply_to_project_id TEXT NULL,
+    in_reply_to_thread_id TEXT NULL,
+    in_reply_to_message_id TEXT NULL,
+    UNIQUE(project_id, thread_id, message_id)
+)
+"""
+
 _CREATE_INDEX_TASK_HISTORY_TASK_ID = """
 CREATE INDEX IF NOT EXISTS idx_task_history_task_id_id
 ON task_history(task_id, id DESC)
@@ -241,6 +277,21 @@ ON agent_owner_notifications(
     status,
     id ASC
 )
+"""
+
+_CREATE_INDEX_PROJECT_THREADS_PROJECT_ACTIVITY = """
+CREATE INDEX IF NOT EXISTS idx_project_threads_project_activity
+ON project_threads(project_id, last_message_at DESC, thread_id ASC)
+"""
+
+_CREATE_INDEX_AGENT_BUS_MESSAGES_THREAD_ID = """
+CREATE INDEX IF NOT EXISTS idx_agent_bus_messages_thread_id_asc
+ON agent_bus_messages(project_id, thread_id, id ASC)
+"""
+
+_CREATE_INDEX_AGENT_BUS_MESSAGES_INBOX_ID = """
+CREATE INDEX IF NOT EXISTS idx_agent_bus_messages_inbox_id_asc
+ON agent_bus_messages(project_id, recipient_role, id ASC)
 """
 
 
@@ -672,6 +723,176 @@ class StateDB:
         return self._row_to_project_runtime_binding(row)
 
     # ------------------------------------------------------------------
+    # Agent bus threads/messages
+    # ------------------------------------------------------------------
+
+    def upsert_project_thread(self, thread: ProjectThread) -> None:
+        if not isinstance(thread, ProjectThread):
+            raise ValueError(
+                "invalid_project_thread_type:"
+                f"{type(thread).__name__}"
+            )
+        self._run_write_transaction(
+            lambda conn: self._upsert_project_thread_conn(conn, thread)
+        )
+
+    def get_project_thread(
+        self,
+        project_id: str,
+        thread_id: str,
+    ) -> ProjectThread | None:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_thread_id = self._normalize_project_identifier(
+            thread_id,
+            field_name="thread_id",
+        )
+        with self._connect() as conn:
+            row = self._get_project_thread_row(
+                conn,
+                normalized_project_id,
+                normalized_thread_id,
+            )
+        return self._row_to_project_thread(row)
+
+    def list_project_threads(
+        self,
+        project_id: str,
+    ) -> tuple[ProjectThread, ...]:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT project_id, thread_id, opened_by_role, status, created_at,
+                       last_message_at, task_id
+                FROM project_threads
+                WHERE project_id = ?
+                ORDER BY last_message_at DESC, thread_id ASC
+                """,
+                (normalized_project_id,),
+            ).fetchall()
+        return tuple(
+            thread
+            for row in rows
+            if (thread := self._row_to_project_thread(row)) is not None
+        )
+
+    def insert_agent_bus_message(
+        self,
+        message: AgentMessage,
+    ) -> None:
+        if not isinstance(message, AgentMessage):
+            raise ValueError(
+                "invalid_agent_bus_message_type:"
+                f"{type(message).__name__}"
+            )
+        self._run_write_transaction(
+            lambda conn: self._insert_agent_bus_message_conn(conn, message)
+        )
+
+    def get_agent_bus_message(
+        self,
+        project_id: str,
+        thread_id: str,
+        message_id: str,
+    ) -> AgentMessage | None:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_thread_id = self._normalize_project_identifier(
+            thread_id,
+            field_name="thread_id",
+        )
+        normalized_message_id = self._normalize_project_identifier(
+            message_id,
+            field_name="message_id",
+        )
+        with self._connect() as conn:
+            row = self._get_agent_bus_message_row(
+                conn,
+                normalized_project_id,
+                normalized_thread_id,
+                normalized_message_id,
+            )
+        return self._row_to_agent_bus_message(row)
+
+    def list_agent_bus_messages(
+        self,
+        project_id: str,
+        thread_id: str,
+    ) -> tuple[AgentMessage, ...]:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_thread_id = self._normalize_project_identifier(
+            thread_id,
+            field_name="thread_id",
+        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT project_id, thread_id, message_id, sender_role,
+                       recipient_role, message_kind, body, created_at,
+                       in_reply_to_project_id, in_reply_to_thread_id,
+                       in_reply_to_message_id
+                FROM agent_bus_messages
+                WHERE project_id = ? AND thread_id = ?
+                ORDER BY id ASC
+                """,
+                (
+                    normalized_project_id,
+                    normalized_thread_id,
+                ),
+            ).fetchall()
+        return tuple(
+            message
+            for row in rows
+            if (message := self._row_to_agent_bus_message(row)) is not None
+        )
+
+    def list_agent_bus_inbox(
+        self,
+        project_id: str,
+        recipient_role: str,
+    ) -> tuple[AgentMessage, ...]:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_recipient_role = self._normalize_project_identifier(
+            recipient_role,
+            field_name="recipient_role",
+        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT project_id, thread_id, message_id, sender_role,
+                       recipient_role, message_kind, body, created_at,
+                       in_reply_to_project_id, in_reply_to_thread_id,
+                       in_reply_to_message_id
+                FROM agent_bus_messages
+                WHERE project_id = ? AND recipient_role = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (
+                    normalized_project_id,
+                    normalized_recipient_role,
+                ),
+            ).fetchall()
+        return tuple(
+            message
+            for row in rows
+            if (message := self._row_to_agent_bus_message(row)) is not None
+        )
+
+    # ------------------------------------------------------------------
     # Agent DM sessions
     # ------------------------------------------------------------------
 
@@ -930,7 +1151,7 @@ class StateDB:
         with self._lock, self._connect() as conn:
             version = self._detect_schema_version(conn)
             if version == 0:
-                self._create_v8_schema(conn)
+                self._create_v9_schema(conn)
                 return
             if version > _CURRENT_SCHEMA_VERSION:
                 raise ValueError(
@@ -965,9 +1186,13 @@ class StateDB:
                     self._migrate_v7_to_v8(conn)
                     version = 8
                     continue
+                if version == 8:
+                    self._migrate_v8_to_v9(conn)
+                    version = 9
+                    continue
                 raise ValueError(f"unsupported_schema_version:{version}")
 
-    def _create_v8_schema(self, conn: sqlite3.Connection) -> None:
+    def _create_v9_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE_SCHEMA_META)
         conn.execute(_CREATE_TIER_SESSIONS)
         conn.execute(_CREATE_TASK_HISTORY)
@@ -980,10 +1205,15 @@ class StateDB:
         conn.execute(_CREATE_AGENT_DM_SESSIONS)
         conn.execute(_CREATE_AGENT_DM_MESSAGES)
         conn.execute(_CREATE_AGENT_OWNER_NOTIFICATIONS)
+        conn.execute(_CREATE_PROJECT_THREADS)
+        conn.execute(_CREATE_AGENT_BUS_MESSAGES)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_TASK_ID)
         conn.execute(_CREATE_INDEX_TASK_HISTORY_FINISHED)
         conn.execute(_CREATE_INDEX_AGENT_DM_MESSAGES_TRANSCRIPT_ID)
         conn.execute(_CREATE_INDEX_AGENT_OWNER_NOTIFICATIONS_QUEUE)
+        conn.execute(_CREATE_INDEX_PROJECT_THREADS_PROJECT_ACTIVITY)
+        conn.execute(_CREATE_INDEX_AGENT_BUS_MESSAGES_THREAD_ID)
+        conn.execute(_CREATE_INDEX_AGENT_BUS_MESSAGES_INBOX_ID)
         self._set_schema_version(conn, _CURRENT_SCHEMA_VERSION)
 
     def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
@@ -1025,6 +1255,14 @@ class StateDB:
         conn.execute(_CREATE_AGENT_OWNER_NOTIFICATIONS)
         conn.execute(_CREATE_INDEX_AGENT_OWNER_NOTIFICATIONS_QUEUE)
         self._set_schema_version(conn, 8)
+
+    def _migrate_v8_to_v9(self, conn: sqlite3.Connection) -> None:
+        conn.execute(_CREATE_PROJECT_THREADS)
+        conn.execute(_CREATE_AGENT_BUS_MESSAGES)
+        conn.execute(_CREATE_INDEX_PROJECT_THREADS_PROJECT_ACTIVITY)
+        conn.execute(_CREATE_INDEX_AGENT_BUS_MESSAGES_THREAD_ID)
+        conn.execute(_CREATE_INDEX_AGENT_BUS_MESSAGES_INBOX_ID)
+        self._set_schema_version(conn, 9)
 
     def _migrate_tier_sessions_to_v2(self, conn: sqlite3.Connection) -> None:
         columns = self._table_columns(conn, "tier_sessions")
@@ -1355,6 +1593,61 @@ class StateDB:
             ),
         )
 
+    @staticmethod
+    def _row_to_project_thread(
+        row: sqlite3.Row | None,
+    ) -> ProjectThread | None:
+        if row is None:
+            return None
+        return ProjectThread(
+            project_id=str(row["project_id"]),
+            thread_id=str(row["thread_id"]),
+            opened_by_role=str(row["opened_by_role"]),
+            status=str(row["status"]),
+            created_at=float(row["created_at"]),
+            last_message_at=float(row["last_message_at"]),
+            task_id=(
+                None
+                if row["task_id"] is None
+                else str(row["task_id"])
+            ),
+        )
+
+    @staticmethod
+    def _row_to_agent_bus_message(
+        row: sqlite3.Row | None,
+    ) -> AgentMessage | None:
+        if row is None:
+            return None
+        in_reply_to_project_id = row["in_reply_to_project_id"]
+        in_reply_to_thread_id = row["in_reply_to_thread_id"]
+        in_reply_to_message_id = row["in_reply_to_message_id"]
+        if (
+            (in_reply_to_project_id is None)
+            != (in_reply_to_thread_id is None)
+            or (in_reply_to_project_id is None)
+            != (in_reply_to_message_id is None)
+        ):
+            raise ValueError("invalid_agent_bus_message_reference_columns")
+        in_reply_to = None
+        if in_reply_to_project_id is not None:
+            in_reply_to = AgentMessageRef(
+                project_id=str(in_reply_to_project_id),
+                thread_id=str(in_reply_to_thread_id),
+                message_id=str(in_reply_to_message_id),
+            )
+        return AgentMessage(
+            project_id=str(row["project_id"]),
+            thread_id=str(row["thread_id"]),
+            message_id=str(row["message_id"]),
+            sender_role=str(row["sender_role"]),
+            recipient_role=str(row["recipient_role"]),
+            message_kind=str(row["message_kind"]),
+            body=str(row["body"]),
+            created_at=float(row["created_at"]),
+            in_reply_to=in_reply_to,
+        )
+
     def _upsert_project_conn(
         self,
         conn: sqlite3.Connection,
@@ -1559,6 +1852,152 @@ class StateDB:
                 ),
                 json.dumps(list(binding.forbidden_paths)),
                 json.dumps(list(binding.forbidden_tokens)),
+            ),
+        )
+
+    def _upsert_project_thread_conn(
+        self,
+        conn: sqlite3.Connection,
+        thread: ProjectThread,
+    ) -> None:
+        self._ensure_project_exists(conn, thread.project_id)
+        conn.execute(
+            """
+            INSERT INTO project_threads(
+                project_id,
+                thread_id,
+                opened_by_role,
+                status,
+                created_at,
+                last_message_at,
+                task_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, thread_id) DO UPDATE SET
+                opened_by_role = excluded.opened_by_role,
+                status = excluded.status,
+                created_at = excluded.created_at,
+                last_message_at = excluded.last_message_at,
+                task_id = excluded.task_id
+            """,
+            (
+                thread.project_id,
+                thread.thread_id,
+                thread.opened_by_role,
+                thread.status,
+                thread.created_at,
+                thread.last_message_at,
+                thread.task_id,
+            ),
+        )
+
+    def _insert_agent_bus_message_conn(
+        self,
+        conn: sqlite3.Connection,
+        message: AgentMessage,
+    ) -> None:
+        self._ensure_project_exists(conn, message.project_id)
+        thread_row = self._get_project_thread_row(
+            conn,
+            message.project_id,
+            message.thread_id,
+        )
+        if thread_row is None:
+            raise ValueError(
+                "unknown_project_thread:"
+                f"{message.project_id}:{message.thread_id}"
+            )
+        thread = self._row_to_project_thread(thread_row)
+        if thread is None:
+            raise ValueError(
+                "unknown_project_thread:"
+                f"{message.project_id}:{message.thread_id}"
+            )
+        if message.created_at < thread.last_message_at:
+            raise ValueError(
+                "message_created_at_before_thread_last_message_at:"
+                f"{message.created_at}<{thread.last_message_at}"
+            )
+        if message.in_reply_to is not None:
+            referenced_row = self._get_agent_bus_message_row(
+                conn,
+                message.in_reply_to.project_id,
+                message.in_reply_to.thread_id,
+                message.in_reply_to.message_id,
+            )
+            if referenced_row is None:
+                raise ValueError(
+                    f"unknown_in_reply_to:{message.in_reply_to.message_id}"
+                )
+            referenced_message = self._row_to_agent_bus_message(referenced_row)
+            if referenced_message is None:
+                raise ValueError(
+                    f"unknown_in_reply_to:{message.in_reply_to.message_id}"
+                )
+            if referenced_message.message_kind != "request":
+                raise ValueError(
+                    "reply_target_must_be_request:"
+                    f"{referenced_message.message_kind}"
+                )
+        try:
+            conn.execute(
+                """
+                INSERT INTO agent_bus_messages(
+                    project_id,
+                    thread_id,
+                    message_id,
+                    sender_role,
+                    recipient_role,
+                    message_kind,
+                    body,
+                    created_at,
+                    in_reply_to_project_id,
+                    in_reply_to_thread_id,
+                    in_reply_to_message_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message.project_id,
+                    message.thread_id,
+                    message.message_id,
+                    message.sender_role,
+                    message.recipient_role,
+                    message.message_kind,
+                    message.body,
+                    message.created_at,
+                    (
+                        None
+                        if message.in_reply_to is None
+                        else message.in_reply_to.project_id
+                    ),
+                    (
+                        None
+                        if message.in_reply_to is None
+                        else message.in_reply_to.thread_id
+                    ),
+                    (
+                        None
+                        if message.in_reply_to is None
+                        else message.in_reply_to.message_id
+                    ),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                "duplicate_agent_bus_message:"
+                f"{message.project_id}:{message.thread_id}:{message.message_id}"
+            ) from exc
+        conn.execute(
+            """
+            UPDATE project_threads
+            SET last_message_at = ?
+            WHERE project_id = ? AND thread_id = ?
+            """,
+            (
+                message.created_at,
+                message.project_id,
+                message.thread_id,
             ),
         )
 
@@ -1798,6 +2237,41 @@ class StateDB:
                 max_entries,
             ),
         )
+
+    def _get_project_thread_row(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+        thread_id: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT project_id, thread_id, opened_by_role, status, created_at,
+                   last_message_at, task_id
+            FROM project_threads
+            WHERE project_id = ? AND thread_id = ?
+            """,
+            (project_id, thread_id),
+        ).fetchone()
+
+    def _get_agent_bus_message_row(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+        thread_id: str,
+        message_id: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT project_id, thread_id, message_id, sender_role,
+                   recipient_role, message_kind, body, created_at,
+                   in_reply_to_project_id, in_reply_to_thread_id,
+                   in_reply_to_message_id
+            FROM agent_bus_messages
+            WHERE project_id = ? AND thread_id = ? AND message_id = ?
+            """,
+            (project_id, thread_id, message_id),
+        ).fetchone()
 
     def _get_project_row_by_id(
         self,
