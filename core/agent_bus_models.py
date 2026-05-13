@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass
 
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 VALID_PROJECT_THREAD_STATUSES = frozenset({"open", "closed"})
 VALID_AGENT_MESSAGE_KINDS = frozenset({"request", "reply"})
@@ -41,6 +42,17 @@ def _normalize_choice(
 ) -> str:
     normalized = _normalize_identifier(value, field_name=field_name)
     if normalized not in allowed:
+        raise ValueError(f"invalid_{field_name}:{normalized}")
+    return normalized
+
+
+def _normalize_task_id(value: str, *, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"empty_{field_name}")
+    normalized = value.strip().lower()
+    if not normalized.isascii():
+        raise ValueError(f"non_ascii_{field_name}")
+    if not _TASK_ID_RE.fullmatch(normalized):
         raise ValueError(f"invalid_{field_name}:{normalized}")
     return normalized
 
@@ -143,7 +155,7 @@ class ProjectThread:
             object.__setattr__(
                 self,
                 "task_id",
-                _normalize_identifier(self.task_id, field_name="task_id"),
+                _normalize_task_id(self.task_id, field_name="task_id"),
             )
 
 

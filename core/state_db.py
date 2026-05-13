@@ -83,6 +83,7 @@ _CURRENT_SCHEMA_VERSION = 9
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _T = TypeVar("_T")
 
 _CREATE_SCHEMA_META = """
@@ -754,6 +755,27 @@ class StateDB:
                 conn,
                 normalized_project_id,
                 normalized_thread_id,
+            )
+        return self._row_to_project_thread(row)
+
+    def get_project_thread_by_task(
+        self,
+        project_id: str,
+        task_id: str,
+    ) -> ProjectThread | None:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_task_id = self._normalize_task_identifier(
+            task_id,
+            field_name="task_id",
+        )
+        with self._connect() as conn:
+            row = self._get_project_thread_by_task_row(
+                conn,
+                normalized_project_id,
+                normalized_task_id,
             )
         return self._row_to_project_thread(row)
 
@@ -1861,6 +1883,13 @@ class StateDB:
         thread: ProjectThread,
     ) -> None:
         self._ensure_project_exists(conn, thread.project_id)
+        if thread.task_id is not None:
+            self._ensure_project_task_thread_available(
+                conn,
+                project_id=thread.project_id,
+                task_id=thread.task_id,
+                thread_id=thread.thread_id,
+            )
         conn.execute(
             """
             INSERT INTO project_threads(
@@ -2254,6 +2283,30 @@ class StateDB:
             (project_id, thread_id),
         ).fetchone()
 
+    def _get_project_thread_by_task_row(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+        task_id: str,
+    ) -> sqlite3.Row | None:
+        rows = conn.execute(
+            """
+            SELECT project_id, thread_id, opened_by_role, status, created_at,
+                   last_message_at, task_id
+            FROM project_threads
+            WHERE project_id = ? AND task_id = ?
+            ORDER BY last_message_at DESC, thread_id ASC
+            """,
+            (project_id, task_id),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) > 1:
+            raise ValueError(
+                f"duplicate_project_task_thread:{project_id}:{task_id}"
+            )
+        return rows[0]
+
     def _get_agent_bus_message_row(
         self,
         conn: sqlite3.Connection,
@@ -2370,6 +2423,36 @@ class StateDB:
         if row is not None and str(row["project_id"]) != project_id:
             raise ValueError(f"project_slug_already_exists:{slug}")
 
+    def _ensure_project_task_thread_available(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+        task_id: str,
+        thread_id: str,
+    ) -> None:
+        rows = conn.execute(
+            """
+            SELECT thread_id
+            FROM project_threads
+            WHERE project_id = ? AND task_id = ?
+            ORDER BY thread_id ASC
+            """,
+            (project_id, task_id),
+        ).fetchall()
+        if not rows:
+            return
+        thread_ids = {str(row["thread_id"]) for row in rows}
+        if len(thread_ids) > 1:
+            raise ValueError(
+                f"duplicate_project_task_thread:{project_id}:{task_id}"
+            )
+        existing_thread_id = next(iter(thread_ids))
+        if existing_thread_id != thread_id:
+            raise ValueError(
+                f"duplicate_project_task_thread:{project_id}:{task_id}"
+            )
+
     def _ensure_chat_binding_available(
         self,
         conn: sqlite3.Connection,
@@ -2431,6 +2514,16 @@ class StateDB:
         if not normalized.isascii():
             raise ValueError(f"non_ascii_{field_name}")
         if not _SLUG_RE.fullmatch(normalized):
+            raise ValueError(f"invalid_{field_name}:{normalized}")
+        return normalized
+
+    @staticmethod
+    def _normalize_task_identifier(value: str, *, field_name: str) -> str:
+        StateDB._validate_non_empty_text(value, field_name)
+        normalized = value.strip().lower()
+        if not normalized.isascii():
+            raise ValueError(f"non_ascii_{field_name}")
+        if not _TASK_ID_RE.fullmatch(normalized):
             raise ValueError(f"invalid_{field_name}:{normalized}")
         return normalized
 

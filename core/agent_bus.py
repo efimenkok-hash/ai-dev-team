@@ -302,6 +302,43 @@ class StateBackedAgentBus:
     ) -> ProjectThread | None:
         return self._state_db.get_project_thread(project_id, thread_id)
 
+    def get_task_thread(
+        self,
+        project_id: str,
+        task_id: str,
+    ) -> ProjectThread | None:
+        return self._state_db.get_project_thread_by_task(project_id, task_id)
+
+    def get_or_open_task_thread(
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        opened_by_role: str,
+        created_at: float,
+    ) -> ProjectThread:
+        normalized_project_id = self._state_db._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        normalized_task_id = self._state_db._normalize_task_identifier(
+            task_id,
+            field_name="task_id",
+        )
+        normalized_opened_by_role = _normalize_identifier(
+            opened_by_role,
+            field_name="opened_by_role",
+        )
+        return self._state_db._run_write_transaction(
+            lambda conn: self._get_or_open_task_thread_conn(
+                conn,
+                project_id=normalized_project_id,
+                task_id=normalized_task_id,
+                opened_by_role=normalized_opened_by_role,
+                created_at=created_at,
+            )
+        )
+
     def list_thread_messages(
         self,
         project_id: str,
@@ -397,6 +434,35 @@ class StateBackedAgentBus:
         )
         self._state_db._insert_agent_bus_message_conn(conn, message)
         return message
+
+    def _get_or_open_task_thread_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+        task_id: str,
+        opened_by_role: str,
+        created_at: float,
+    ) -> ProjectThread:
+        row = self._state_db._get_project_thread_by_task_row(
+            conn,
+            project_id,
+            task_id,
+        )
+        thread = self._state_db._row_to_project_thread(row)
+        if thread is not None:
+            if thread.status != "open":
+                raise ValueError(
+                    f"project_task_thread_closed:{project_id}:{task_id}"
+                )
+            return thread
+        return self._open_thread_conn(
+            conn,
+            project_id=project_id,
+            opened_by_role=opened_by_role,
+            created_at=created_at,
+            task_id=task_id,
+        )
 
     def _allocate_thread_id_conn(self, conn: sqlite3.Connection) -> str:
         rows = conn.execute(

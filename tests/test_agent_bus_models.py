@@ -95,7 +95,7 @@ def test_project_thread_happy_path_normalizes_fields():
         status="  Closed  ",
         created_at=1000,
         last_message_at=1001,
-        task_id="  Task_One  ",
+        task_id="  Task-abc-001  ",
     )
 
     assert thread.project_id == "alpha_project"
@@ -104,7 +104,7 @@ def test_project_thread_happy_path_normalizes_fields():
     assert thread.status == "closed"
     assert thread.created_at == 1000.0
     assert thread.last_message_at == 1001.0
-    assert thread.task_id == "task_one"
+    assert thread.task_id == "task-abc-001"
 
 
 def test_agent_request_happy_path_normalizes_fields():
@@ -190,6 +190,12 @@ def test_project_thread_rejects_invalid_project_id(bad: object):
 def test_project_thread_rejects_invalid_thread_id(bad: object):
     with pytest.raises(ValueError):
         _thread(thread_id=bad)
+
+
+@pytest.mark.parametrize("bad", ["", "  ", "task 42", "task@42", "Русский"])
+def test_project_thread_rejects_invalid_task_id(bad: object):
+    with pytest.raises(ValueError):
+        _thread(task_id=bad)
 
 
 @pytest.mark.parametrize("bad", ["", "  ", None, "writer-agent", "Русский"])
