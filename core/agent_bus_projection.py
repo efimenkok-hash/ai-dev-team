@@ -239,6 +239,14 @@ class AgentBusProjectionService:
     def project_registry(self) -> ProjectRegistry:
         return self._project_registry
 
+    def send_envelope(self, envelope: OutgoingEnvelope) -> None:
+        if not isinstance(envelope, OutgoingEnvelope):
+            raise ValueError(
+                "invalid_outgoing_envelope_type:"
+                f"{type(envelope).__name__}"
+            )
+        self._send_envelope(envelope)
+
     def resolve_target(
         self,
         thread: ProjectThread,
@@ -352,7 +360,7 @@ class AgentBusProjectionService:
                 f"{thread.project_id}:{thread.thread_id}"
             )
         try:
-            self._send_envelope(envelope)
+            self.send_envelope(envelope)
         except Exception as exc:
             return AgentBusProjectionResult(
                 message=message,
