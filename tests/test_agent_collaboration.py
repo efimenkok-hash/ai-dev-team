@@ -15,6 +15,7 @@ from core.agent_collaboration import (
     AgentCollaborationPolicy,
     AgentCollaborationService,
 )
+from core.agent_role_catalog import SPECIALIST_ROLE_ORDER
 from core.coordinator_role import COORDINATOR_ROLE
 from core.llm_dispatcher import LLMAttempt, LLMDispatcher, LLMResponse
 from core.model_tier import REQUIRED_ROLES, TierConfig
@@ -29,6 +30,9 @@ def _make_tier() -> TierConfig:
         description="test",
         estimated_cost_usd=0.5,
         models_per_role={role: ("model-x",) for role in REQUIRED_ROLES},
+        specialist_models_per_role={
+            role: ("specialist-model-x",) for role in SPECIALIST_ROLE_ORDER
+        },
     )
 
 
@@ -193,6 +197,47 @@ def test_run_consultation_rejects_unknown_recipient_role(tmp_path: Path):
         service.run_consultation(context, request, created_at=1001.0)
 
 
+@pytest.mark.parametrize(
+    "recipient_role",
+    ("security_agent", "devops_agent", "data_agent"),
+)
+def test_run_consultation_allows_selectable_specialist_recipient_roles(
+    tmp_path: Path,
+    recipient_role: str,
+):
+    _, bus, projecting_bus, thread, sent_envelopes = _make_bus(
+        tmp_path,
+        throttled=True,
+    )
+    dispatcher = _make_dispatcher()
+    dispatcher.dispatch = MagicMock(return_value=_make_response("Короткий ответ"))  # type: ignore[method-assign]
+    service = AgentCollaborationService(bus, dispatcher, _make_tier())
+    context = AgentCollaborationContext(
+        project_id="alpha_project",
+        task_id="task-42",
+        thread=thread,
+        caller_role="writer_agent",
+        owner_task_text="Сделай API",
+    )
+    request = service.parse_consultation_request(
+        '{"action":"ask_another_agent","recipient_role":"'
+        f'{recipient_role}'
+        '","question":"Нужна экспертная консультация"}'
+    )
+    assert request is not None
+
+    result = service.run_consultation(context, request, created_at=1001.0)
+
+    assert result.recipient_role == recipient_role
+    assert result.request_message.recipient_role == recipient_role
+    assert result.reply_message.sender_role == recipient_role
+    assert dispatcher.dispatch.call_args[0][0].agent_role == recipient_role
+    messages = projecting_bus.list_thread_messages("alpha_project", thread.thread_id)
+    assert tuple(message.message_kind for message in messages) == ("request", "reply")
+    assert len(sent_envelopes) >= 2
+    assert sent_envelopes[1].sender_role == recipient_role
+
+
 def test_run_consultation_writes_request_and_reply_and_reuses_task_thread(
     tmp_path: Path,
 ):
@@ -343,6 +388,30 @@ def test_nested_consultation_from_recipient_is_rejected_without_fake_reply(
     assert request is not None
 
     with pytest.raises(ValueError, match="nested_consultation_not_allowed:reviewer_agent"):
+        service.run_consultation(context, request, created_at=1001.0)
+
+    messages = projecting_bus.list_thread_messages("alpha_project", thread.thread_id)
+    assert tuple(message.message_kind for message in messages) == ("request",)
+
+
+def test_specialist_recipient_failure_does_not_write_fake_reply(tmp_path: Path):
+    _, bus, projecting_bus, thread, _ = _make_bus(tmp_path)
+    dispatcher = _make_dispatcher()
+    dispatcher.dispatch = MagicMock(side_effect=RuntimeError("specialist failed"))  # type: ignore[method-assign]
+    service = AgentCollaborationService(bus, dispatcher, _make_tier())
+    context = AgentCollaborationContext(
+        project_id="alpha_project",
+        task_id="task-42",
+        thread=thread,
+        caller_role="writer_agent",
+        owner_task_text="Сделай API",
+    )
+    request = service.parse_consultation_request(
+        '{"action":"ask_another_agent","recipient_role":"security_agent","question":"Проверь риск"}'
+    )
+    assert request is not None
+
+    with pytest.raises(RuntimeError, match="specialist failed"):
         service.run_consultation(context, request, created_at=1001.0)
 
     messages = projecting_bus.list_thread_messages("alpha_project", thread.thread_id)

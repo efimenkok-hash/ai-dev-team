@@ -117,6 +117,8 @@ def reject_injection_markers(
     return _check
 
 
+# Baseline FSM contract only. This is intentionally narrower than the full
+# universe of selectable logical roles from core.agent_role_catalog.
 REQUIRED_AGENTS = (
     "planning_agent",
     "pm_agent",

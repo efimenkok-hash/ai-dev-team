@@ -25,6 +25,7 @@ from core.agent_bus_models import (
 )
 from core.agent_bus_projection import ProjectingAgentBus
 from core.agent_bus_projection_throttle import ThrottledProjectingAgentBus
+from core.agent_role_catalog import is_selectable_agent_role
 from core.json_extractor import extract_json_object
 from core.llm_dispatcher import LLMDispatcher, LLMRequest
 from core.model_tier import REQUIRED_ROLES, TierConfig
@@ -325,10 +326,9 @@ class AgentCollaborationService:
             created_at,
             field_name="created_at",
         )
-        self._ensure_known_role(context.caller_role, field_name="caller_role")
-        self._ensure_known_role(
+        self._ensure_pipeline_caller_role(context.caller_role)
+        self._ensure_selectable_recipient_role(
             request.recipient_role,
-            field_name="recipient_role",
         )
         if request.recipient_role == context.caller_role:
             raise ValueError(
@@ -414,14 +414,23 @@ class AgentCollaborationService:
             answer_text=answer_text,
         )
 
-    def _ensure_known_role(self, role: str, *, field_name: str) -> None:
-        normalized_role = _normalize_identifier(role, field_name=field_name)
+    def _ensure_pipeline_caller_role(self, role: str) -> None:
+        normalized_role = _normalize_identifier(role, field_name="caller_role")
         if normalized_role not in REQUIRED_ROLES:
-            raise ValueError(f"unknown_{field_name}:{normalized_role}")
+            raise ValueError(f"unknown_caller_role:{normalized_role}")
         try:
-            self._tier.chain_for(normalized_role)
+            self._tier.dispatch_chain_for(normalized_role)
         except Exception as exc:
-            raise ValueError(f"unknown_{field_name}:{normalized_role}") from exc
+            raise ValueError(f"unknown_caller_role:{normalized_role}") from exc
+
+    def _ensure_selectable_recipient_role(self, role: str) -> None:
+        normalized_role = _normalize_identifier(role, field_name="recipient_role")
+        if not is_selectable_agent_role(normalized_role):
+            raise ValueError(f"unknown_recipient_role:{normalized_role}")
+        try:
+            self._tier.dispatch_chain_for(normalized_role)
+        except Exception as exc:
+            raise ValueError(f"unknown_recipient_role:{normalized_role}") from exc
 
     def _resolve_task_thread(
         self,

@@ -4,6 +4,7 @@ import time
 
 import pytest
 
+from core.agent_role_catalog import SELECTABLE_AGENT_ROLES
 from core.model_tier import REQUIRED_ROLES
 from core.progress_emitter import (
     EVENT_KINDS,
@@ -39,6 +40,15 @@ def test_event_happy_path():
     )
     assert e.kind == "agent_started"
     assert e.agent_role == "architect_agent"
+
+
+def test_event_accepts_selectable_specialist_role():
+    e = ProgressEvent(
+        kind="agent_started",
+        timestamp=time.time(),
+        agent_role="security_agent",
+    )
+    assert e.agent_role == "security_agent"
 
 
 def test_event_is_frozen():
@@ -237,6 +247,23 @@ def test_wrap_preserves_return_value():
     assert wrapped() == "expected"
 
 
+def test_wrap_accepts_selectable_specialist_role():
+    captured: list[ProgressEvent] = []
+    emitter = ProgressEmitter(captured.append)
+    wrapped = wrap_agent_with_progress(
+        "security_agent",
+        lambda: "specialist-ok",
+        emitter,
+    )
+
+    assert wrapped() == "specialist-ok"
+    assert [event.kind for event in captured] == [
+        "agent_started",
+        "agent_finished",
+    ]
+    assert all(event.agent_role == "security_agent" for event in captured)
+
+
 def test_wrap_passes_through_args_and_kwargs():
     captured_args = []
     emitter = ProgressEmitter(lambda _e: None)
@@ -327,6 +354,29 @@ def test_wrap_registry_emits_events_on_call():
     wrapped["architect_agent"]("input")
     kinds = [e.kind for e in captured]
     assert kinds == ["agent_started", "agent_finished"]
+
+
+def test_wrap_registry_wraps_selectable_specialist_roles():
+    captured: list[ProgressEvent] = []
+    emitter = ProgressEmitter(captured.append)
+    registry: dict[str, object] = {
+        "writer_agent": lambda: "writer",
+        "security_agent": lambda: "security",
+        "custom_role": lambda: "custom",
+    }
+
+    wrapped = wrap_registry_with_progress(registry, emitter)
+
+    assert wrapped["writer_agent"]() == "writer"
+    assert wrapped["security_agent"]() == "security"
+    assert wrapped["custom_role"]() == "custom"
+    assert [event.agent_role for event in captured] == [
+        "writer_agent",
+        "writer_agent",
+        "security_agent",
+        "security_agent",
+    ]
+    assert "security_agent" in SELECTABLE_AGENT_ROLES
 
 
 def test_wrap_registry_rejects_non_mapping():

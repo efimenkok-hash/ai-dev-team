@@ -133,6 +133,11 @@ def test_construction_accepts_extra_agents():
     Orchestrator(memory=PipelineMemory(), agents=extras)
 
 
+def test_construction_accepts_extra_specialist_agents_without_requiring_them():
+    extras = _registry(security_agent=SeqAgent("noop"))
+    Orchestrator(memory=PipelineMemory(), agents=extras)
+
+
 # ---------------------------------------------------------------------------
 # run idempotency
 # ---------------------------------------------------------------------------

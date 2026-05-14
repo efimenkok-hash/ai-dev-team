@@ -22,7 +22,7 @@ Design:
 
 CONTRACTS:
 1. ProgressEvent is frozen; kind must be one of EVENT_KINDS; agent_role
-   optional but if present must be in REQUIRED_ROLES (from model_tier).
+   optional but if present must be a selectable logical role.
 2. ProgressEmitter.emit() is total: never raises, never propagates
    callback errors.
 3. wrap_agent_with_progress preserves the agent function's signature
@@ -37,7 +37,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from core.model_tier import REQUIRED_ROLES
+from core.agent_role_catalog import SELECTABLE_AGENT_ROLES
 
 EVENT_KINDS: frozenset[str] = frozenset({
     "task_started",
@@ -70,7 +70,7 @@ class ProgressEvent:
         if self.agent_role is not None:
             if not isinstance(self.agent_role, str) or not self.agent_role.strip():
                 raise ValueError("empty_agent_role")
-            if self.agent_role not in REQUIRED_ROLES:
+            if self.agent_role not in SELECTABLE_AGENT_ROLES:
                 raise ValueError(f"unknown_agent_role:{self.agent_role}")
         if not isinstance(self.detail, str):
             raise ValueError("non_string_detail")
@@ -187,7 +187,7 @@ def wrap_agent_with_progress(
     The wrapper is transparent: it returns whatever `fn` returns and
     re-raises whatever `fn` raises. Only the progress events are added.
     """
-    if not isinstance(agent_role, str) or agent_role not in REQUIRED_ROLES:
+    if not isinstance(agent_role, str) or agent_role not in SELECTABLE_AGENT_ROLES:
         raise ValueError(f"invalid_agent_role:{agent_role!r}")
     if not callable(fn):
         raise ValueError(f"agent_not_callable:{type(fn).__name__}")
@@ -221,8 +221,9 @@ def wrap_registry_with_progress(
     """Returns a new registry where every agent is wrapped with progress
     events. Input registry is NOT mutated.
 
-    Roles outside REQUIRED_ROLES are preserved unwrapped (defensive: don't
-    drop unknown roles, just let them through). Roles in REQUIRED_ROLES
+    Roles outside SELECTABLE_AGENT_ROLES are preserved unwrapped (defensive:
+    don't drop unknown roles, just let them through). Roles in
+    SELECTABLE_AGENT_ROLES
     that are missing from the input are NOT injected — caller's
     responsibility.
     """
@@ -232,7 +233,7 @@ def wrap_registry_with_progress(
         raise ValueError(f"invalid_emitter:{type(emitter).__name__}")
     out: dict[str, AgentFn] = {}
     for role, fn in registry.items():
-        if role in REQUIRED_ROLES and callable(fn):
+        if role in SELECTABLE_AGENT_ROLES and callable(fn):
             out[role] = wrap_agent_with_progress(role, fn, emitter)
         else:
             out[role] = fn
