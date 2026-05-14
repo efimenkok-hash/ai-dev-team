@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from core.agent_personas import DEFAULT_PERSONAS, PersonaRegistry, default_registry
+from core.agent_role_catalog import SPECIALIST_ROLE_ORDER
 from core.coordinator_role import COORDINATOR_ROLE
 from core.coordinator_team_assembly import (
     BASELINE_INTERNAL_TEAM_ROLE_ORDER,
@@ -366,6 +367,33 @@ def test_service_assembles_baseline_team_in_stable_order(tmp_path):
     assert assembly.members[0].is_captain is True
     assert all(member.is_internal for member in assembly.members)
     assert all(member.is_active for member in assembly.members)
+    assert not any(
+        member.persona.agent_role in SPECIALIST_ROLE_ORDER
+        for member in assembly.members
+    )
+
+
+def test_service_ignores_extra_specialist_personas_and_keeps_baseline_shape(
+    tmp_path,
+):
+    repo = _git_repo(tmp_path)
+    assembly = CoordinatorTeamAssemblyService().assemble_team(
+        CoordinatorTeamAssemblyContext(
+            snapshot=_snapshot(repo, chat_binding=_chat_binding()),
+            owner_task_text="Implement the release workflow.",
+            context_source="bound_chat",
+            personas=PersonaRegistry(DEFAULT_PERSONAS),
+        )
+    )
+
+    assert len(assembly.members) == len(BASELINE_INTERNAL_TEAM_ROLE_ORDER)
+    assert tuple(member.persona.agent_role for member in assembly.members) == (
+        BASELINE_INTERNAL_TEAM_ROLE_ORDER
+    )
+    assert all(
+        role not in SPECIALIST_ROLE_ORDER
+        for role in (member.persona.agent_role for member in assembly.members)
+    )
 
 
 def test_format_team_assembly_includes_project_context_and_stable_roster(tmp_path):

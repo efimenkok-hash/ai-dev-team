@@ -24,7 +24,8 @@ CONTRACTS:
 7. format_signature(body) -> "<Title> <Name>: <body>".
    Idempotent: if body already starts with the signature, returns body
    unchanged (protects against double-signing in chains).
-8. DEFAULT_PERSONAS provides a complete set for all default system personas.
+8. DEFAULT_PERSONAS provides a complete set for all known default personas,
+   including future specialist roles that are not baseline workers yet.
 9. PersonaRegistry maps agent_role -> AgentPersona, with .for_role()
    raising KeyError for unknown roles, .all() returning sorted tuple.
 """
@@ -33,22 +34,9 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-VALID_SENIORITIES = ("junior", "middle", "senior", "lead")
+from core.agent_role_catalog import KNOWN_AGENT_ROLES
 
-# Agent roles and system personas that may appear in owner-facing chat.
-# The orchestrator worker set is a subset of these roles; coordinator is a
-# control-plane persona and does not participate in the FSM worker chain.
-_KNOWN_ROLES = frozenset({
-    "coordinator_agent",
-    "planning_agent",
-    "pm_agent",
-    "architect_agent",
-    "writer_agent",
-    "reviewer_agent",
-    "tester_agent",
-    "qa_agent",
-    "fixer_agent",
-})
+VALID_SENIORITIES = ("junior", "middle", "senior", "lead")
 
 # Allowed characters: word (letters/digits/underscore in any script via
 # re.UNICODE default), Cyrillic block (redundant safety), space, hyphen,
@@ -75,7 +63,7 @@ class AgentPersona:
     emoji: str = ""  # thematic icon (optional, used by chat formatting)
 
     def __post_init__(self) -> None:
-        if self.agent_role not in _KNOWN_ROLES:
+        if self.agent_role not in KNOWN_AGENT_ROLES:
             raise ValueError(f"unknown_agent_role:{self.agent_role}")
 
         if not isinstance(self.human_name, str):
@@ -227,6 +215,30 @@ DEFAULT_PERSONAS: tuple[AgentPersona, ...] = (
         seniority="middle",
         voice_traits=("быстрый", "хирургический", "минимум изменений"),
         emoji="🩹",
+    ),
+    AgentPersona(
+        agent_role="security_agent",
+        human_name="Безопасник",
+        title="Безопасник",
+        seniority="senior",
+        voice_traits=("подозрительный", "видит угрозы", "харднит контур"),
+        emoji="🛡",
+    ),
+    AgentPersona(
+        agent_role="devops_agent",
+        human_name="Девопс",
+        title="Девопс",
+        seniority="senior",
+        voice_traits=("операционный", "любит надёжность", "думает о деплое"),
+        emoji="⚙️",
+    ),
+    AgentPersona(
+        agent_role="data_agent",
+        human_name="Дата-инженер",
+        title="Дата-инженер",
+        seniority="senior",
+        voice_traits=("аккуратный", "следит за схемами", "проверяет корректность данных"),
+        emoji="🧮",
     ),
 )
 

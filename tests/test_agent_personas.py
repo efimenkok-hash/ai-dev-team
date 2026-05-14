@@ -9,6 +9,7 @@ from core.agent_personas import (
     PersonaRegistry,
     default_registry,
 )
+from core.agent_role_catalog import KNOWN_AGENT_ROLES, SPECIALIST_ROLE_ORDER
 
 # ---------------------------------------------------------------------------
 # constants & invariants
@@ -23,20 +24,9 @@ def test_valid_seniorities_constant():
     assert len(VALID_SENIORITIES) == 4
 
 
-def test_default_personas_covers_all_nine_roles():
+def test_default_personas_covers_all_known_roles():
     roles = {p.agent_role for p in DEFAULT_PERSONAS}
-    expected = {
-        "coordinator_agent",
-        "planning_agent",
-        "pm_agent",
-        "architect_agent",
-        "writer_agent",
-        "reviewer_agent",
-        "tester_agent",
-        "qa_agent",
-        "fixer_agent",
-    }
-    assert roles == expected
+    assert roles == KNOWN_AGENT_ROLES
 
 
 def test_default_personas_have_unique_human_names():
@@ -55,6 +45,9 @@ def test_default_personas_match_expected_callsigns():
     assert by_role["tester_agent"].human_name == "Тестировщик"
     assert by_role["qa_agent"].human_name == "QA-инженер"
     assert by_role["fixer_agent"].human_name == "Фиксер"
+    assert by_role["security_agent"].human_name == "Безопасник"
+    assert by_role["devops_agent"].human_name == "Девопс"
+    assert by_role["data_agent"].human_name == "Дата-инженер"
 
 
 def test_default_personas_callsign_equals_title():
@@ -140,6 +133,16 @@ def test_default_personas_have_voice_traits():
         assert len(p.voice_traits) >= 2, f"{p.agent_role} needs >=2 traits"
 
 
+def test_default_personas_include_specialists_with_valid_voice_and_formatting():
+    by_role = {p.agent_role: p for p in DEFAULT_PERSONAS}
+    for role in SPECIALIST_ROLE_ORDER:
+        persona = by_role[role]
+        assert persona.voice_traits
+        assert all(isinstance(trait, str) and trait.strip() for trait in persona.voice_traits)
+        assert persona.human_name == persona.title
+        assert persona.emoji
+
+
 # ---------------------------------------------------------------------------
 # AgentPersona happy-path construction
 # ---------------------------------------------------------------------------
@@ -185,6 +188,19 @@ def test_construction_happy_path_latin():
     assert p.display_name == "Forge"
     assert p.qualified_name == "Forge (Programmer)"
     assert p.seniority == "senior"
+
+
+def test_construction_accepts_security_specialist_role():
+    p = AgentPersona(
+        agent_role="security_agent",
+        human_name="Щит",
+        title="Безопасник",
+        seniority="senior",
+        voice_traits=("осторожный",),
+        emoji="🛡",
+    )
+    assert p.agent_role == "security_agent"
+    assert p.qualified_name == "Щит (Безопасник)"
 
 
 def test_construction_strips_whitespace():
@@ -461,24 +477,14 @@ def test_default_personas_qualified_names_unique():
 # ---------------------------------------------------------------------------
 
 
-def test_default_registry_has_nine_personas():
+def test_default_registry_has_twelve_personas():
     reg = default_registry()
-    assert len(reg) == 9
+    assert len(reg) == 12
 
 
-def test_default_registry_covers_all_required_roles():
+def test_default_registry_covers_all_known_roles():
     reg = default_registry()
-    for role in (
-        "coordinator_agent",
-        "planning_agent",
-        "pm_agent",
-        "architect_agent",
-        "writer_agent",
-        "reviewer_agent",
-        "tester_agent",
-        "qa_agent",
-        "fixer_agent",
-    ):
+    for role in KNOWN_AGENT_ROLES:
         assert role in reg
 
 
@@ -488,6 +494,21 @@ def test_registry_for_role_returns_correct_persona():
     assert p.human_name == "Архитектор"
     assert p.title == "Архитектор"
     assert p.qualified_name == "Архитектор"
+
+
+@pytest.mark.parametrize(
+    ("role", "expected_name"),
+    (
+        ("security_agent", "Безопасник"),
+        ("devops_agent", "Девопс"),
+        ("data_agent", "Дата-инженер"),
+    ),
+)
+def test_registry_for_specialist_role_returns_correct_persona(role, expected_name):
+    reg = default_registry()
+    persona = reg.for_role(role)
+    assert persona.human_name == expected_name
+    assert persona.title == expected_name
 
 
 def test_registry_for_unknown_role_raises_keyerror():
@@ -524,7 +545,7 @@ def test_registry_list_roles_returns_sorted():
     reg = default_registry()
     roles = reg.list_roles()
     assert roles == sorted(roles)
-    assert len(roles) == 9
+    assert len(roles) == len(KNOWN_AGENT_ROLES)
 
 
 def test_registry_with_subset_personas():
@@ -553,6 +574,6 @@ def test_registry_with_replaced_default():
     )
     others = tuple(p for p in DEFAULT_PERSONAS if p.agent_role != "writer_agent")
     reg = PersonaRegistry((*others, custom_writer))
-    assert len(reg) == 9
+    assert len(reg) == len(KNOWN_AGENT_ROLES)
     assert reg.for_role("writer_agent").human_name == "Custom"
     assert reg.for_role("architect_agent").human_name == "Архитектор"

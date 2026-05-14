@@ -84,6 +84,18 @@ def test_bot_identity_rejects_unknown_role():
         _identity(role="ghost_agent")
 
 
+@pytest.mark.parametrize(
+    "role",
+    ("security_agent", "devops_agent", "data_agent"),
+)
+def test_bot_identity_rejects_specialist_role_not_runtime_exposed(role: str):
+    with pytest.raises(
+        ValueError,
+        match=fr"runtime_agent_role_not_allowed:{role}",
+    ):
+        _identity(role=role)
+
+
 # ---------------------------------------------------------------------------
 # PerRoleBotMap
 # ---------------------------------------------------------------------------
@@ -489,6 +501,34 @@ def test_build_multi_bot_runtime_spec_uses_explicit_persona_registry_validation(
     )
     assert spec is not None
     assert spec.primary_bot.agent_role == COORDINATOR_ROLE
+
+
+@pytest.mark.parametrize(
+    ("role", "env_key", "token"),
+    (
+        ("security_agent", "TELEGRAM_SECURITY_BOT_TOKEN", "777:security"),
+        ("devops_agent", "TELEGRAM_DEVOPS_BOT_TOKEN", "778:devops"),
+        ("data_agent", "TELEGRAM_DATA_BOT_TOKEN", "779:data"),
+    ),
+)
+def test_build_multi_bot_runtime_spec_rejects_specialist_runtime_identity_activation(
+    role: str,
+    env_key: str,
+    token: str,
+):
+    with pytest.raises(
+        ValueError,
+        match=fr"telegram_agent_role_not_runtime_exposed:{role}",
+    ):
+        build_multi_bot_runtime_spec(
+            {
+                "TELEGRAM_AGENT_TOKENS": (
+                    f"coordinator_agent=TELEGRAM_BOT_TOKEN,{role}={env_key}"
+                ),
+                "TELEGRAM_BOT_TOKEN": "123:coord",
+                env_key: token,
+            }
+        )
 
 
 def test_build_multi_bot_runtime_spec_rejects_bad_persona_registry_type():

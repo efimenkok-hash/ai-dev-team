@@ -3,21 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from core.agent_personas import AgentPersona, PersonaRegistry
+from core.agent_role_catalog import BASELINE_INTERNAL_TEAM_ROLE_ORDER
 from core.coordinator_onboarding import describe_context_source
 from core.coordinator_role import COORDINATOR_ROLE
 from core.project_registry import ProjectSnapshot
-
-BASELINE_INTERNAL_TEAM_ROLE_ORDER = (
-    COORDINATOR_ROLE,
-    "planning_agent",
-    "pm_agent",
-    "architect_agent",
-    "writer_agent",
-    "reviewer_agent",
-    "tester_agent",
-    "qa_agent",
-    "fixer_agent",
-)
 
 _VALID_TEAM_ASSEMBLY_CONTEXT_SOURCES = frozenset(
     {"bound_chat", "owner_dm_single_project"}

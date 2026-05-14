@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from core.agent_personas import PersonaRegistry, default_registry
+from core.agent_role_catalog import is_runtime_exposed_agent_role
 from core.coordinator_role import COORDINATOR_ROLE
 
 VALID_MULTI_BOT_RUNTIME_SOURCES = frozenset(
@@ -93,6 +94,10 @@ class BotIdentity:
         personas = default_registry()
         if normalized_role not in personas:
             raise ValueError(f"unknown_agent_role:{normalized_role}")
+        if not is_runtime_exposed_agent_role(normalized_role):
+            raise ValueError(
+                f"runtime_agent_role_not_allowed:{normalized_role}"
+            )
         object.__setattr__(self, "agent_role", normalized_role)
         object.__setattr__(
             self,
@@ -250,6 +255,10 @@ def build_multi_bot_runtime_spec(
     for role, token_env_key in bindings:
         if role not in resolved_personas:
             raise ValueError(f"telegram_agent_role_unknown:{role}")
+        if not is_runtime_exposed_agent_role(role):
+            raise ValueError(
+                f"telegram_agent_role_not_runtime_exposed:{role}"
+            )
         raw_token = env.get(token_env_key)
         if raw_token is None:
             raise ValueError(f"telegram_agent_token_env_missing:{token_env_key}")

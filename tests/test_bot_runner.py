@@ -13,6 +13,10 @@ from core.agent_owner_notifications import (
     AgentOwnerNotificationService,
 )
 from core.agent_personas import default_registry
+from core.agent_role_catalog import (
+    BASELINE_INTERNAL_TEAM_ROLE_ORDER,
+    SPECIALIST_ROLE_ORDER,
+)
 from core.bot_commands import (
     BotCommand,
     CommandName,
@@ -2048,8 +2052,10 @@ def test_agents_handler_without_context_shows_baseline_template():
     personas = default_registry()
     handler = make_agents_handler(personas)
     text = handler(parse_command("/agents"), None)
-    for p in personas.all():
-        assert p.callsign in text
+    for role in BASELINE_INTERNAL_TEAM_ROLE_ORDER:
+        assert personas.for_role(role).callsign in text
+    for role in SPECIALIST_ROLE_ORDER:
+        assert personas.for_role(role).callsign not in text
     assert "Baseline internal team template" in text
     assert "reference template" in text
 
