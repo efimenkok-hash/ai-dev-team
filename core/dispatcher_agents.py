@@ -35,9 +35,19 @@ CONTRACTS:
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from core.agent_bus_models import ProjectThread
+from core.agent_bus_projection import ProjectingAgentBus
+from core.agent_bus_projection_throttle import ThrottledProjectingAgentBus
+from core.agent_collaboration import (
+    AgentCollaborationContext,
+    AgentCollaborationPolicy,
+    AgentCollaborationService,
+    format_consultation_followup_block,
+)
 from core.llm_dispatcher import LLMDispatcher, LLMRequest
 from core.model_tier import REQUIRED_ROLES, TierConfig
 from core.orchestrator import AgentRegistry
@@ -707,6 +717,127 @@ class DispatcherAgentConfig:
             )
 
 
+_SYSTEM_PROMPTS = {
+    "planning_agent": _PLANNING_SYSTEM,
+    "pm_agent": _PM_SYSTEM,
+    "architect_agent": _ARCHITECT_SYSTEM,
+    "writer_agent": _WRITER_SYSTEM,
+    "reviewer_agent": _REVIEWER_SYSTEM,
+    "tester_agent": _TESTER_SYSTEM,
+    "qa_agent": _QA_SYSTEM,
+    "fixer_agent": _FIXER_SYSTEM,
+}
+
+
+def _build_qa_user_content(
+    pm_plan: str,
+    arch_plan: str,
+    writer_output: str,
+    review: str,
+    test_output: str,
+) -> str:
+    import json as _json
+
+    arch_summary = arch_plan
+    try:
+        arch_obj = _json.loads(arch_plan)
+        arch_summary = _json.dumps(
+            {
+                "arch_id": arch_obj.get("arch_id", ""),
+                "plan_id": arch_obj.get("plan_id", ""),
+                "task_summary": arch_obj.get("task_summary", ""),
+                "file_structure": arch_obj.get("file_structure", []),
+                "blockers": arch_obj.get("blockers", []),
+            },
+            ensure_ascii=False,
+        )
+    except Exception:
+        pass
+
+    code_summary = writer_output
+    try:
+        code_obj = _json.loads(writer_output)
+        files = code_obj.get("files", [])
+        code_summary = _json.dumps(
+            {
+                "files": [
+                    {
+                        "path": f.get("path", ""),
+                        "lines": len(f.get("content", "").splitlines()),
+                    }
+                    for f in files
+                ]
+            },
+            ensure_ascii=False,
+        )
+    except Exception:
+        pass
+
+    return (
+        f"pm_plan:\n{pm_plan}\n\n"
+        f"arch_plan:\n{arch_summary}\n\n"
+        f"writer_output:\n{code_summary}\n\n"
+        f"review:\n{review}\n\n"
+        f"test_output:\n{test_output}"
+    )
+
+
+def _build_user_content(agent_role: str, args: tuple) -> str:
+    if agent_role in {
+        "planning_agent",
+        "pm_agent",
+        "architect_agent",
+        "writer_agent",
+    }:
+        return args[0]
+    if agent_role in {"reviewer_agent", "tester_agent"}:
+        writer_output, arch_plan = args
+        return f"writer_output:\n{writer_output}\n\narch_plan:\n{arch_plan}"
+    if agent_role == "qa_agent":
+        return _build_qa_user_content(*args)
+    if agent_role == "fixer_agent":
+        writer_output, for_fixer, arch_plan = args
+        return (
+            f"writer_output:\n{writer_output}\n\n"
+            f"for_fixer:\n{for_fixer}\n\n"
+            f"arch_plan:\n{arch_plan}"
+        )
+    raise ValueError(f"unknown_agent_role:{agent_role}")
+
+
+def _build_request(
+    agent_role: str,
+    args: tuple,
+    *,
+    system_suffix: str | None = None,
+    user_suffix: str | None = None,
+) -> LLMRequest:
+    system_prompt = _SYSTEM_PROMPTS.get(agent_role)
+    if system_prompt is None:
+        raise ValueError(f"unknown_agent_role:{agent_role}")
+    if isinstance(system_suffix, str) and system_suffix.strip():
+        system_prompt = f"{system_prompt}\n\n{system_suffix.strip()}"
+    user_content = _build_user_content(agent_role, args)
+    if isinstance(user_suffix, str) and user_suffix.strip():
+        user_content = f"{user_content}\n\n{user_suffix.strip()}"
+    return LLMRequest(
+        agent_role=agent_role,
+        messages=(
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ),
+    )
+
+
+def _build_consultation_exhausted_instruction(caller_role: str) -> str:
+    return (
+        "INTERNAL CONSULTATION LIMIT REACHED\n"
+        f"Ты уже использовал разрешённую внутреннюю консультацию как {caller_role}.\n"
+        "Новый ask_another_agent запрос запрещён. Верни финальный ответ "
+        "строго в обычном формате для своей роли."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -723,7 +854,16 @@ def build_dispatcher_agent_registry_factory(
     """
     config = DispatcherAgentConfig(dispatcher=dispatcher)
 
-    def factory(tier: TierConfig) -> AgentRegistry:
+    def _build_registry(
+        tier: TierConfig,
+        *,
+        collaboration_bus: ThrottledProjectingAgentBus | ProjectingAgentBus | None = None,
+        collaboration_thread: ProjectThread | None = None,
+        project_id: str | None = None,
+        task_id: str | None = None,
+        owner_task_text: str | None = None,
+        collaboration_policy: AgentCollaborationPolicy | None = None,
+    ) -> AgentRegistry:
         if not isinstance(tier, TierConfig):
             raise ValueError(
                 f"invalid_tier_type:{type(tier).__name__}"
@@ -731,6 +871,23 @@ def build_dispatcher_agent_registry_factory(
 
         d = config.dispatcher
         response_usage: dict[str, tuple[tuple, str, int, int, float]] = {}
+        collaboration_service: AgentCollaborationService | None = None
+
+        if collaboration_bus is not None:
+            if collaboration_thread is None:
+                raise ValueError("collaboration_thread_required")
+            if project_id is None:
+                raise ValueError("collaboration_project_id_required")
+            if task_id is None:
+                raise ValueError("collaboration_task_id_required")
+            if owner_task_text is None:
+                raise ValueError("collaboration_owner_task_text_required")
+            collaboration_service = AgentCollaborationService(
+                collaboration_bus,
+                d,
+                tier,
+                policy=collaboration_policy,
+            )
 
         per_call_estimate = tier.estimated_cost_usd / float(len(REQUIRED_ROLES))
 
@@ -765,7 +922,11 @@ def build_dispatcher_agent_registry_factory(
             )
 
         def _make_cost_estimator() -> Callable[[str, tuple, str], tuple[int, int, float]]:
-            def _estimator(agent_name: str, args: tuple, output: str) -> tuple[int, int, float]:
+            def _estimator(
+                agent_name: str,
+                args: tuple,
+                output: str,
+            ) -> tuple[int, int, float]:
                 cached = response_usage.get(agent_name)
                 if cached is None:
                     return 0, 0, 0.0
@@ -776,125 +937,128 @@ def build_dispatcher_agent_registry_factory(
 
             return _estimator
 
+        def _dispatch_agent(
+            agent_role: str,
+            args: tuple,
+            *,
+            system_suffix: str | None = None,
+            user_suffix: str | None = None,
+        ):
+            req = _build_request(
+                agent_role,
+                args,
+                system_suffix=system_suffix,
+                user_suffix=user_suffix,
+            )
+            return d.dispatch(req, tier)
+
+        def _invoke_agent(agent_role: str, args: tuple) -> str:
+            if collaboration_service is None:
+                response = _dispatch_agent(agent_role, args)
+                _cache_response(
+                    agent_role,
+                    args,
+                    response.text,
+                    response.prompt_tokens,
+                    response.completion_tokens,
+                    len(response.attempts),
+                )
+                return response.text
+
+            followup_blocks: list[str] = []
+            consultations_used = 0
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+            total_attempts = 0
+
+            while True:
+                system_suffix = (
+                    collaboration_service.build_capability_instruction(agent_role)
+                    if consultations_used
+                    < collaboration_service.policy.max_consultations_per_call
+                    else _build_consultation_exhausted_instruction(agent_role)
+                )
+                response = _dispatch_agent(
+                    agent_role,
+                    args,
+                    system_suffix=system_suffix,
+                    user_suffix=(
+                        "\n\n".join(followup_blocks)
+                        if followup_blocks
+                        else None
+                    ),
+                )
+                total_prompt_tokens += response.prompt_tokens
+                total_completion_tokens += response.completion_tokens
+                total_attempts += len(response.attempts)
+                consultation_request = (
+                    collaboration_service.parse_consultation_request(
+                        response.text
+                    )
+                )
+                if consultation_request is None:
+                    _cache_response(
+                        agent_role,
+                        args,
+                        response.text,
+                        total_prompt_tokens,
+                        total_completion_tokens,
+                        total_attempts,
+                    )
+                    return response.text
+                if (
+                    consultations_used
+                    >= collaboration_service.policy.max_consultations_per_call
+                ):
+                    raise ValueError(
+                        f"consultation_limit_exceeded:{agent_role}"
+                    )
+                consultation_result = collaboration_service.run_consultation(
+                    AgentCollaborationContext(
+                        project_id=project_id,
+                        task_id=task_id,
+                        thread=collaboration_thread,
+                        caller_role=agent_role,
+                        owner_task_text=owner_task_text,
+                    ),
+                    consultation_request,
+                    created_at=time.time(),
+                )
+                usage = collaboration_service.last_dispatch_usage
+                if usage is not None:
+                    total_prompt_tokens += usage[0]
+                    total_completion_tokens += usage[1]
+                    total_attempts += usage[2]
+                consultations_used += 1
+                followup_blocks.append(
+                    format_consultation_followup_block(
+                        consultation_result
+                    )
+                )
+
         def planning_agent(task: str) -> str:
-            req = LLMRequest(
-                agent_role="planning_agent",
-                messages=(
-                    {"role": "system", "content": _PLANNING_SYSTEM},
-                    {"role": "user", "content": task},
-                ),
-            )
-            response = d.dispatch(req, tier)
-            _cache_response(
-                "planning_agent",
-                (task,),
-                response.text,
-                response.prompt_tokens,
-                response.completion_tokens,
-                len(response.attempts),
-            )
-            return response.text
+            return _invoke_agent("planning_agent", (task,))
 
         def pm_agent(task: str) -> str:
-            req = LLMRequest(
-                agent_role="pm_agent",
-                messages=(
-                    {"role": "system", "content": _PM_SYSTEM},
-                    {"role": "user", "content": task},
-                ),
-            )
-            response = d.dispatch(req, tier)
-            _cache_response(
-                "pm_agent",
-                (task,),
-                response.text,
-                response.prompt_tokens,
-                response.completion_tokens,
-                len(response.attempts),
-            )
-            return response.text
+            return _invoke_agent("pm_agent", (task,))
 
         def architect_agent(spec: str) -> str:
-            req = LLMRequest(
-                agent_role="architect_agent",
-                messages=(
-                    {"role": "system", "content": _ARCHITECT_SYSTEM},
-                    {"role": "user", "content": spec},
-                ),
-            )
-            response = d.dispatch(req, tier)
-            _cache_response(
-                "architect_agent",
-                (spec,),
-                response.text,
-                response.prompt_tokens,
-                response.completion_tokens,
-                len(response.attempts),
-            )
-            return response.text
+            return _invoke_agent("architect_agent", (spec,))
 
         def writer_agent(architecture: str) -> str:
-            req = LLMRequest(
-                agent_role="writer_agent",
-                messages=(
-                    {"role": "system", "content": _WRITER_SYSTEM},
-                    {"role": "user", "content": architecture},
-                ),
-            )
-            response = d.dispatch(req, tier)
-            _cache_response(
-                "writer_agent",
-                (architecture,),
-                response.text,
-                response.prompt_tokens,
-                response.completion_tokens,
-                len(response.attempts),
-            )
-            return response.text
+            return _invoke_agent("writer_agent", (architecture,))
 
         def reviewer_agent(writer_output: str, arch_plan: str) -> str:
-            user_content = (
-                f"writer_output:\n{writer_output}\n\narch_plan:\n{arch_plan}"
-            )
-            req = LLMRequest(
-                agent_role="reviewer_agent",
-                messages=(
-                    {"role": "system", "content": _REVIEWER_SYSTEM},
-                    {"role": "user", "content": user_content},
-                ),
-            )
-            response = d.dispatch(req, tier)
-            _cache_response(
+            return _invoke_agent(
                 "reviewer_agent",
                 (writer_output, arch_plan),
-                response.text,
-                response.prompt_tokens,
-                response.completion_tokens,
-                len(response.attempts),
             )
-            return response.text
 
         def tester_agent(writer_output: str, arch_plan: str) -> str:
-            user_content = (
-                f"writer_output:\n{writer_output}\n\narch_plan:\n{arch_plan}"
-            )
-            req = LLMRequest(
-                agent_role="tester_agent",
-                messages=(
-                    {"role": "system", "content": _TESTER_SYSTEM},
-                    {"role": "user", "content": user_content},
-                ),
-            )
-            response = d.dispatch(req, tier)
-            _cache_response(
+            return _invoke_agent(
                 "tester_agent",
                 (writer_output, arch_plan),
-                response.text,
-                response.prompt_tokens,
-                response.completion_tokens,
-                len(response.attempts),
             )
-            return response.text
 
         def qa_agent(
             pm_plan: str,
@@ -903,99 +1067,26 @@ def build_dispatcher_agent_registry_factory(
             review: str,
             test_output: str,
         ) -> str:
-            import json as _json
-
-            # Summarize arch_plan: send only task_summary + file_structure,
-            # drop modules/contracts/functions (too large, not needed for QA checks).
-            arch_summary = arch_plan
-            try:
-                arch_obj = _json.loads(arch_plan)
-                arch_summary = _json.dumps(
-                    {
-                        "arch_id": arch_obj.get("arch_id", ""),
-                        "plan_id": arch_obj.get("plan_id", ""),
-                        "task_summary": arch_obj.get("task_summary", ""),
-                        "file_structure": arch_obj.get("file_structure", []),
-                        "blockers": arch_obj.get("blockers", []),
-                    },
-                    ensure_ascii=False,
-                )
-            except Exception:
-                pass  # keep original if not parseable
-
-            # Summarize writer_output: send only file paths + line counts,
-            # drop full source content (can be 10k+ tokens, not needed for QA).
-            code_summary = writer_output
-            try:
-                code_obj = _json.loads(writer_output)
-                files = code_obj.get("files", [])
-                code_summary = _json.dumps(
-                    {
-                        "files": [
-                            {
-                                "path": f.get("path", ""),
-                                "lines": len(f.get("content", "").splitlines()),
-                            }
-                            for f in files
-                        ]
-                    },
-                    ensure_ascii=False,
-                )
-            except Exception:
-                pass  # keep original if not parseable
-
-            user_content = (
-                f"pm_plan:\n{pm_plan}\n\n"
-                f"arch_plan:\n{arch_summary}\n\n"
-                f"writer_output:\n{code_summary}\n\n"
-                f"review:\n{review}\n\n"
-                f"test_output:\n{test_output}"
-            )
-            req = LLMRequest(
-                agent_role="qa_agent",
-                messages=(
-                    {"role": "system", "content": _QA_SYSTEM},
-                    {"role": "user", "content": user_content},
+            return _invoke_agent(
+                "qa_agent",
+                (
+                    pm_plan,
+                    arch_plan,
+                    writer_output,
+                    review,
+                    test_output,
                 ),
             )
-            response = d.dispatch(req, tier)
-            _cache_response(
-                "qa_agent",
-                (pm_plan, arch_plan, writer_output, review, test_output),
-                response.text,
-                response.prompt_tokens,
-                response.completion_tokens,
-                len(response.attempts),
-            )
-            return response.text
 
         def fixer_agent(
             writer_output: str,
             for_fixer: str,
             arch_plan: str,
         ) -> str:
-            user_content = (
-                f"writer_output:\n{writer_output}\n\n"
-                f"for_fixer:\n{for_fixer}\n\n"
-                f"arch_plan:\n{arch_plan}"
-            )
-            req = LLMRequest(
-                agent_role="fixer_agent",
-                messages=(
-                    {"role": "system", "content": _FIXER_SYSTEM},
-                    {"role": "user", "content": user_content},
-                ),
-            )
-            response = d.dispatch(req, tier)
-            _cache_response(
+            return _invoke_agent(
                 "fixer_agent",
                 (writer_output, for_fixer, arch_plan),
-                response.text,
-                response.prompt_tokens,
-                response.completion_tokens,
-                len(response.attempts),
             )
-            return response.text
 
         return DispatcherAgentRegistry(
             {
@@ -1011,4 +1102,31 @@ def build_dispatcher_agent_registry_factory(
             cost_estimator=_make_cost_estimator(),
         )
 
+    def factory(tier: TierConfig) -> AgentRegistry:
+        return _build_registry(tier)
+
+    def build_collaboration_registry(
+        tier: TierConfig,
+        *,
+        project_id: str,
+        task_id: str,
+        thread: ProjectThread,
+        owner_task_text: str,
+        bus: ThrottledProjectingAgentBus | ProjectingAgentBus,
+        policy: AgentCollaborationPolicy | None = None,
+    ) -> AgentRegistry:
+        return _build_registry(
+            tier,
+            collaboration_bus=bus,
+            collaboration_thread=thread,
+            project_id=project_id,
+            task_id=task_id,
+            owner_task_text=owner_task_text,
+            collaboration_policy=policy,
+        )
+
+    factory.dispatcher = dispatcher  # type: ignore[attr-defined]
+    factory.build_collaboration_registry = (  # type: ignore[attr-defined]
+        build_collaboration_registry
+    )
     return factory

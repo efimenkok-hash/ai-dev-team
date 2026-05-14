@@ -57,6 +57,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from core.adapter import ProjectAdapter, ProjectCommand
+from core.agent_bus import StateBackedAgentBus
+from core.agent_bus_projection import (
+    AgentBusProjectionService,
+    ProjectingAgentBus,
+)
+from core.agent_bus_projection_throttle import ThrottledProjectingAgentBus
 from core.agent_personas import default_registry
 from core.background_runner import (
     BackgroundTaskRunner,
@@ -309,6 +315,17 @@ def make_real_task_handler(
         if send_progress_envelope is not None
         else _adapt_legacy_send_progress(send_progress)
     )
+    collaboration_bus: ThrottledProjectingAgentBus | None = None
+    if runtime_router is not None and runtime_router.registry is not None:
+        collaboration_bus = ThrottledProjectingAgentBus(
+            ProjectingAgentBus(
+                StateBackedAgentBus(runtime_router.registry.state_db),
+                AgentBusProjectionService(
+                    runtime_router.registry,
+                    _send_progress_envelope,
+                ),
+            )
+        )
 
     def _safe_send_envelope(envelope: OutgoingEnvelope) -> None:
         with contextlib.suppress(Exception):
@@ -326,6 +343,7 @@ def make_real_task_handler(
     def _build_run_fn(
         chat_id: int,
         task_id: str,
+        project_id: str | None,
         owner_task_text: str,
         onboarding_context: ProjectCaptainOnboardingContext | None,
         posting_context: ProjectChatPostingContext | None,
@@ -397,7 +415,34 @@ def make_real_task_handler(
                 )
 
                 memory = memory_factory()
-                base_registry = agent_registry_factory(tier)
+                collaboration_registry_builder = getattr(
+                    agent_registry_factory,
+                    "build_collaboration_registry",
+                    None,
+                )
+                if (
+                    project_id is not None
+                    and collaboration_bus is not None
+                    and callable(collaboration_registry_builder)
+                ):
+                    collaboration_thread = (
+                        collaboration_bus.projecting_bus.get_or_open_task_thread(
+                            project_id,
+                            task_id,
+                            opened_by_role=COORDINATOR_ROLE,
+                            created_at=time.time(),
+                        )
+                    )
+                    base_registry = collaboration_registry_builder(
+                        tier,
+                        project_id=project_id,
+                        task_id=task_id,
+                        thread=collaboration_thread,
+                        owner_task_text=owner_task_text,
+                        bus=collaboration_bus,
+                    )
+                else:
+                    base_registry = agent_registry_factory(tier)
                 cost_estimator = getattr(base_registry, "cost_estimator", None)
                 if cost_estimator is not None and not callable(cost_estimator):
                     raise ValueError("registry_cost_estimator_not_callable")
@@ -1039,6 +1084,7 @@ def make_real_task_handler(
         run_fn = _build_run_fn(
             chat_id,
             task_id,
+            project_id,
             text,
             onboarding_context,
             posting_context,

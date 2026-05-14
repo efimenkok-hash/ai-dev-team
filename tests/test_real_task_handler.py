@@ -15,8 +15,11 @@ from pathlib import Path
 
 import pytest
 
+from core.agent_bus import StateBackedAgentBus
 from core.background_runner import BackgroundTaskRunner
 from core.coordinator_role import COORDINATOR_ROLE
+from core.dispatcher_agents import build_dispatcher_agent_registry_factory
+from core.llm_dispatcher import LLMAttempt, LLMDispatcher, LLMResponse
 from core.memory import PipelineMemory
 from core.model_tier import default_registry as default_tier_registry
 from core.observability import Observability
@@ -209,6 +212,22 @@ def _make_progress_envelope_capture():
             captured.append(envelope)
 
     return _send, captured
+
+
+def _make_dispatcher() -> LLMDispatcher:
+    return LLMDispatcher(api_key="sk-test-key-1234")
+
+
+def _make_dispatch_response(text: str) -> LLMResponse:
+    return LLMResponse(
+        text=text,
+        model_used="model-x",
+        prompt_tokens=11,
+        completion_tokens=7,
+        attempts=(
+            LLMAttempt(model="model-x", ok=True, reason="ok", duration_ms=1),
+        ),
+    )
 
 
 def _wait_until_idle(runner: BackgroundTaskRunner, timeout: float = 5.0) -> None:
@@ -2289,3 +2308,164 @@ def test_runtime_validator_run_tests_is_false(runner, sandbox, tier_store):
         "run_tests must be False — tester files are not in the worktree"
     )
     assert validator._run_lint is True, "run_lint must remain True"
+
+
+def test_project_aware_pipeline_uses_collaboration_bus_and_public_projection(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send_envelope, captured = _make_progress_envelope_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="collaboration-runtime.db",
+    )
+    dispatcher = _make_dispatcher()
+    factory = build_dispatcher_agent_registry_factory(dispatcher)
+    planning_calls = 0
+
+    def _dispatch(req, _tier):
+        nonlocal planning_calls
+        if req.agent_role == "planning_agent":
+            planning_calls += 1
+            if planning_calls == 1:
+                return _make_dispatch_response(
+                    '{"action":"ask_another_agent","recipient_role":"reviewer_agent","question":"Нужен риск-анализ по API"}'
+                )
+            assert "INTERNAL CONSULTATION TRANSCRIPT" in req.messages[1]["content"]
+            return _make_dispatch_response('{"plan":"ok"}')
+        if req.agent_role == "pm_agent":
+            return _make_dispatch_response('{"tasks":[]}')
+        if req.agent_role == "architect_agent":
+            return _make_dispatch_response('{"arch":"spec"}')
+        if req.agent_role == "writer_agent":
+            return _make_dispatch_response("def f(): return 42")
+        if req.agent_role == "reviewer_agent":
+            if "INTERNAL CONSULTATION MODE" in req.messages[0]["content"]:
+                return _make_dispatch_response(
+                    "Главный риск — silent regression в contract validation."
+                )
+            return _make_dispatch_response('{"verdict":"APPROVED"}')
+        if req.agent_role == "tester_agent":
+            return _make_dispatch_response("tests pass")
+        if req.agent_role == "qa_agent":
+            return _make_dispatch_response('{"verdict":"PASS"}')
+        if req.agent_role == "fixer_agent":
+            return _make_dispatch_response("def f(): return 42")
+        raise AssertionError(f"unexpected role {req.agent_role}")
+
+    dispatcher.dispatch = MagicMock(side_effect=_dispatch)  # type: ignore[method-assign]
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress_envelope=send_envelope,
+            agent_registry_factory=factory,
+            task_id_factory=lambda: "task-42",
+        )
+        reply = handler(
+            "Собери безопасный API для billing.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Собери безопасный API для billing.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        assert isinstance(reply, BridgeReply)
+        _wait_until_idle(runner)
+        _wait_for_count(
+            captured,
+            lambda envelopes: any("Готово" in env.message.text for env in envelopes),
+        )
+
+    backend_bus = StateBackedAgentBus(runtime_router.registry.state_db)
+    thread = backend_bus.get_task_thread("alpha_project", "task-42")
+    assert thread is not None
+    messages = backend_bus.list_thread_messages("alpha_project", thread.thread_id)
+    assert tuple(message.message_kind for message in messages) == ("request", "reply")
+    assert messages[0].sender_role == "planning_agent"
+    assert messages[0].recipient_role == "reviewer_agent"
+    assert messages[1].sender_role == "reviewer_agent"
+    assert messages[1].in_reply_to is not None
+    assert messages[1].in_reply_to.message_id == messages[0].message_id
+
+    projection_texts = [env.message.text for env in captured]
+    assert any("Маршрут: planning_agent -> reviewer_agent" in text for text in projection_texts)
+    assert any("Маршрут: reviewer_agent -> planning_agent" in text for text in projection_texts)
+    assert any(env.sender_role == "planning_agent" and env.delivery_role is None for env in captured)
+    assert any(env.sender_role == "reviewer_agent" and env.delivery_role is None for env in captured)
+    assert any("Готово" in text for text in projection_texts)
+
+
+def test_non_project_dispatcher_path_stays_legacy_without_collaboration(
+    runner,
+    sandbox,
+    tier_store,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(42, "STANDARD")
+    send, captured = _make_progress_capture()
+    dispatcher = _make_dispatcher()
+    factory = build_dispatcher_agent_registry_factory(dispatcher)
+
+    def _dispatch(req, _tier):
+        payloads = {
+            "planning_agent": '{"plan":"ok"}',
+            "pm_agent": '{"tasks":[]}',
+            "architect_agent": '{"arch":"spec"}',
+            "writer_agent": "def f(): return 42",
+            "reviewer_agent": '{"verdict":"APPROVED"}',
+            "tester_agent": "tests pass",
+            "qa_agent": '{"verdict":"PASS"}',
+            "fixer_agent": "def f(): return 42",
+        }
+        return _make_dispatch_response(payloads[req.agent_role])
+
+    dispatcher.dispatch = MagicMock(side_effect=_dispatch)  # type: ignore[method-assign]
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            sandbox=sandbox,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=factory,
+            task_id_factory=lambda: "task-plain-42",
+        )
+        reply = handler("Сделай CLI tool.", _msg(chat_id=42))
+        assert isinstance(reply, BridgeReply)
+        _wait_until_idle(runner)
+        _wait_for_count(
+            captured,
+            lambda rows: any("Готово" in text for _, text in rows),
+        )
+
+    assert not any("Маршрут:" in text for _, text in captured)

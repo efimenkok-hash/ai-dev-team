@@ -18,6 +18,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from core.agent_bus import StateBackedAgentBus
+from core.agent_bus_projection import AgentBusProjectionService, ProjectingAgentBus
+from core.agent_collaboration import AgentCollaborationPolicy
 from core.dispatcher_agents import (
     DispatcherAgentConfig,
     build_dispatcher_agent_registry_factory,
@@ -30,6 +33,9 @@ from core.llm_dispatcher import (
     LLMResponse,
 )
 from core.model_tier import REQUIRED_ROLES, TierConfig
+from core.project_models import Project, ProjectChatBinding, ProjectPolicy
+from core.project_registry import ProjectRegistry, ProjectSnapshot
+from core.state_db import StateDB
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -75,6 +81,50 @@ def _patched_registry(text: str = "agent-output"):
     registry = factory(tier)
     d.dispatch = MagicMock(return_value=resp)  # type: ignore[method-assign]
     return d, registry, tier
+
+
+def _make_collaboration_bus(tmp_path):
+    db = StateDB(tmp_path / "dispatcher-collaboration.db")
+    registry = ProjectRegistry(db)
+    registry.register_project(
+        ProjectSnapshot(
+            project=Project(
+                project_id="alpha_project",
+                slug="alpha-project",
+                name="Alpha",
+                description="Alpha project",
+                owner_user_id=101,
+                status="active",
+            ),
+            policy=ProjectPolicy(
+                project_id="alpha_project",
+                allow_hiring=True,
+                allow_agent_dm=False,
+                require_owner_approval_for_hires=True,
+            ),
+            chat_binding=ProjectChatBinding(
+                project_id="alpha_project",
+                chat_id=-100123,
+                chat_provider="telegram",
+            ),
+        )
+    )
+    sent_envelopes = []
+    backend_bus = StateBackedAgentBus(db)
+    projecting_bus = ProjectingAgentBus(
+        backend_bus,
+        AgentBusProjectionService(
+            registry,
+            lambda envelope: sent_envelopes.append(envelope),
+        ),
+    )
+    thread = projecting_bus.get_or_open_task_thread(
+        "alpha_project",
+        "task-42",
+        opened_by_role="coordinator_agent",
+        created_at=1000.0,
+    )
+    return projecting_bus, thread, sent_envelopes
 
 
 # ---------------------------------------------------------------------------
@@ -630,3 +680,156 @@ class TestOrchestratorCompatibility:
         mem = PipelineMemory()
         orch = Orchestrator(memory=mem, agents=registry)
         assert orch is not None
+
+
+class TestDispatcherAgentCollaboration:
+    @pytest.mark.parametrize(
+        ("role", "args", "payload"),
+        (
+            ("planning_agent", ("task",), '{"plan":"ok"}'),
+            ("pm_agent", ("task",), '{"tasks":[]}'),
+            ("architect_agent", ("task",), '{"arch":"ok"}'),
+        ),
+    )
+    def test_final_output_compatibility_is_preserved(
+        self,
+        tmp_path,
+        role,
+        args,
+        payload,
+    ):
+        dispatcher = _make_dispatcher()
+        tier = _make_tier()
+        factory = build_dispatcher_agent_registry_factory(dispatcher)
+        projecting_bus, thread, _sent = _make_collaboration_bus(tmp_path)
+        dispatcher.dispatch = MagicMock(return_value=_make_response(payload))  # type: ignore[method-assign]
+
+        registry = factory.build_collaboration_registry(
+            tier,
+            project_id="alpha_project",
+            task_id="task-42",
+            thread=thread,
+            owner_task_text="Owner task",
+            bus=projecting_bus,
+        )
+
+        result = registry[role](*args)
+
+        assert result == payload
+
+    def test_one_consultation_path_returns_final_payload_and_persists_bus_roundtrip(
+        self,
+        tmp_path,
+    ):
+        dispatcher = _make_dispatcher()
+        tier = _make_tier()
+        factory = build_dispatcher_agent_registry_factory(dispatcher)
+        projecting_bus, thread, sent_envelopes = _make_collaboration_bus(tmp_path)
+        call_counts: dict[str, int] = {}
+
+        def _dispatch(req: LLMRequest, _tier: TierConfig) -> LLMResponse:
+            call_counts[req.agent_role] = call_counts.get(req.agent_role, 0) + 1
+            if req.agent_role == "planning_agent" and call_counts[req.agent_role] == 1:
+                return _make_response(
+                    '{"action":"ask_another_agent","recipient_role":"reviewer_agent","question":"Нужен риск-анализ"}'
+                )
+            if req.agent_role == "reviewer_agent":
+                assert "INTERNAL CONSULTATION MODE" in req.messages[0]["content"]
+                return _make_response("Есть риск silent regression в валидации.")
+            if req.agent_role == "planning_agent":
+                assert "INTERNAL CONSULTATION TRANSCRIPT" in req.messages[1]["content"]
+                return _make_response('{"plan":"ok"}')
+            raise AssertionError(f"unexpected role {req.agent_role}")
+
+        dispatcher.dispatch = MagicMock(side_effect=_dispatch)  # type: ignore[method-assign]
+        registry = factory.build_collaboration_registry(
+            tier,
+            project_id="alpha_project",
+            task_id="task-42",
+            thread=thread,
+            owner_task_text="Owner task",
+            bus=projecting_bus,
+        )
+
+        result = registry["planning_agent"]("Нужен план")
+
+        assert result == '{"plan":"ok"}'
+        messages = projecting_bus.list_thread_messages("alpha_project", thread.thread_id)
+        assert tuple(message.message_kind for message in messages) == ("request", "reply")
+        assert messages[0].sender_role == "planning_agent"
+        assert messages[0].recipient_role == "reviewer_agent"
+        assert messages[1].sender_role == "reviewer_agent"
+        assert messages[1].in_reply_to is not None
+        assert messages[1].in_reply_to.message_id == messages[0].message_id
+        assert sent_envelopes[0].sender_role == "planning_agent"
+        assert sent_envelopes[1].sender_role == "reviewer_agent"
+
+    def test_repeated_consultation_beyond_limit_is_rejected(self, tmp_path):
+        dispatcher = _make_dispatcher()
+        tier = _make_tier()
+        factory = build_dispatcher_agent_registry_factory(dispatcher)
+        projecting_bus, thread, _sent = _make_collaboration_bus(tmp_path)
+        call_counts: dict[str, int] = {}
+
+        def _dispatch(req: LLMRequest, _tier: TierConfig) -> LLMResponse:
+            call_counts[req.agent_role] = call_counts.get(req.agent_role, 0) + 1
+            if req.agent_role == "planning_agent" and call_counts[req.agent_role] == 1:
+                return _make_response(
+                    '{"action":"ask_another_agent","recipient_role":"reviewer_agent","question":"Нужен риск-анализ"}'
+                )
+            if req.agent_role == "reviewer_agent":
+                return _make_response("Есть риск silent regression в валидации.")
+            if req.agent_role == "planning_agent":
+                return _make_response(
+                    '{"action":"ask_another_agent","recipient_role":"tester_agent","question":"Хочу ещё одно мнение"}'
+                )
+            raise AssertionError(f"unexpected role {req.agent_role}")
+
+        dispatcher.dispatch = MagicMock(side_effect=_dispatch)  # type: ignore[method-assign]
+        registry = factory.build_collaboration_registry(
+            tier,
+            project_id="alpha_project",
+            task_id="task-42",
+            thread=thread,
+            owner_task_text="Owner task",
+            bus=projecting_bus,
+            policy=AgentCollaborationPolicy(max_consultations_per_call=1),
+        )
+
+        with pytest.raises(ValueError, match="consultation_limit_exceeded:planning_agent"):
+            registry["planning_agent"]("Нужен план")
+
+    def test_consultation_dispatch_error_propagates_without_fake_reply(
+        self,
+        tmp_path,
+    ):
+        dispatcher = _make_dispatcher()
+        tier = _make_tier()
+        factory = build_dispatcher_agent_registry_factory(dispatcher)
+        projecting_bus, thread, _sent = _make_collaboration_bus(tmp_path)
+        dispatch_error = _make_dispatch_error()
+        call_counts: dict[str, int] = {}
+
+        def _dispatch(req: LLMRequest, _tier: TierConfig) -> LLMResponse:
+            call_counts[req.agent_role] = call_counts.get(req.agent_role, 0) + 1
+            if req.agent_role == "planning_agent":
+                return _make_response(
+                    '{"action":"ask_another_agent","recipient_role":"reviewer_agent","question":"Нужен риск-анализ"}'
+                )
+            raise dispatch_error
+
+        dispatcher.dispatch = MagicMock(side_effect=_dispatch)  # type: ignore[method-assign]
+        registry = factory.build_collaboration_registry(
+            tier,
+            project_id="alpha_project",
+            task_id="task-42",
+            thread=thread,
+            owner_task_text="Owner task",
+            bus=projecting_bus,
+        )
+
+        with pytest.raises(LLMDispatchError):
+            registry["planning_agent"]("Нужен план")
+
+        messages = projecting_bus.list_thread_messages("alpha_project", thread.thread_id)
+        assert tuple(message.message_kind for message in messages) == ("request",)
