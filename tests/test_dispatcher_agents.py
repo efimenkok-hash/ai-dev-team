@@ -21,9 +21,11 @@ import pytest
 from core.agent_bus import StateBackedAgentBus
 from core.agent_bus_projection import AgentBusProjectionService, ProjectingAgentBus
 from core.agent_collaboration import AgentCollaborationPolicy
+from core.agent_role_catalog import SPECIALIST_ROLE_ORDER
 from core.dispatcher_agents import (
     DispatcherAgentConfig,
     build_dispatcher_agent_registry_factory,
+    build_specialist_dispatch_request,
 )
 from core.llm_dispatcher import (
     LLMAttempt,
@@ -32,7 +34,7 @@ from core.llm_dispatcher import (
     LLMRequest,
     LLMResponse,
 )
-from core.model_tier import REQUIRED_ROLES, TierConfig
+from core.model_tier import DEFAULT_TIERS, REQUIRED_ROLES, TierConfig
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.state_db import StateDB
@@ -588,6 +590,116 @@ class TestDispatcherCostEstimator:
         )
 
         assert (in_tokens, out_tokens, cost_usd) == (0, 0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Specialist prompt contracts (G1.2 readiness without activation)
+# ---------------------------------------------------------------------------
+
+
+class TestSpecialistDispatchRequest:
+    @pytest.mark.parametrize(
+        ("role", "marker"),
+        (
+            ("security_agent", "hardening"),
+            ("devops_agent", "deployability"),
+            ("data_agent", "schema"),
+        ),
+    )
+    def test_build_specialist_dispatch_request_happy_path(self, role, marker):
+        request = build_specialist_dispatch_request(
+            role,
+            "Проверь specialist readiness",
+        )
+
+        assert request.agent_role == role
+        assert [message["role"] for message in request.messages] == ["system", "user"]
+        assert marker in request.messages[0]["content"]
+        assert "Specialist expert task" in request.messages[1]["content"]
+        assert "Проверь specialist readiness" in request.messages[1]["content"]
+
+    def test_build_specialist_dispatch_request_includes_optional_context(self):
+        request = build_specialist_dispatch_request(
+            "security_agent",
+            "Проверь security assumptions",
+            context_block="project_id=alpha_project\ntask_id=task-42",
+        )
+
+        user_content = request.messages[1]["content"]
+        assert "Context:" in user_content
+        assert "project_id=alpha_project" in user_content
+        assert "task_id=task-42" in user_content
+
+    def test_specialist_prompts_are_distinct_and_not_json_locked(self):
+        security_request = build_specialist_dispatch_request("security_agent", "A")
+        devops_request = build_specialist_dispatch_request("devops_agent", "A")
+        data_request = build_specialist_dispatch_request("data_agent", "A")
+
+        security_prompt = security_request.messages[0]["content"]
+        devops_prompt = devops_request.messages[0]["content"]
+        data_prompt = data_request.messages[0]["content"]
+
+        assert security_prompt != devops_prompt
+        assert security_prompt != data_prompt
+        assert devops_prompt != data_prompt
+        assert "никакого JSON по умолчанию" in security_prompt
+        assert "никакого JSON по умолчанию" in devops_prompt
+        assert "никакого JSON по умолчанию" in data_prompt
+
+    @pytest.mark.parametrize("role", ("writer_agent", "ghost_agent"))
+    def test_build_specialist_dispatch_request_rejects_non_specialist_role(self, role):
+        with pytest.raises(ValueError, match=fr"unknown_specialist_role:{role}"):
+            build_specialist_dispatch_request(role, "Task")
+
+    def test_build_specialist_dispatch_request_rejects_non_string_role(self):
+        with pytest.raises(ValueError, match="invalid_specialist_role_type:int"):
+            build_specialist_dispatch_request(42, "Task")  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("task_text", ("", "   "))
+    def test_build_specialist_dispatch_request_rejects_empty_task(self, task_text):
+        with pytest.raises(ValueError, match="empty_specialist_task_text"):
+            build_specialist_dispatch_request("security_agent", task_text)
+
+    @pytest.mark.parametrize("context_block", ("", "   "))
+    def test_build_specialist_dispatch_request_rejects_empty_context_block(
+        self,
+        context_block,
+    ):
+        with pytest.raises(ValueError, match="empty_specialist_context_block"):
+            build_specialist_dispatch_request(
+                "data_agent",
+                "Check data invariants",
+                context_block=context_block,
+            )
+
+
+class TestSpecialistPromptNonActivation:
+    def test_default_dispatcher_registry_does_not_auto_include_specialists(self):
+        factory = build_dispatcher_agent_registry_factory(_make_dispatcher())
+        registry = factory(_make_tier())
+
+        assert set(registry.keys()) == REQUIRED_ROLES
+        for role in SPECIALIST_ROLE_ORDER:
+            assert role not in registry
+
+    def test_specialist_dispatch_request_is_dispatchable_through_tier_dispatcher(
+        self,
+    ):
+        dispatcher = _make_dispatcher()
+        request = build_specialist_dispatch_request(
+            "security_agent",
+            "check threat model",
+        )
+        dispatcher._try_model = MagicMock(  # type: ignore[method-assign]
+            return_value=("specialist-answer", 12, 7)
+        )
+
+        response = dispatcher.dispatch(request, DEFAULT_TIERS[0])
+
+        expected_model = DEFAULT_TIERS[0].specialist_chain_for("security_agent")[0]
+        dispatcher._try_model.assert_called_once_with(expected_model, request)
+        assert response.text == "specialist-answer"
+        assert response.model_used == expected_model
 
 
 # ---------------------------------------------------------------------------

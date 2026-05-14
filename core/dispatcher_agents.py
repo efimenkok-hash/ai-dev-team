@@ -31,6 +31,8 @@ CONTRACTS:
      fixer_agent(writer_output: str, for_fixer: str, arch_plan: str) -> str
 6. LLMRequest is built with correct agent_role matching REQUIRED_ROLES.
 7. Return value of each AgentFn is LLMResponse.text (stripped by dispatcher).
+8. Specialist roles may have dormant prompt contracts and request builders,
+   but they are not added to the default pipeline registry until later steps.
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ from core.agent_collaboration import (
     AgentCollaborationService,
     format_consultation_followup_block,
 )
+from core.agent_role_catalog import SPECIALIST_ROLE_ORDER
 from core.llm_dispatcher import LLMDispatcher, LLMRequest
 from core.model_tier import REQUIRED_ROLES, TierConfig
 from core.orchestrator import AgentRegistry
@@ -677,6 +680,93 @@ BLOCKED: <конкретная причина>
 12. Удаляй неиспользуемые импорты сразу — не оставляй "может пригодится".\
 """
 
+_SECURITY_SYSTEM = """\
+AGENT: SECURITY_AGENT
+VERSION: 1.0
+
+## ROLE
+Ты — Security Specialist Agent.
+Ты помогаешь как внутренний эксперт по безопасности. Ты не утверждаешь, что
+уязвимость уже эксплуатируется, если это не доказано контекстом.
+
+## FOCUS
+- threat modeling и trust boundaries
+- abuse cases и permission boundaries
+- secret handling и credential exposure
+- dangerous defaults, injection surfaces, authz/authn gaps
+- hardening recommendations и честная severity language
+
+## OUTPUT
+Верни краткий plain-text expert analysis:
+- сначала самые важные security risks
+- затем конкретные hardening recommendations
+- если контекста мало, явно назови unknowns
+
+## POLICY
+- никакого JSON по умолчанию
+- никакого markdown fence
+- не паникуй и не драматизируй severity
+- не утверждай, что код уже исправлен или проверен, если этого нет
+- не инициируй новых ask_another_agent запросов\
+"""
+
+_DEVOPS_SYSTEM = """\
+AGENT: DEVOPS_AGENT
+VERSION: 1.0
+
+## ROLE
+Ты — DevOps Specialist Agent.
+Ты помогаешь как внутренний эксперт по deployability и runtime reliability.
+
+## FOCUS
+- CI/CD и release safety
+- environment/config correctness
+- infrastructure assumptions и operational dependencies
+- observability, alerting, rollback и recovery paths
+- runtime failure modes и service reliability
+
+## OUTPUT
+Верни краткий plain-text expert analysis:
+- deployment/reliability risks
+- operational recommendations
+- missing infra assumptions or observability gaps
+
+## POLICY
+- никакого JSON по умолчанию
+- никакого markdown fence
+- не утверждай, что deploy уже настроен или инцидент уже предотвращён
+- если контекста мало, явно перечисли missing assumptions
+- не инициируй новых ask_another_agent запросов\
+"""
+
+_DATA_SYSTEM = """\
+AGENT: DATA_AGENT
+VERSION: 1.0
+
+## ROLE
+Ты — Data Specialist Agent.
+Ты помогаешь как внутренний эксперт по schema correctness и data reliability.
+
+## FOCUS
+- schema and migration correctness
+- data shape invariants и lineage assumptions
+- analytics/event semantics
+- ingestion/output consistency
+- data quality risks, nullability, duplication, aggregation mistakes
+
+## OUTPUT
+Верни краткий plain-text expert analysis:
+- главные data/schema risks
+- рекомендации по корректности и проверяемым инвариантам
+- явно выдели assumptions, если контекст неполный
+
+## POLICY
+- никакого JSON по умолчанию
+- никакого markdown fence
+- не утверждай, что данные уже мигрированы или аналитика уже валидирована
+- не инициируй новых ask_another_agent запросов\
+"""
+
 # ---------------------------------------------------------------------------
 # Validated frozen config
 # ---------------------------------------------------------------------------
@@ -726,7 +816,68 @@ _SYSTEM_PROMPTS = {
     "tester_agent": _TESTER_SYSTEM,
     "qa_agent": _QA_SYSTEM,
     "fixer_agent": _FIXER_SYSTEM,
+    "security_agent": _SECURITY_SYSTEM,
+    "devops_agent": _DEVOPS_SYSTEM,
+    "data_agent": _DATA_SYSTEM,
 }
+
+
+def _normalize_specialist_role(agent_role: str) -> str:
+    if not isinstance(agent_role, str):
+        raise ValueError(
+            f"invalid_specialist_role_type:{type(agent_role).__name__}"
+        )
+    normalized = agent_role.strip().lower()
+    if not normalized:
+        raise ValueError("empty_specialist_role")
+    if normalized not in SPECIALIST_ROLE_ORDER:
+        raise ValueError(f"unknown_specialist_role:{normalized}")
+    return normalized
+
+
+def _normalize_non_empty_text(value: str, *, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"empty_{field_name}")
+    return value.strip()
+
+
+def build_specialist_dispatch_request(
+    agent_role: str,
+    task_text: str,
+    *,
+    context_block: str | None = None,
+) -> LLMRequest:
+    normalized_role = _normalize_specialist_role(agent_role)
+    normalized_task_text = _normalize_non_empty_text(
+        task_text,
+        field_name="specialist_task_text",
+    )
+    user_lines = [
+        "Specialist expert task",
+        f"specialist_role: {normalized_role}",
+    ]
+    if context_block is not None:
+        normalized_context_block = _normalize_non_empty_text(
+            context_block,
+            field_name="specialist_context_block",
+        )
+        user_lines.extend(("", "Context:", normalized_context_block))
+    user_lines.extend(
+        (
+            "",
+            "Task:",
+            normalized_task_text,
+            "",
+            "Верни concise expert analysis и practical recommendations.",
+        )
+    )
+    return LLMRequest(
+        agent_role=normalized_role,
+        messages=(
+            {"role": "system", "content": _SYSTEM_PROMPTS[normalized_role]},
+            {"role": "user", "content": "\n".join(user_lines)},
+        ),
+    )
 
 
 def _build_qa_user_content(

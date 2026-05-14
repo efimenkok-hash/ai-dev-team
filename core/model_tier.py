@@ -18,23 +18,29 @@ Design intent (from the spec):
 
 CONTRACTS:
 1. TierConfig is frozen; all fields validated in __post_init__.
-2. models_per_role MUST cover ALL 8 known roles (planning_agent, pm_agent,
+2. models_per_role MUST cover ALL 8 baseline pipeline roles (planning_agent, pm_agent,
    architect_agent, writer_agent, reviewer_agent, tester_agent, qa_agent,
    fixer_agent). Missing role -> ValueError.
-3. Each chain MUST be a non-empty tuple of non-empty strings (model ids).
-4. estimated_cost_usd must be > 0 and < 100 (sanity).
-5. DEFAULT_TIERS provides ECONOMY / STANDARD / PREMIUM with verified
+3. specialist_models_per_role MAY define additional LLM-ready specialist
+   chains; default tiers provide all three known specialists.
+4. Each chain MUST be a non-empty tuple of non-empty strings (model ids).
+5. estimated_cost_usd must be > 0 and < 100 (sanity).
+6. DEFAULT_TIERS provides ECONOMY / STANDARD / PREMIUM with verified
    OpenRouter model identifiers (mid-2026 baseline; can be replaced via
    the registry without touching code).
-6. TierRegistry rejects duplicate names; .active() returns the currently-
+7. TierRegistry rejects duplicate names; .active() returns the currently-
    selected tier (default: STANDARD).
-7. to_dict / from_dict round-trip stably for persistence and bot config.
+8. to_dict / from_dict round-trip stably for persistence and bot config.
+9. dispatch_chain_for resolves either a baseline or specialist LLM-ready
+   role without activating specialists as required pipeline workers.
 """
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+from core.agent_role_catalog import SPECIALIST_ROLE_ORDER
 
 # Keep in sync with core.orchestrator.REQUIRED_AGENTS — duplicated to avoid
 # an import cycle (orchestrator doesn't depend on this module).
@@ -48,10 +54,54 @@ REQUIRED_ROLES: frozenset[str] = frozenset({
     "qa_agent",
     "fixer_agent",
 })
+SPECIALIST_ROLES: frozenset[str] = frozenset(SPECIALIST_ROLE_ORDER)
 
 # OpenRouter limits per provider; we just need a simple positive cap to
 # catch obvious mistakes when someone configures a tier.
 _MAX_REASONABLE_COST_USD = 100.0
+
+
+def _validate_models_mapping(
+    mapping: Mapping[str, tuple[str, ...]],
+    *,
+    required_roles: frozenset[str] | None,
+    allowed_roles: frozenset[str],
+    empty_mapping_error: str | None = None,
+) -> dict[str, tuple[str, ...]]:
+    if not isinstance(mapping, Mapping):
+        raise ValueError("models_per_role_must_be_mapping")
+    if empty_mapping_error is not None and not mapping:
+        raise ValueError(empty_mapping_error)
+
+    roles = set(mapping.keys())
+    if required_roles is not None:
+        missing = required_roles - roles
+        if missing:
+            raise ValueError(f"missing_roles:{','.join(sorted(missing))}")
+    unexpected = roles - allowed_roles
+    if unexpected:
+        raise ValueError(f"unknown_roles:{','.join(sorted(unexpected))}")
+
+    normalised: dict[str, tuple[str, ...]] = {}
+    for role, chain in mapping.items():
+        if not isinstance(chain, tuple):
+            raise ValueError(f"chain_must_be_tuple:{role}")
+        if not chain:
+            raise ValueError(f"empty_chain:{role}")
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for model_id in chain:
+            if not isinstance(model_id, str):
+                raise ValueError(f"non_string_model_id:{role}")
+            stripped = model_id.strip()
+            if not stripped:
+                raise ValueError(f"empty_model_id:{role}")
+            if stripped in seen:
+                raise ValueError(f"duplicate_in_chain:{role}:{stripped}")
+            seen.add(stripped)
+            cleaned.append(stripped)
+        normalised[role] = tuple(cleaned)
+    return normalised
 
 
 class ModelTierName(str, Enum):
@@ -66,6 +116,9 @@ class TierConfig:
     description: str
     estimated_cost_usd: float
     models_per_role: Mapping[str, tuple[str, ...]]
+    specialist_models_per_role: Mapping[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -82,42 +135,27 @@ class TierConfig:
         if self.estimated_cost_usd > _MAX_REASONABLE_COST_USD:
             raise ValueError(f"cost_too_high:{self.estimated_cost_usd}")
 
-        if not isinstance(self.models_per_role, Mapping):
-            raise ValueError("models_per_role_must_be_mapping")
-
-        # All required roles must be present and non-trivial.
-        missing = REQUIRED_ROLES - set(self.models_per_role.keys())
-        if missing:
-            raise ValueError(f"missing_roles:{','.join(sorted(missing))}")
-        unexpected = set(self.models_per_role.keys()) - REQUIRED_ROLES
-        if unexpected:
-            raise ValueError(f"unknown_roles:{','.join(sorted(unexpected))}")
-
-        normalised: dict[str, tuple[str, ...]] = {}
-        for role, chain in self.models_per_role.items():
-            if not isinstance(chain, tuple):
-                raise ValueError(f"chain_must_be_tuple:{role}")
-            if not chain:
-                raise ValueError(f"empty_chain:{role}")
-            cleaned: list[str] = []
-            seen: set[str] = set()
-            for model_id in chain:
-                if not isinstance(model_id, str):
-                    raise ValueError(f"non_string_model_id:{role}")
-                stripped = model_id.strip()
-                if not stripped:
-                    raise ValueError(f"empty_model_id:{role}")
-                if stripped in seen:
-                    raise ValueError(f"duplicate_in_chain:{role}:{stripped}")
-                seen.add(stripped)
-                cleaned.append(stripped)
-            normalised[role] = tuple(cleaned)
+        normalised = _validate_models_mapping(
+            self.models_per_role,
+            required_roles=REQUIRED_ROLES,
+            allowed_roles=REQUIRED_ROLES,
+        )
+        normalised_specialists = _validate_models_mapping(
+            self.specialist_models_per_role,
+            required_roles=None,
+            allowed_roles=SPECIALIST_ROLES,
+        )
 
         # Persist normalised form (frozen requires object.__setattr__).
         object.__setattr__(self, "name", self.name.strip())
         object.__setattr__(self, "description", self.description.strip())
         object.__setattr__(self, "estimated_cost_usd", float(self.estimated_cost_usd))
         object.__setattr__(self, "models_per_role", dict(normalised))
+        object.__setattr__(
+            self,
+            "specialist_models_per_role",
+            dict(normalised_specialists),
+        )
 
     def chain_for(self, agent_role: str) -> tuple[str, ...]:
         """Returns the fallback chain for the given role, or raises KeyError."""
@@ -129,9 +167,31 @@ class TierConfig:
         """Convenience: first model in the chain for a role."""
         return self.chain_for(agent_role)[0]
 
+    def specialist_chain_for(self, agent_role: str) -> tuple[str, ...]:
+        """Returns the fallback chain for a specialist role, or raises KeyError."""
+        if agent_role not in self.specialist_models_per_role:
+            raise KeyError(f"unknown_specialist_role:{agent_role}")
+        return self.specialist_models_per_role[agent_role]
+
+    def specialist_primary_model(self, agent_role: str) -> str:
+        return self.specialist_chain_for(agent_role)[0]
+
+    def dispatch_chain_for(self, agent_role: str) -> tuple[str, ...]:
+        """Return the LLM dispatch chain for any known LLM-ready role.
+
+        Baseline worker roles resolve through models_per_role.
+        Dormant specialist roles resolve through specialist_models_per_role.
+        Unknown roles still fail honestly.
+        """
+        if agent_role in self.models_per_role:
+            return self.models_per_role[agent_role]
+        if agent_role in self.specialist_models_per_role:
+            return self.specialist_models_per_role[agent_role]
+        raise KeyError(f"unknown_role:{agent_role}")
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "name": self.name,
             "description": self.description,
             "estimated_cost_usd": self.estimated_cost_usd,
@@ -139,28 +199,44 @@ class TierConfig:
                 role: list(chain)
                 for role, chain in self.models_per_role.items()
             },
+            "specialist_models_per_role": {
+                role: list(chain)
+                for role, chain in self.specialist_models_per_role.items()
+            },
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TierConfig":
         if not isinstance(data, Mapping):
             raise ValueError("invalid_dump_type")
-        if data.get("schema_version") != 1:
+        schema_version = data.get("schema_version")
+        if schema_version not in {1, 2}:
             raise ValueError(
-                f"unsupported_schema_version:{data.get('schema_version')}"
+                f"unsupported_schema_version:{schema_version}"
             )
-        for key in ("name", "description", "estimated_cost_usd", "models_per_role"):
+        required_keys = (
+            "name",
+            "description",
+            "estimated_cost_usd",
+            "models_per_role",
+        )
+        for key in required_keys:
             if key not in data:
                 raise ValueError(f"missing_key:{key}")
         models = {
             role: tuple(chain)
             for role, chain in data["models_per_role"].items()
         }
+        specialist_models = {
+            role: tuple(chain)
+            for role, chain in data.get("specialist_models_per_role", {}).items()
+        }
         return cls(
             name=data["name"],
             description=data["description"],
             estimated_cost_usd=data["estimated_cost_usd"],
             models_per_role=models,
+            specialist_models_per_role=specialist_models,
         )
 
 
@@ -186,6 +262,11 @@ DEFAULT_TIERS: tuple[TierConfig, ...] = (
             "tester_agent": ("openai/gpt-4o-mini", "qwen/qwen3-coder"),
             "qa_agent": ("openai/gpt-4o-mini",),
             "fixer_agent": ("qwen/qwen3-coder", "openai/gpt-4o-mini"),
+        },
+        specialist_models_per_role={
+            "security_agent": ("openai/gpt-4o-mini", "qwen/qwen3-coder"),
+            "devops_agent": ("qwen/qwen3-coder", "openai/gpt-4o-mini"),
+            "data_agent": ("openai/gpt-4o-mini", "qwen/qwen3-coder"),
         },
     ),
     TierConfig(
@@ -220,6 +301,20 @@ DEFAULT_TIERS: tuple[TierConfig, ...] = (
                 "anthropic/claude-haiku-4.5",
             ),
             "fixer_agent": ("qwen/qwen3-coder", "anthropic/claude-haiku-4.5"),
+        },
+        specialist_models_per_role={
+            "security_agent": (
+                "anthropic/claude-sonnet-4.6",
+                "openai/gpt-5",
+            ),
+            "devops_agent": (
+                "anthropic/claude-sonnet-4.6",
+                "qwen/qwen3-coder",
+            ),
+            "data_agent": (
+                "openai/gpt-5",
+                "qwen/qwen3-coder",
+            ),
         },
     ),
     TierConfig(
@@ -263,6 +358,23 @@ DEFAULT_TIERS: tuple[TierConfig, ...] = (
             ),
             "fixer_agent": (
                 "anthropic/claude-sonnet-4.6",
+                "qwen/qwen3-coder",
+            ),
+        },
+        specialist_models_per_role={
+            "security_agent": (
+                "anthropic/claude-opus-4.6",
+                "openai/gpt-5.5",
+                "anthropic/claude-sonnet-4.6",
+            ),
+            "devops_agent": (
+                "anthropic/claude-opus-4.6",
+                "qwen/qwen3-coder",
+                "anthropic/claude-sonnet-4.6",
+            ),
+            "data_agent": (
+                "openai/gpt-5.5",
+                "anthropic/claude-opus-4.6",
                 "qwen/qwen3-coder",
             ),
         },

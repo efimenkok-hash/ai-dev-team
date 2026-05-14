@@ -2,9 +2,11 @@
 
 import pytest
 
+from core.agent_role_catalog import SPECIALIST_ROLE_ORDER
 from core.model_tier import (
     DEFAULT_TIERS,
     REQUIRED_ROLES,
+    SPECIALIST_ROLES,
     ModelTierName,
     TierConfig,
     TierRegistry,
@@ -16,6 +18,10 @@ from core.model_tier import (
 def _full_chain():
     """Helper: produce a minimal valid models_per_role for tests."""
     return {role: ("model-a", "model-b") for role in REQUIRED_ROLES}
+
+
+def _full_specialist_chain():
+    return {role: ("specialist-a", "specialist-b") for role in SPECIALIST_ROLES}
 
 
 # ---------------------------------------------------------------------------
@@ -61,10 +67,19 @@ def test_default_tiers_cover_all_required_roles():
         assert set(tier.models_per_role.keys()) == REQUIRED_ROLES
 
 
+def test_default_tiers_cover_all_specialist_roles():
+    for tier in DEFAULT_TIERS:
+        assert set(tier.specialist_models_per_role.keys()) == set(
+            SPECIALIST_ROLE_ORDER
+        )
+
+
 def test_default_tiers_chains_non_empty():
     for tier in DEFAULT_TIERS:
         for role, chain in tier.models_per_role.items():
             assert len(chain) >= 1, f"{tier.name}/{role} chain is empty"
+        for role, chain in tier.specialist_models_per_role.items():
+            assert len(chain) >= 1, f"{tier.name}/{role} specialist chain is empty"
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +93,7 @@ def test_tier_config_happy_path():
         description="desc",
         estimated_cost_usd=1.5,
         models_per_role=_full_chain(),
+        specialist_models_per_role=_full_specialist_chain(),
     )
     assert t.name == "test"
     assert t.estimated_cost_usd == 1.5
@@ -89,6 +105,7 @@ def test_tier_config_strips_name_and_description():
         description=" desc ",
         estimated_cost_usd=1.0,
         models_per_role=_full_chain(),
+        specialist_models_per_role=_full_specialist_chain(),
     )
     assert t.name == "test"
     assert t.description == "desc"
@@ -195,6 +212,17 @@ def test_tier_config_rejects_unknown_role():
         )
 
 
+def test_tier_config_rejects_unknown_specialist_role():
+    with pytest.raises(ValueError, match="unknown_roles:ghost_agent"):
+        TierConfig(
+            name="t",
+            description="d",
+            estimated_cost_usd=1.0,
+            models_per_role=_full_chain(),
+            specialist_models_per_role={"ghost_agent": ("m",)},
+        )
+
+
 def test_tier_config_rejects_non_tuple_chain():
     bad = dict(_full_chain())
     bad["planning_agent"] = ["m"]  # type: ignore[assignment]
@@ -207,6 +235,19 @@ def test_tier_config_rejects_non_tuple_chain():
         )
 
 
+def test_tier_config_rejects_non_tuple_specialist_chain():
+    bad = dict(_full_specialist_chain())
+    bad["security_agent"] = ["m"]  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="chain_must_be_tuple:security_agent"):
+        TierConfig(
+            name="t",
+            description="d",
+            estimated_cost_usd=1.0,
+            models_per_role=_full_chain(),
+            specialist_models_per_role=bad,
+        )
+
+
 def test_tier_config_rejects_empty_chain():
     bad = dict(_full_chain())
     bad["planning_agent"] = ()
@@ -216,6 +257,19 @@ def test_tier_config_rejects_empty_chain():
             description="d",
             estimated_cost_usd=1.0,
             models_per_role=bad,
+        )
+
+
+def test_tier_config_rejects_empty_specialist_chain():
+    bad = dict(_full_specialist_chain())
+    bad["security_agent"] = ()
+    with pytest.raises(ValueError, match="empty_chain:security_agent"):
+        TierConfig(
+            name="t",
+            description="d",
+            estimated_cost_usd=1.0,
+            models_per_role=_full_chain(),
+            specialist_models_per_role=bad,
         )
 
 
@@ -244,6 +298,22 @@ def test_tier_config_rejects_duplicate_in_chain():
         )
 
 
+def test_tier_config_rejects_duplicate_in_specialist_chain():
+    bad = dict(_full_specialist_chain())
+    bad["security_agent"] = ("model-a", "model-a")
+    with pytest.raises(
+        ValueError,
+        match="duplicate_in_chain:security_agent:model-a",
+    ):
+        TierConfig(
+            name="t",
+            description="d",
+            estimated_cost_usd=1.0,
+            models_per_role=_full_chain(),
+            specialist_models_per_role=bad,
+        )
+
+
 def test_tier_config_normalises_model_ids():
     chain = dict(_full_chain())
     chain["planning_agent"] = ("  model-a  ", "model-b")
@@ -268,10 +338,23 @@ def test_chain_for_returns_correct_chain():
     assert len(chain) >= 1
 
 
+def test_specialist_chain_for_returns_correct_chain():
+    t = DEFAULT_TIERS[1]
+    chain = t.specialist_chain_for("security_agent")
+    assert isinstance(chain, tuple)
+    assert len(chain) >= 1
+
+
 def test_chain_for_unknown_role_raises():
     t = DEFAULT_TIERS[0]
     with pytest.raises(KeyError, match="unknown_role"):
         t.chain_for("ceo_agent")
+
+
+def test_specialist_chain_for_unknown_role_raises():
+    t = DEFAULT_TIERS[0]
+    with pytest.raises(KeyError, match="unknown_specialist_role"):
+        t.specialist_chain_for("ceo_agent")
 
 
 def test_primary_model_returns_first_in_chain():
@@ -283,8 +366,42 @@ def test_primary_model_returns_first_in_chain():
             **{role: ("default-m",) for role in REQUIRED_ROLES},
             "architect_agent": ("primary", "fallback1", "fallback2"),
         },
+        specialist_models_per_role=_full_specialist_chain(),
     )
     assert t.primary_model("architect_agent") == "primary"
+
+
+def test_specialist_primary_model_returns_first_in_chain():
+    t = TierConfig(
+        name="t",
+        description="d",
+        estimated_cost_usd=1.0,
+        models_per_role=_full_chain(),
+        specialist_models_per_role={
+            **_full_specialist_chain(),
+            "security_agent": ("specialist-primary", "specialist-fallback"),
+        },
+    )
+    assert t.specialist_primary_model("security_agent") == "specialist-primary"
+
+
+def test_dispatch_chain_for_returns_baseline_chain():
+    t = DEFAULT_TIERS[1]
+    assert t.dispatch_chain_for("architect_agent") == t.chain_for("architect_agent")
+
+
+def test_dispatch_chain_for_returns_specialist_chain():
+    t = DEFAULT_TIERS[1]
+    assert (
+        t.dispatch_chain_for("security_agent")
+        == t.specialist_chain_for("security_agent")
+    )
+
+
+def test_dispatch_chain_for_unknown_role_raises():
+    t = DEFAULT_TIERS[0]
+    with pytest.raises(KeyError, match="unknown_role"):
+        t.dispatch_chain_for("ceo_agent")
 
 
 # ---------------------------------------------------------------------------
@@ -300,11 +417,16 @@ def test_to_dict_round_trip():
     assert restored.description == original.description
     assert restored.estimated_cost_usd == original.estimated_cost_usd
     assert restored.models_per_role == original.models_per_role
+    assert (
+        restored.specialist_models_per_role
+        == original.specialist_models_per_role
+    )
 
 
 def test_to_dict_includes_schema_version():
     d = DEFAULT_TIERS[0].to_dict()
-    assert d["schema_version"] == 1
+    assert d["schema_version"] == 2
+    assert "specialist_models_per_role" in d
 
 
 def test_from_dict_rejects_wrong_schema():
@@ -317,6 +439,21 @@ def test_from_dict_rejects_wrong_schema():
 def test_from_dict_rejects_non_mapping():
     with pytest.raises(ValueError, match="invalid_dump_type"):
         TierConfig.from_dict("not a dict")  # type: ignore[arg-type]
+
+
+def test_from_dict_accepts_legacy_schema_without_specialists():
+    legacy = {
+        "schema_version": 1,
+        "name": "LEGACY",
+        "description": "legacy tier",
+        "estimated_cost_usd": 1.0,
+        "models_per_role": {
+            role: ["model-a"] for role in REQUIRED_ROLES
+        },
+    }
+    restored = TierConfig.from_dict(legacy)
+    assert restored.name == "LEGACY"
+    assert restored.specialist_models_per_role == {}
 
 
 @pytest.mark.parametrize(
@@ -380,6 +517,7 @@ def test_registry_register_adds_new_tier():
         description="custom desc",
         estimated_cost_usd=2.5,
         models_per_role=_full_chain(),
+        specialist_models_per_role=_full_specialist_chain(),
     )
     reg.register(custom)
     assert "CUSTOM" in reg
@@ -393,6 +531,7 @@ def test_registry_register_duplicate_raises():
         description="d",
         estimated_cost_usd=1.0,
         models_per_role=_full_chain(),
+        specialist_models_per_role=_full_specialist_chain(),
     )
     with pytest.raises(ValueError, match="duplicate_tier"):
         reg.register(duplicate)
@@ -405,6 +544,7 @@ def test_registry_replace_overwrites_existing():
         description="updated economy",
         estimated_cost_usd=0.10,
         models_per_role=_full_chain(),
+        specialist_models_per_role=_full_specialist_chain(),
     )
     reg.replace(new_economy)
     assert reg.get("ECONOMY").description == "updated economy"
@@ -417,6 +557,7 @@ def test_registry_replace_unknown_raises():
         description="d",
         estimated_cost_usd=1.0,
         models_per_role=_full_chain(),
+        specialist_models_per_role=_full_specialist_chain(),
     )
     with pytest.raises(KeyError, match="unknown_tier"):
         reg.replace(custom)

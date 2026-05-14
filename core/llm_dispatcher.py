@@ -163,7 +163,7 @@ class LLMDispatcher:
         request: LLMRequest,
         tier: TierConfig,
     ) -> LLMResponse:
-        """Walks tier.chain_for(request.agent_role), returns first success.
+        """Walks tier.dispatch_chain_for(request.agent_role), returns first success.
 
         Raises LLMDispatchError if the entire chain fails.
         """
@@ -176,7 +176,7 @@ class LLMDispatcher:
                 f"invalid_tier_type:{type(tier).__name__}"
             )
 
-        chain = tier.chain_for(request.agent_role)
+        chain = tier.dispatch_chain_for(request.agent_role)
         attempts: list[LLMAttempt] = []
 
         for model in chain:
