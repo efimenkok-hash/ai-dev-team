@@ -88,6 +88,7 @@ from core.coordinator_team_proposal import (
 )
 from core.fsm import State
 from core.json_extractor import extract_json_object
+from core.logical_hiring import LogicalHiringService
 from core.memory import PipelineMemory
 from core.model_tier import TierConfig
 from core.observability import Observability
@@ -319,6 +320,7 @@ def make_real_task_handler(
         else _adapt_legacy_send_progress(send_progress)
     )
     collaboration_bus: ThrottledProjectingAgentBus | None = None
+    logical_hiring_service: LogicalHiringService | None = None
     if runtime_router is not None and runtime_router.registry is not None:
         collaboration_bus = ThrottledProjectingAgentBus(
             ProjectingAgentBus(
@@ -329,6 +331,7 @@ def make_real_task_handler(
                 ),
             )
         )
+        logical_hiring_service = LogicalHiringService(runtime_router.registry)
 
     def _safe_send_envelope(envelope: OutgoingEnvelope) -> None:
         with contextlib.suppress(Exception):
@@ -543,6 +546,33 @@ def make_real_task_handler(
                     "tier_name": tier_name,
                     "commit_sha": None,
                 }
+
+                if (
+                    not cancelled
+                    and logical_hiring_service is not None
+                    and onboarding_context is not None
+                ):
+                    try:
+                        logical_hiring_result = logical_hiring_service.run_from_hints(
+                            onboarding_context.snapshot,
+                            _resolve_runtime_specialization_hints(),
+                        )
+                    except Exception as logical_hiring_exc:
+                        summary["logical_hiring_status"] = "system_error"
+                        summary["logical_hiring_reply"] = (
+                            "🧩 Логический hire не удалось обработать; "
+                            "persisted project roster не менялся.\n"
+                            "\n"
+                            "Техническая причина: "
+                            f"`{type(logical_hiring_exc).__name__}: "
+                            f"{str(logical_hiring_exc)[:160]}`"
+                        )
+                    else:
+                        summary["logical_hiring_status"] = logical_hiring_result.status
+                        if logical_hiring_result.status != "no_candidates":
+                            summary["logical_hiring_reply"] = (
+                                logical_hiring_result.message_text
+                            )
 
                 if cancelled:
                     # Do NOT commit — user explicitly stopped the task.
@@ -959,6 +989,17 @@ def make_real_task_handler(
                             project_id=project_id,
                         )
                     )
+
+            logical_hiring_reply = result.get("logical_hiring_reply")
+            if isinstance(logical_hiring_reply, str) and logical_hiring_reply.strip():
+                _safe_send_envelope(
+                    _build_system_envelope(
+                        chat_id=chat_id,
+                        posting_context=posting_context,
+                        owner_dm_delivery_role=owner_dm_delivery_role,
+                        text=logical_hiring_reply,
+                    )
+                )
 
             if final_state == "CANCELLED":
                 _safe_send_envelope(

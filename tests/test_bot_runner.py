@@ -58,6 +58,7 @@ from core.llm_dispatcher import (
     LLMDispatcher,
     LLMResponse,
 )
+from core.logical_hiring import LogicalHiringService
 from core.model_tier import default_registry as default_tier_registry
 from core.multi_bot_bridge import MultiBotBridge
 from core.project_chat_binding_service import ProjectChatBindingService
@@ -68,6 +69,7 @@ from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
 from core.project_runtime_router import ProjectRuntimeRouter
 from core.project_summary_service import ProjectSummaryService
+from core.specialization_hints import SpecializationHint, SpecializationHints
 from core.state_db import StateDB
 from core.task_history import TaskHistory
 from core.telegram_bridge import (
@@ -2626,6 +2628,67 @@ def test_team_command_in_ambiguous_owner_dm_does_not_guess_project(tmp_path):
     assert result.reason == "command"
     assert "не выбирает проект автоматически" in captured[0].text.lower()
     assert "/projects" in captured[0].text
+
+
+def test_team_list_shows_specialist_added_by_logical_hiring_after_restart(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "team-logical-hire.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "team-logical-hire-repo")
+    snapshot = _project_snapshot(
+        repo,
+        project=_project(owner_user_id=777),
+        policy=_policy(project_id="alpha_project"),
+        chat_binding=_chat_binding(chat_id=-100123450906),
+    )
+    registry.register_project(snapshot)
+    hiring_service = LogicalHiringService(registry)
+
+    hiring_result = hiring_service.run_from_hints(
+        snapshot,
+        SpecializationHints(
+            (
+                SpecializationHint(
+                    specialist_role="security_agent",
+                    reason="Задача затрагивает auth и secrets.",
+                ),
+            )
+        ),
+    )
+    assert hiring_result.status == "hired"
+
+    reopened_registry = ProjectRegistry(StateDB(db.path))
+    resolver = ProjectContextResolver(reopened_registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: BridgeReply(
+            persona_role="architect_agent",
+            body="task ok",
+        ),
+        project_context_resolver=resolver,
+    )
+
+    result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450906,
+            user_id=999,
+            message_id=1,
+            text="/team list",
+        )
+    )
+
+    assert result.handled is True
+    assert result.reason == "command"
+    assert "Project specialists:" in captured[0].text
+    assert "security_agent" in captured[0].text
 
 
 def test_log_handler_no_history_returns_stub():

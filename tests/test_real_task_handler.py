@@ -251,7 +251,7 @@ def _wait_for_count(captured, predicate, timeout: float = 5.0) -> None:
 def happy_agents(_tier):
     return {
         "planning_agent": lambda *_a: '{"plan": "ok"}',
-        "pm_agent": lambda *_a: '{"tasks": []}',
+        "pm_agent": lambda *_a: '{"tasks": [], "specialization_hints": []}',
         "architect_agent": lambda *_a: '{"arch": "spec"}',
         "writer_agent": lambda *_a: "def f(): return 42",
         "reviewer_agent": lambda *_a: '{"verdict": "APPROVED"}',
@@ -2429,7 +2429,9 @@ def test_project_aware_pipeline_uses_collaboration_bus_and_public_projection(
             assert "INTERNAL CONSULTATION TRANSCRIPT" in req.messages[1]["content"]
             return _make_dispatch_response('{"plan":"ok"}')
         if req.agent_role == "pm_agent":
-            return _make_dispatch_response('{"tasks":[]}')
+            return _make_dispatch_response(
+                '{"tasks":[],"specialization_hints":[]}'
+            )
         if req.agent_role == "architect_agent":
             return _make_dispatch_response('{"arch":"spec"}')
         if req.agent_role == "writer_agent":
@@ -2501,6 +2503,10 @@ def test_project_aware_pipeline_uses_collaboration_bus_and_public_projection(
     assert any(env.sender_role == "planning_agent" and env.delivery_role is None for env in captured)
     assert any(env.sender_role == "reviewer_agent" and env.delivery_role is None for env in captured)
     assert any("Готово" in text for text in projection_texts)
+    assert runtime_router.registry.get_project_specialist_roster(
+        "alpha_project"
+    ).specialist_roles == ()
+    assert not any("Логический hire" in text for text in projection_texts)
 
 
 def test_project_aware_runtime_propagates_pm_specialization_hints_to_specialist_consult_prompt(
@@ -2616,7 +2622,354 @@ def test_project_aware_runtime_propagates_pm_specialization_hints_to_specialist_
     projection_texts = [env.message.text for env in captured]
     assert any("Маршрут: architect_agent -> security_agent" in text for text in projection_texts)
     assert any("Маршрут: security_agent -> architect_agent" in text for text in projection_texts)
+    assert any("Логический hire выполнен" in text for text in projection_texts)
+    assert any("security_agent" in text for text in projection_texts)
     assert any("Готово" in text for text in projection_texts)
+    assert runtime_router.registry.get_project_specialist_roster(
+        "alpha_project"
+    ).specialist_roles == ("security_agent",)
+
+
+def test_project_aware_runtime_blocks_logical_hire_when_policy_disallows_it(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send_envelope, captured = _make_progress_envelope_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+        policy=_policy(allow_hiring=False),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="logical-hiring-blocked.db",
+    )
+    dispatcher = _make_dispatcher()
+    factory = build_dispatcher_agent_registry_factory(dispatcher)
+
+    def _dispatch(req, _tier):
+        payloads = {
+            "planning_agent": '{"plan":"ok"}',
+            "pm_agent": (
+                '{"tasks":[],"specialization_hints":'
+                '[{"specialist_role":"security_agent","reason":"Auth и secrets в scope."}]}'
+            ),
+            "architect_agent": '{"arch":"spec"}',
+            "writer_agent": "def f(): return 42",
+            "reviewer_agent": '{"verdict":"APPROVED"}',
+            "tester_agent": "tests pass",
+            "qa_agent": '{"verdict":"PASS"}',
+            "fixer_agent": "def f(): return 42",
+        }
+        return _make_dispatch_response(payloads[req.agent_role])
+
+    dispatcher.dispatch = MagicMock(side_effect=_dispatch)  # type: ignore[method-assign]
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress_envelope=send_envelope,
+            agent_registry_factory=factory,
+            task_id_factory=lambda: "task-42",
+        )
+        reply = handler(
+            "Собери безопасный API для billing.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Собери безопасный API для billing.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        assert isinstance(reply, BridgeReply)
+        _wait_until_idle(runner)
+        _wait_for_count(
+            captured,
+            lambda envelopes: any("Готово" in env.message.text for env in envelopes),
+        )
+
+    projection_texts = [env.message.text for env in captured]
+    assert any("Логический hire заблокирован" in text for text in projection_texts)
+    assert runtime_router.registry.get_project_specialist_roster(
+        "alpha_project"
+    ).specialist_roles == ()
+
+
+def test_project_aware_runtime_reloads_persisted_policy_before_logical_hire(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send_envelope, captured = _make_progress_envelope_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+        policy=_policy(allow_hiring=True),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="logical-hiring-stale-policy.db",
+    )
+    dispatcher = _make_dispatcher()
+    factory = build_dispatcher_agent_registry_factory(dispatcher)
+
+    def _dispatch(req, _tier):
+        if req.agent_role == "pm_agent":
+            runtime_router.registry.set_project_policy(_policy(allow_hiring=False))
+            return _make_dispatch_response(
+                '{"tasks":[],"specialization_hints":'
+                '[{"specialist_role":"security_agent","reason":"Auth и secrets в scope."}]}'
+            )
+        payloads = {
+            "planning_agent": '{"plan":"ok"}',
+            "architect_agent": '{"arch":"spec"}',
+            "writer_agent": "def f(): return 42",
+            "reviewer_agent": '{"verdict":"APPROVED"}',
+            "tester_agent": "tests pass",
+            "qa_agent": '{"verdict":"PASS"}',
+            "fixer_agent": "def f(): return 42",
+        }
+        return _make_dispatch_response(payloads[req.agent_role])
+
+    dispatcher.dispatch = MagicMock(side_effect=_dispatch)  # type: ignore[method-assign]
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress_envelope=send_envelope,
+            agent_registry_factory=factory,
+            task_id_factory=lambda: "task-42",
+        )
+        reply = handler(
+            "Собери безопасный API для billing.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Собери безопасный API для billing.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        assert isinstance(reply, BridgeReply)
+        _wait_until_idle(runner)
+        _wait_for_count(
+            captured,
+            lambda envelopes: any("Готово" in env.message.text for env in envelopes),
+        )
+
+    projection_texts = [env.message.text for env in captured]
+    assert any("Логический hire заблокирован" in text for text in projection_texts)
+    assert runtime_router.registry.get_project_specialist_roster(
+        "alpha_project"
+    ).specialist_roles == ()
+
+
+def test_project_aware_runtime_does_not_duplicate_already_hired_specialist(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send_envelope, captured = _make_progress_envelope_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="logical-hiring-already.db",
+    )
+    runtime_router.registry.add_project_specialist(
+        "alpha_project",
+        "security_agent",
+    )
+    dispatcher = _make_dispatcher()
+    factory = build_dispatcher_agent_registry_factory(dispatcher)
+
+    def _dispatch(req, _tier):
+        payloads = {
+            "planning_agent": '{"plan":"ok"}',
+            "pm_agent": (
+                '{"tasks":[],"specialization_hints":'
+                '[{"specialist_role":"security_agent","reason":"Auth и secrets в scope."}]}'
+            ),
+            "architect_agent": '{"arch":"spec"}',
+            "writer_agent": "def f(): return 42",
+            "reviewer_agent": '{"verdict":"APPROVED"}',
+            "tester_agent": "tests pass",
+            "qa_agent": '{"verdict":"PASS"}',
+            "fixer_agent": "def f(): return 42",
+        }
+        return _make_dispatch_response(payloads[req.agent_role])
+
+    dispatcher.dispatch = MagicMock(side_effect=_dispatch)  # type: ignore[method-assign]
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress_envelope=send_envelope,
+            agent_registry_factory=factory,
+            task_id_factory=lambda: "task-42",
+        )
+        reply = handler(
+            "Собери безопасный API для billing.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Собери безопасный API для billing.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        assert isinstance(reply, BridgeReply)
+        _wait_until_idle(runner)
+        _wait_for_count(
+            captured,
+            lambda envelopes: any("Готово" in env.message.text for env in envelopes),
+        )
+
+    projection_texts = [env.message.text for env in captured]
+    assert any("Логический hire не потребовался" in text for text in projection_texts)
+    assert runtime_router.registry.get_project_specialist_roster(
+        "alpha_project"
+    ).specialist_roles == ("security_agent",)
+
+
+def test_project_aware_runtime_converges_when_owner_adds_specialist_before_apply(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send_envelope, captured = _make_progress_envelope_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="logical-hiring-owner-adds-first.db",
+    )
+    dispatcher = _make_dispatcher()
+    factory = build_dispatcher_agent_registry_factory(dispatcher)
+
+    def _dispatch(req, _tier):
+        if req.agent_role == "pm_agent":
+            runtime_router.registry.add_project_specialist(
+                "alpha_project",
+                "security_agent",
+            )
+            return _make_dispatch_response(
+                '{"tasks":[],"specialization_hints":'
+                '[{"specialist_role":"security_agent","reason":"Auth и secrets в scope."}]}'
+            )
+        payloads = {
+            "planning_agent": '{"plan":"ok"}',
+            "architect_agent": '{"arch":"spec"}',
+            "writer_agent": "def f(): return 42",
+            "reviewer_agent": '{"verdict":"APPROVED"}',
+            "tester_agent": "tests pass",
+            "qa_agent": '{"verdict":"PASS"}',
+            "fixer_agent": "def f(): return 42",
+        }
+        return _make_dispatch_response(payloads[req.agent_role])
+
+    dispatcher.dispatch = MagicMock(side_effect=_dispatch)  # type: ignore[method-assign]
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress_envelope=send_envelope,
+            agent_registry_factory=factory,
+            task_id_factory=lambda: "task-42",
+        )
+        reply = handler(
+            "Собери безопасный API для billing.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Собери безопасный API для billing.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        assert isinstance(reply, BridgeReply)
+        _wait_until_idle(runner)
+        _wait_for_count(
+            captured,
+            lambda envelopes: any("Готово" in env.message.text for env in envelopes),
+        )
+
+    projection_texts = [env.message.text for env in captured]
+    assert any("Логический hire не потребовался" in text for text in projection_texts)
+    assert not any("Логический hire не удалось обработать" in text for text in projection_texts)
+    assert runtime_router.registry.get_project_specialist_roster(
+        "alpha_project"
+    ).specialist_roles == ("security_agent",)
 
 
 def test_non_project_dispatcher_path_stays_legacy_without_collaboration(
@@ -2634,7 +2987,7 @@ def test_non_project_dispatcher_path_stays_legacy_without_collaboration(
     def _dispatch(req, _tier):
         payloads = {
             "planning_agent": '{"plan":"ok"}',
-            "pm_agent": '{"tasks":[]}',
+            "pm_agent": '{"tasks":[],"specialization_hints":[]}',
             "architect_agent": '{"arch":"spec"}',
             "writer_agent": "def f(): return 42",
             "reviewer_agent": '{"verdict":"APPROVED"}',

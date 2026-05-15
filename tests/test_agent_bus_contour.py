@@ -999,7 +999,7 @@ def test_agent_bus_contour_real_handler_project_and_legacy_runtime_paths(
             assert "INTERNAL CONSULTATION TRANSCRIPT" in req.messages[1]["content"]
             return _make_response('{"plan":"ok"}')
         if req.agent_role == "pm_agent":
-            return _make_response('{"tasks":[]}')
+            return _make_response('{"tasks":[],"specialization_hints":[]}')
         if req.agent_role == "architect_agent":
             return _make_response('{"arch":"spec"}')
         if req.agent_role == "writer_agent":
@@ -1096,7 +1096,7 @@ def test_agent_bus_contour_real_handler_project_and_legacy_runtime_paths(
     def _legacy_dispatch(req, _tier):
         payloads = {
             "planning_agent": '{"plan":"ok"}',
-            "pm_agent": '{"tasks":[]}',
+            "pm_agent": '{"tasks":[],"specialization_hints":[]}',
             "architect_agent": '{"arch":"spec"}',
             "writer_agent": "def f(): return 42",
             "reviewer_agent": '{"verdict":"APPROVED"}',
