@@ -2355,6 +2355,279 @@ def test_agents_command_does_not_create_hidden_state_for_unresolved_context(
     assert task_calls == []
 
 
+# ---------------------------------------------------------------------------
+# /team command
+# ---------------------------------------------------------------------------
+
+
+def test_team_command_in_bound_project_chat_returns_current_roster(tmp_path):
+    db = StateDB(tmp_path / "team-bound.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "team-bound-repo")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            project=_project(owner_user_id=777),
+            policy=_policy(project_id="alpha_project"),
+            chat_binding=_chat_binding(chat_id=-100123450903),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: BridgeReply(
+            persona_role="architect_agent",
+            body="task ok",
+        ),
+        project_context_resolver=resolver,
+    )
+
+    result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450903,
+            user_id=999,
+            message_id=1,
+            text="/team",
+        )
+    )
+
+    assert result.handled is True
+    assert result.reason == "command"
+    assert "Project specialists:" in captured[0].text
+    assert "- none" in captured[0].text
+
+
+def test_team_command_owner_can_add_and_remove_specialist_in_bound_chat(
+    tmp_path,
+):
+    db = StateDB(tmp_path / "team-bound-mutate.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "team-bound-mutate-repo")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            project=_project(owner_user_id=777),
+            policy=_policy(project_id="alpha_project"),
+            chat_binding=_chat_binding(chat_id=-100123450904),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: BridgeReply(
+            persona_role="architect_agent",
+            body="task ok",
+        ),
+        project_context_resolver=resolver,
+    )
+
+    add_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450904,
+            user_id=777,
+            message_id=1,
+            text="/team add security_agent",
+        )
+    )
+    assert add_result.reason == "command"
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == (
+        "security_agent",
+    )
+    assert "добавлен" in captured[0].text.lower()
+
+    remove_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450904,
+            user_id=777,
+            message_id=2,
+            text="/team remove security_agent",
+        )
+    )
+
+    assert remove_result.reason == "command"
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == ()
+    assert "удалён" in captured[1].text.lower()
+
+
+def test_team_command_non_owner_mutation_is_rejected(tmp_path):
+    db = StateDB(tmp_path / "team-non-owner.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "team-non-owner-repo")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            project=_project(owner_user_id=777),
+            policy=_policy(project_id="alpha_project"),
+            chat_binding=_chat_binding(chat_id=-100123450905),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: BridgeReply(
+            persona_role="architect_agent",
+            body="task ok",
+        ),
+        project_context_resolver=resolver,
+    )
+
+    result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450905,
+            user_id=999,
+            message_id=1,
+            text="/team add security_agent",
+        )
+    )
+
+    assert result.handled is True
+    assert result.reason == "command"
+    assert "только owner" in captured[0].text.lower()
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == ()
+
+
+def test_team_command_owner_dm_single_project_list_add_remove_work(tmp_path):
+    db = StateDB(tmp_path / "team-owner-dm.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "team-owner-dm-repo")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            project=_project(owner_user_id=777),
+            policy=_policy(project_id="alpha_project"),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: BridgeReply(
+            persona_role="architect_agent",
+            body="task ok",
+        ),
+        project_context_resolver=resolver,
+    )
+
+    list_result = bridge.handle(
+        IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=1,
+            text="/team list",
+        )
+    )
+    add_result = bridge.handle(
+        IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=2,
+            text="/team add data_agent",
+        )
+    )
+    remove_result = bridge.handle(
+        IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=3,
+            text="/team remove data_agent",
+        )
+    )
+
+    assert list_result.reason == "command"
+    assert add_result.reason == "command"
+    assert remove_result.reason == "command"
+    assert "- none" in captured[0].text
+    assert "data_agent" in captured[1].text
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == ()
+
+
+def test_team_command_in_ambiguous_owner_dm_does_not_guess_project(tmp_path):
+    db = StateDB(tmp_path / "team-ambiguous.db")
+    registry = ProjectRegistry(db)
+    alpha_repo = _git_repo(tmp_path, "team-ambiguous-alpha")
+    beta_repo = _git_repo(tmp_path, "team-ambiguous-beta")
+    registry.register_project(
+        _project_snapshot(
+            alpha_repo,
+            project=_project(owner_user_id=777),
+        )
+    )
+    registry.register_project(
+        _project_snapshot(
+            beta_repo,
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+                owner_user_id=777,
+            ),
+            policy=_policy(project_id="beta_project"),
+            runtime_binding=_runtime_binding(
+                beta_repo,
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: BridgeReply(
+            persona_role="architect_agent",
+            body="task ok",
+        ),
+        project_context_resolver=resolver,
+    )
+
+    result = bridge.handle(
+        IncomingMessage(
+            chat_id=777,
+            user_id=777,
+            message_id=1,
+            text="/team",
+        )
+    )
+
+    assert result.handled is True
+    assert result.reason == "command"
+    assert "не выбирает проект автоматически" in captured[0].text.lower()
+    assert "/projects" in captured[0].text
+
+
 def test_log_handler_no_history_returns_stub():
     """Without task_history /log must return an informative stub."""
     handler = make_log_handler()
@@ -2640,10 +2913,10 @@ def test_tier_handler_marks_active_in_summary():
 # ---------------------------------------------------------------------------
 
 
-def test_build_command_registry_has_all_twelve():
+def test_build_command_registry_has_all_thirteen():
     personas = default_registry()
     reg = build_command_registry(personas)
-    assert len(reg) == 12
+    assert len(reg) == 13
     for cmd_name in CommandName:
         assert cmd_name in reg
 

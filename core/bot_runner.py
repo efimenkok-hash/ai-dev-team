@@ -86,6 +86,13 @@ from core.project_runtime_router import (
     describe_project_runtime_error,
 )
 from core.project_summary_service import ProjectSummaryService
+from core.project_team_commands import (
+    ProjectTeamCommandContext,
+    ProjectTeamCommandService,
+    describe_project_team_command_error,
+    format_project_team_usage,
+    parse_project_team_command,
+)
 from core.real_task_handler import RealTaskHandlerConfig, make_real_task_handler
 from core.sandbox_workspace import SandboxWorkspace
 from core.state_db import StateDB
@@ -704,6 +711,32 @@ def _format_projects_usage() -> str:
     )
 
 
+def _format_team_context_unavailable(reason: str | None) -> str:
+    if reason == "owner_dm_requires_explicit_project_chat":
+        detail = (
+            "В owner DM при нескольких проектах `/team` не выбирает проект "
+            "автоматически.\n"
+            "\n"
+            "Открой нужный project chat или сначала используй `/projects`."
+        )
+    elif reason == "project_chat_not_bound":
+        detail = (
+            "Этот чат сейчас не привязан к проекту.\n"
+            "\n"
+            "Сначала используй `/projects bind <project_id_or_slug>` или "
+            "перейди в уже привязанный project chat."
+        )
+    else:
+        detail = "Не удалось определить project context для этой команды."
+    return (
+        "👥 /team\n"
+        "\n"
+        f"{detail}\n"
+        "\n"
+        f"{format_project_team_usage()}"
+    )
+
+
 def _format_projects_here_unbound(
     *,
     chat_id: int,
@@ -1256,6 +1289,87 @@ def make_budget_handler(state: _BudgetState) -> CommandHandler:
             f"\n"
             f"▸ ${updated:.2f}"
         )
+
+    return _handle
+
+
+def make_team_handler(
+    project_context_resolver: ProjectContextResolver | None = None,
+    project_team_command_service: ProjectTeamCommandService | None = None,
+) -> CommandHandler:
+    if (
+        project_context_resolver is not None
+        and not isinstance(project_context_resolver, ProjectContextResolver)
+    ):
+        raise ValueError("invalid_project_context_resolver")
+    if (
+        project_team_command_service is not None
+        and not isinstance(
+            project_team_command_service,
+            ProjectTeamCommandService,
+        )
+    ):
+        raise ValueError("invalid_project_team_command_service")
+
+    resolved_service = project_team_command_service
+    if resolved_service is None and project_context_resolver is not None:
+        resolved_service = ProjectTeamCommandService(
+            project_context_resolver.registry
+        )
+
+    def _handle(cmd: BotCommand, ctx: Any) -> str:
+        try:
+            parsed_command = parse_project_team_command(cmd)
+        except ValueError as exc:
+            return (
+                "⚠️ /team\n"
+                "\n"
+                f"{describe_project_team_command_error(str(exc))}"
+            )
+
+        if (
+            project_context_resolver is None
+            or resolved_service is None
+        ):
+            return (
+                "👥 /team\n"
+                "\n"
+                "Project specialist roster сейчас недоступен: registry/"
+                "project-context resolver не подключены."
+            )
+        if not isinstance(ctx, IncomingMessage):
+            return (
+                "👥 /team\n"
+                "\n"
+                "Не удалось определить текущий chat context для этой команды."
+            )
+
+        resolution = project_context_resolver.resolve_telegram_context(
+            chat_id=ctx.chat_id,
+            user_id=ctx.user_id,
+        )
+        if (
+            resolution.source not in {"bound_chat", "owner_dm_single_project"}
+            or resolution.snapshot is None
+        ):
+            return _format_team_context_unavailable(resolution.reason)
+
+        try:
+            result = resolved_service.handle(
+                parsed_command,
+                ProjectTeamCommandContext(
+                    snapshot=resolution.snapshot,
+                    actor_user_id=ctx.user_id,
+                    context_source=resolution.source,
+                ),
+            )
+        except ValueError as exc:
+            return (
+                "⚠️ /team\n"
+                "\n"
+                f"{describe_project_team_command_error(str(exc))}"
+            )
+        return result.message_text
 
     return _handle
 
@@ -1971,7 +2085,7 @@ def build_command_registry(
     project_summary_service: ProjectSummaryService | None = None,
     coordinator_team_assembly_service: CoordinatorTeamAssemblyService | None = None,
 ) -> CommandRegistry:
-    """Build a CommandRegistry pre-populated with all 10 default handlers.
+    """Build a CommandRegistry pre-populated with all default handlers.
 
     If tier_store is None, a fresh store backed by default_tier_registry()
     is created. Pass an explicit store when the bridge wants to share tier
@@ -2069,6 +2183,10 @@ def build_command_registry(
     reg.register(
         CommandName.SWITCH,
         make_switch_handler(project_context_resolver),
+    )
+    reg.register(
+        CommandName.TEAM,
+        make_team_handler(project_context_resolver),
     )
     reg.register(CommandName.BUDGET, make_budget_handler(budget_state))
     reg.register(
