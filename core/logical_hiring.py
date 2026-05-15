@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from core.agent_role_catalog import SPECIALIST_ROLE_ORDER
+from core.hire_approval import HireApprovalService
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_team_state import ProjectSpecialistRoster
 from core.specialization_hints import SpecializationHints
@@ -11,7 +12,13 @@ _SPECIALIST_ORDER_INDEX = {
     role: index for index, role in enumerate(SPECIALIST_ROLE_ORDER)
 }
 _ALLOWED_STATUSES = frozenset(
-    {"no_candidates", "already_satisfied", "hired", "blocked_by_policy"}
+    {
+        "no_candidates",
+        "already_satisfied",
+        "hired",
+        "blocked_by_policy",
+        "pending_owner_approval",
+    }
 )
 
 
@@ -50,6 +57,24 @@ def _render_roles(roles: tuple[str, ...]) -> str:
     if not roles:
         return "none"
     return ", ".join(f"`{role}`" for role in roles)
+
+
+def _render_pending_owner_approval_message(
+    *,
+    created_requests: tuple[tuple[str, str], ...],
+    existing_requests: tuple[tuple[str, str], ...],
+) -> str:
+    details: list[str] = []
+    for specialist_role, request_id in created_requests:
+        details.append(f"`{specialist_role}` -> `{request_id}` (created)")
+    for specialist_role, request_id in existing_requests:
+        details.append(f"`{specialist_role}` -> `{request_id}` (existing)")
+    rendered_details = ", ".join(details) if details else "none"
+    return (
+        "🧩 Sensitive logical hire ждёт owner approval: "
+        f"{rendered_details}. Persisted project roster пока не изменён; "
+        "runtime activation не запускалась."
+    )
 
 
 def _is_duplicate_project_specialist_error(
@@ -204,10 +229,15 @@ class LogicalHiringService:
                 f"invalid_project_registry_type:{type(project_registry).__name__}"
             )
         self._project_registry = project_registry
+        self._hire_approval_service = HireApprovalService(project_registry)
 
     @property
     def project_registry(self) -> ProjectRegistry:
         return self._project_registry
+
+    @property
+    def hire_approval_service(self) -> HireApprovalService:
+        return self._hire_approval_service
 
     def plan_from_hints(
         self,
@@ -296,6 +326,12 @@ class LogicalHiringService:
                     "и owner approval flow не запускались."
                 ),
             )
+        if current_snapshot.policy.require_owner_approval_for_hires:
+            return self._apply_pending_owner_approval(
+                snapshot=snapshot,
+                plan=plan,
+                initial_roster=initial_roster,
+            )
         pending_hired_roles = tuple(
             candidate.specialist_role
             for candidate in plan.candidates
@@ -366,4 +402,100 @@ class LogicalHiringService:
         return self.apply_plan(
             snapshot,
             self.plan_from_hints(snapshot, hints),
+        )
+
+    def _apply_pending_owner_approval(
+        self,
+        *,
+        snapshot: ProjectSnapshot,
+        plan: LogicalHiringPlan,
+        initial_roster: ProjectSpecialistRoster,
+    ) -> LogicalHiringResult:
+        pending_candidates = tuple(
+            candidate
+            for candidate in plan.candidates
+            if not initial_roster.contains(candidate.specialist_role)
+        )
+        if not pending_candidates:
+            return LogicalHiringResult(
+                project_id=plan.project_id,
+                status="already_satisfied",
+                initial_roster=initial_roster,
+                final_roster=initial_roster,
+                hired_roles=(),
+                message_text=(
+                    "🧩 Логический hire не потребовался: все hinted "
+                    "specialists уже есть в persisted project roster. "
+                    "Runtime activation и owner approval flow не запускались."
+                ),
+            )
+
+        created_requests: list[tuple[str, str]] = []
+        existing_requests: list[tuple[str, str]] = []
+        for candidate in pending_candidates:
+            approval_result = self._hire_approval_service.request_sensitive_hire(
+                snapshot,
+                candidate.specialist_role,
+                candidate.reason,
+                "logical_hiring_pm_hint",
+            )
+            if approval_result.status == "already_applied":
+                continue
+            if approval_result.status == "blocked_by_policy":
+                return LogicalHiringResult(
+                    project_id=plan.project_id,
+                    status="blocked_by_policy",
+                    initial_roster=initial_roster,
+                    final_roster=initial_roster,
+                    hired_roles=(),
+                    message_text=(
+                        "🧩 Логический hire заблокирован policy проекта: "
+                        "persisted project roster не изменён. Runtime activation "
+                        "и owner approval flow не запускались."
+                    ),
+                )
+            if approval_result.request_id is None:
+                raise ValueError("hire_approval_pending_result_requires_request_id")
+            if approval_result.status == "pending_created":
+                created_requests.append(
+                    (candidate.specialist_role, approval_result.request_id)
+                )
+                continue
+            if approval_result.status == "pending_exists":
+                existing_requests.append(
+                    (candidate.specialist_role, approval_result.request_id)
+                )
+                continue
+            raise ValueError(
+                "unexpected_hire_approval_result_status:"
+                f"{approval_result.status}"
+            )
+
+        if not created_requests and not existing_requests:
+            final_roster = self._project_registry.get_project_specialist_roster(
+                plan.project_id
+            )
+            return LogicalHiringResult(
+                project_id=plan.project_id,
+                status="already_satisfied",
+                initial_roster=final_roster,
+                final_roster=final_roster,
+                hired_roles=(),
+                message_text=(
+                    "🧩 Логический hire не потребовался: все hinted "
+                    "specialists уже есть в persisted project roster. "
+                    "Runtime activation и owner approval flow не запускались."
+                ),
+            )
+
+        return LogicalHiringResult(
+            project_id=plan.project_id,
+            status="pending_owner_approval",
+            initial_roster=initial_roster,
+            final_roster=initial_roster,
+            hired_roles=(),
+            message_text=_render_pending_owner_approval_message(
+                created_requests=tuple(created_requests),
+                existing_requests=tuple(existing_requests),
+            ),
         )

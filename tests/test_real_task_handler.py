@@ -1396,6 +1396,7 @@ def test_bound_project_chat_progress_posts_use_agent_and_coordinator_roles(
     snapshot = _project_snapshot(
         fake_repo,
         chat_binding=_chat_binding(chat_id=-100123),
+        policy=_policy(require_owner_approval_for_hires=False),
     )
     runtime_router = _runtime_router_for_snapshot(
         tmp_path,
@@ -1476,6 +1477,7 @@ def test_bound_project_chat_agent_failed_post_uses_agent_role(
     snapshot = _project_snapshot(
         fake_repo,
         chat_binding=_chat_binding(chat_id=-100123),
+        policy=_policy(require_owner_approval_for_hires=False),
     )
     runtime_router = _runtime_router_for_snapshot(
         tmp_path,
@@ -2408,6 +2410,7 @@ def test_project_aware_pipeline_uses_collaboration_bus_and_public_projection(
     snapshot = _project_snapshot(
         fake_repo,
         chat_binding=_chat_binding(chat_id=-100123),
+        policy=_policy(require_owner_approval_for_hires=False),
     )
     runtime_router = _runtime_router_for_snapshot(
         tmp_path,
@@ -2523,6 +2526,7 @@ def test_project_aware_runtime_propagates_pm_specialization_hints_to_specialist_
     snapshot = _project_snapshot(
         fake_repo,
         chat_binding=_chat_binding(chat_id=-100123),
+        policy=_policy(require_owner_approval_for_hires=False),
     )
     runtime_router = _runtime_router_for_snapshot(
         tmp_path,
@@ -2628,6 +2632,93 @@ def test_project_aware_runtime_propagates_pm_specialization_hints_to_specialist_
     assert runtime_router.registry.get_project_specialist_roster(
         "alpha_project"
     ).specialist_roles == ("security_agent",)
+
+
+def test_project_aware_runtime_creates_pending_hire_request_when_owner_approval_is_required(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send_envelope, captured = _make_progress_envelope_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+        policy=_policy(require_owner_approval_for_hires=True),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="logical-hiring-pending-approval.db",
+    )
+    dispatcher = _make_dispatcher()
+    factory = build_dispatcher_agent_registry_factory(dispatcher)
+
+    def _dispatch(req, _tier):
+        payloads = {
+            "planning_agent": '{"plan":"ok"}',
+            "pm_agent": (
+                '{"tasks":[],"specialization_hints":'
+                '[{"specialist_role":"security_agent","reason":"Auth и secrets в scope."}]}'
+            ),
+            "architect_agent": '{"arch":"spec"}',
+            "writer_agent": "def f(): return 42",
+            "reviewer_agent": '{"verdict":"APPROVED"}',
+            "tester_agent": "tests pass",
+            "qa_agent": '{"verdict":"PASS"}',
+            "fixer_agent": "def f(): return 42",
+        }
+        return _make_dispatch_response(payloads[req.agent_role])
+
+    dispatcher.dispatch = MagicMock(side_effect=_dispatch)  # type: ignore[method-assign]
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress_envelope=send_envelope,
+            agent_registry_factory=factory,
+            task_id_factory=lambda: "task-42",
+        )
+        reply = handler(
+            "Собери безопасный API для billing.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Собери безопасный API для billing.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        assert isinstance(reply, BridgeReply)
+        _wait_until_idle(runner)
+        _wait_for_count(
+            captured,
+            lambda envelopes: any("Готово" in env.message.text for env in envelopes),
+        )
+
+    projection_texts = [env.message.text for env in captured]
+    assert any("owner approval" in text for text in projection_texts)
+    assert any("roster пока не изменён" in text for text in projection_texts)
+    assert runtime_router.registry.get_project_specialist_roster(
+        "alpha_project"
+    ).specialist_roles == ()
+    pending = runtime_router.registry.list_pending_hire_requests("alpha_project")
+    assert len(pending) == 1
+    assert pending[0].specialist_role == "security_agent"
 
 
 def test_project_aware_runtime_blocks_logical_hire_when_policy_disallows_it(

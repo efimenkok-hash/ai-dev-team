@@ -19,14 +19,14 @@ Design goals:
 CONTRACTS:
 1. StateDB(path) requires a Path; constructor creates parent directories and
    initializes/migrates the schema eagerly.
-2. Current schema version is 10. Unknown future versions raise ValueError.
+2. Current schema version is 11. Unknown future versions raise ValueError.
 3. Every public method validates arguments via isinstance/ValueError.
 4. Writes are serialized with a process-local lock; reads use independent
    SQLite connections and remain safe under concurrent access.
 5. task_history keeps an append-only audit log. get_task(task_id) returns the
    newest record for that task_id; recent_tasks(n) returns newest-last order.
 6. schema migration supports v1 -> v2 -> v3 -> v4 -> v5 -> v6 -> v7 -> v8
-   -> v9 -> v10:
+   -> v9 -> v10 -> v11:
    - v1 -> v2: tier_sessions.tier_name -> active_tier
    - v1 -> v2: task_history gains AUTOINCREMENT id for stable append-order
      semantics
@@ -42,6 +42,8 @@ CONTRACTS:
      backend agent-bus history
    - v9 -> v10: adds project_specialist_roster for persisted per-project
      optional specialist assignments
+   - v10 -> v11: adds project_hire_requests for persisted pending owner
+     approval workflow around sensitive logical hires
 7. Identity model is explicit:
    - Project.owner_user_id is a positive Telegram owner user id stored in
      projects.owner_user_id.
@@ -71,6 +73,7 @@ from core.agent_dm_models import (
     AgentDmSession,
 )
 from core.agent_owner_notifications import AgentOwnerNotification
+from core.hire_approval import PendingHireRequest
 from core.project_models import (
     VALID_CHAT_PROVIDERS,
     Project,
@@ -85,7 +88,7 @@ from core.project_team_state import (
 )
 from core.task_history import TaskSummary
 
-_CURRENT_SCHEMA_VERSION = 10
+_CURRENT_SCHEMA_VERSION = 11
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -165,6 +168,20 @@ CREATE TABLE IF NOT EXISTS project_specialist_roster (
     project_id TEXT NOT NULL,
     specialist_role TEXT NOT NULL,
     PRIMARY KEY(project_id, specialist_role)
+)
+"""
+
+_CREATE_PROJECT_HIRE_REQUESTS = """
+CREATE TABLE IF NOT EXISTS project_hire_requests (
+    request_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    specialist_role TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    decided_at REAL NULL,
+    decided_by_user_id INTEGER NULL
 )
 """
 
@@ -307,6 +324,17 @@ ON agent_bus_messages(project_id, thread_id, id ASC)
 _CREATE_INDEX_AGENT_BUS_MESSAGES_INBOX_ID = """
 CREATE INDEX IF NOT EXISTS idx_agent_bus_messages_inbox_id_asc
 ON agent_bus_messages(project_id, recipient_role, id ASC)
+"""
+
+_CREATE_INDEX_PROJECT_HIRE_REQUESTS_PENDING = """
+CREATE INDEX IF NOT EXISTS idx_project_hire_requests_pending_created
+ON project_hire_requests(project_id, status, created_at ASC, request_id ASC)
+"""
+
+_CREATE_INDEX_PROJECT_HIRE_REQUESTS_PENDING_UNIQUE = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_hire_requests_pending_unique
+ON project_hire_requests(project_id, specialist_role, source)
+WHERE status = 'pending'
 """
 
 
@@ -706,6 +734,88 @@ class StateDB:
         return ProjectSpecialistRoster(
             project_id=normalized_project_id,
             specialist_roles=specialist_roles,
+        )
+
+    def create_hire_request(
+        self,
+        request: PendingHireRequest,
+    ) -> PendingHireRequest:
+        if not isinstance(request, PendingHireRequest):
+            raise ValueError(
+                "invalid_pending_hire_request_type:"
+                f"{type(request).__name__}"
+            )
+        if request.status != "pending":
+            raise ValueError("hire_request_must_start_pending")
+        return self._run_write_transaction(
+            lambda conn: self._create_hire_request_conn(conn, request)
+        )
+
+    def get_hire_request(
+        self,
+        request_id: str,
+    ) -> PendingHireRequest | None:
+        normalized_request_id = self._normalize_hire_request_id(request_id)
+        with self._connect() as conn:
+            row = self._get_hire_request_row(conn, normalized_request_id)
+        return self._row_to_pending_hire_request(row)
+
+    def list_pending_hire_requests(
+        self,
+        project_id: str,
+    ) -> tuple[PendingHireRequest, ...]:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        with self._connect() as conn:
+            self._ensure_project_exists(conn, normalized_project_id)
+            rows = conn.execute(
+                """
+                SELECT request_id, project_id, specialist_role, reason, source,
+                       status, created_at, decided_at, decided_by_user_id
+                FROM project_hire_requests
+                WHERE project_id = ? AND status = 'pending'
+                ORDER BY created_at ASC, request_id ASC
+                """,
+                (normalized_project_id,),
+            ).fetchall()
+        requests: list[PendingHireRequest] = []
+        for row in rows:
+            request = self._row_to_pending_hire_request(row)
+            if request is None:
+                continue
+            requests.append(request)
+        return tuple(requests)
+
+    def mark_hire_request_approved(
+        self,
+        request_id: str,
+        actor_user_id: int,
+    ) -> PendingHireRequest:
+        normalized_request_id = self._normalize_hire_request_id(request_id)
+        self._validate_positive_int(actor_user_id, "hire_approval_actor_user_id")
+        return self._run_write_transaction(
+            lambda conn: self._mark_hire_request_approved_conn(
+                conn,
+                normalized_request_id,
+                actor_user_id=actor_user_id,
+            )
+        )
+
+    def mark_hire_request_rejected(
+        self,
+        request_id: str,
+        actor_user_id: int,
+    ) -> PendingHireRequest:
+        normalized_request_id = self._normalize_hire_request_id(request_id)
+        self._validate_positive_int(actor_user_id, "hire_approval_actor_user_id")
+        return self._run_write_transaction(
+            lambda conn: self._mark_hire_request_rejected_conn(
+                conn,
+                normalized_request_id,
+                actor_user_id=actor_user_id,
+            )
         )
 
     def bind_project_chat(self, binding: ProjectChatBinding) -> None:
@@ -1238,7 +1348,7 @@ class StateDB:
         with self._lock, self._connect() as conn:
             version = self._detect_schema_version(conn)
             if version == 0:
-                self._create_v10_schema(conn)
+                self._create_v11_schema(conn)
                 return
             if version > _CURRENT_SCHEMA_VERSION:
                 raise ValueError(
@@ -1281,9 +1391,13 @@ class StateDB:
                     self._migrate_v9_to_v10(conn)
                     version = 10
                     continue
+                if version == 10:
+                    self._migrate_v10_to_v11(conn)
+                    version = 11
+                    continue
                 raise ValueError(f"unsupported_schema_version:{version}")
 
-    def _create_v10_schema(self, conn: sqlite3.Connection) -> None:
+    def _create_v11_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE_SCHEMA_META)
         conn.execute(_CREATE_TIER_SESSIONS)
         conn.execute(_CREATE_TASK_HISTORY)
@@ -1292,6 +1406,7 @@ class StateDB:
         conn.execute(_CREATE_PROJECT_POLICIES)
         conn.execute(_CREATE_PROJECT_MEMBERS)
         conn.execute(_CREATE_PROJECT_SPECIALIST_ROSTER)
+        conn.execute(_CREATE_PROJECT_HIRE_REQUESTS)
         conn.execute(_CREATE_PROJECT_CHAT_BINDINGS)
         conn.execute(_CREATE_PROJECT_RUNTIME_BINDINGS)
         conn.execute(_CREATE_AGENT_DM_SESSIONS)
@@ -1306,6 +1421,8 @@ class StateDB:
         conn.execute(_CREATE_INDEX_PROJECT_THREADS_PROJECT_ACTIVITY)
         conn.execute(_CREATE_INDEX_AGENT_BUS_MESSAGES_THREAD_ID)
         conn.execute(_CREATE_INDEX_AGENT_BUS_MESSAGES_INBOX_ID)
+        conn.execute(_CREATE_INDEX_PROJECT_HIRE_REQUESTS_PENDING)
+        conn.execute(_CREATE_INDEX_PROJECT_HIRE_REQUESTS_PENDING_UNIQUE)
         self._set_schema_version(conn, _CURRENT_SCHEMA_VERSION)
 
     def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
@@ -1359,6 +1476,12 @@ class StateDB:
     def _migrate_v9_to_v10(self, conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE_PROJECT_SPECIALIST_ROSTER)
         self._set_schema_version(conn, 10)
+
+    def _migrate_v10_to_v11(self, conn: sqlite3.Connection) -> None:
+        conn.execute(_CREATE_PROJECT_HIRE_REQUESTS)
+        conn.execute(_CREATE_INDEX_PROJECT_HIRE_REQUESTS_PENDING)
+        conn.execute(_CREATE_INDEX_PROJECT_HIRE_REQUESTS_PENDING_UNIQUE)
+        self._set_schema_version(conn, 11)
 
     def _migrate_tier_sessions_to_v2(self, conn: sqlite3.Connection) -> None:
         columns = self._table_columns(conn, "tier_sessions")
@@ -1557,6 +1680,30 @@ class StateDB:
             allow_agent_dm=bool(row["allow_agent_dm"]),
             require_owner_approval_for_hires=bool(
                 row["require_owner_approval_for_hires"]
+            ),
+        )
+
+    @staticmethod
+    def _row_to_pending_hire_request(
+        row: sqlite3.Row | None,
+    ) -> PendingHireRequest | None:
+        if row is None:
+            return None
+        return PendingHireRequest(
+            request_id=str(row["request_id"]),
+            project_id=str(row["project_id"]),
+            specialist_role=str(row["specialist_role"]),
+            reason=str(row["reason"]),
+            source=str(row["source"]),
+            status=str(row["status"]),
+            created_at=float(row["created_at"]),
+            decided_at=(
+                None if row["decided_at"] is None else float(row["decided_at"])
+            ),
+            decided_by_user_id=(
+                None
+                if row["decided_by_user_id"] is None
+                else int(row["decided_by_user_id"])
             ),
         )
 
@@ -1893,6 +2040,172 @@ class StateDB:
                 "unknown_project_specialist:"
                 f"{assignment.project_id}:{assignment.specialist_role}"
             )
+
+    def _create_hire_request_conn(
+        self,
+        conn: sqlite3.Connection,
+        request: PendingHireRequest,
+    ) -> PendingHireRequest:
+        self._ensure_project_exists(conn, request.project_id)
+        if request.specialist_role in self._list_project_specialist_roles_conn(
+            conn,
+            request.project_id,
+        ):
+            raise ValueError(
+                "project_specialist_already_present:"
+                f"{request.project_id}:{request.specialist_role}"
+            )
+        existing_pending = self._get_pending_hire_request_row(
+            conn,
+            project_id=request.project_id,
+            specialist_role=request.specialist_role,
+            source=request.source,
+        )
+        if existing_pending is not None:
+            persisted = self._row_to_pending_hire_request(existing_pending)
+            if persisted is None:
+                raise ValueError("existing_pending_hire_request_missing")
+            return persisted
+        try:
+            conn.execute(
+                """
+                INSERT INTO project_hire_requests(
+                    request_id,
+                    project_id,
+                    specialist_role,
+                    reason,
+                    source,
+                    status,
+                    created_at,
+                    decided_at,
+                    decided_by_user_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request.request_id,
+                    request.project_id,
+                    request.specialist_role,
+                    request.reason,
+                    request.source,
+                    request.status,
+                    request.created_at,
+                    request.decided_at,
+                    request.decided_by_user_id,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            existing_pending = self._get_pending_hire_request_row(
+                conn,
+                project_id=request.project_id,
+                specialist_role=request.specialist_role,
+                source=request.source,
+            )
+            if existing_pending is not None:
+                persisted = self._row_to_pending_hire_request(existing_pending)
+                if persisted is None:
+                    raise ValueError("existing_pending_hire_request_missing") from exc
+                return persisted
+            raise ValueError(
+                f"duplicate_hire_request_id:{request.request_id}"
+            ) from exc
+        persisted_row = self._get_hire_request_row(conn, request.request_id)
+        persisted = self._row_to_pending_hire_request(persisted_row)
+        if persisted is None:
+            raise ValueError(
+                f"inserted_hire_request_missing:{request.request_id}"
+            )
+        return persisted
+
+    def _mark_hire_request_approved_conn(
+        self,
+        conn: sqlite3.Connection,
+        request_id: str,
+        *,
+        actor_user_id: int,
+    ) -> PendingHireRequest:
+        row = self._get_hire_request_row(conn, request_id)
+        request = self._row_to_pending_hire_request(row)
+        if request is None:
+            raise ValueError(f"unknown_hire_request:{request_id}")
+        if request.status != "pending":
+            return request
+        with_duplicate_ok = ProjectSpecialistAssignment(
+            project_id=request.project_id,
+            specialist_role=request.specialist_role,
+        )
+        try:
+            self._add_project_specialist_conn(conn, with_duplicate_ok)
+        except ValueError as exc:
+            if str(exc) != (
+                "duplicate_project_specialist:"
+                f"{request.project_id}:{request.specialist_role}"
+            ):
+                raise
+        decided_at = self._normalise_timestamp(
+            time.time(),
+            field_name="hire_request_decided_at",
+            allow_zero=False,
+        )
+        conn.execute(
+            """
+            UPDATE project_hire_requests
+            SET status = 'approved',
+                decided_at = ?,
+                decided_by_user_id = ?
+            WHERE request_id = ?
+            """,
+            (
+                decided_at,
+                actor_user_id,
+                request_id,
+            ),
+        )
+        updated = self._row_to_pending_hire_request(
+            self._get_hire_request_row(conn, request_id)
+        )
+        if updated is None:
+            raise ValueError(f"approved_hire_request_missing:{request_id}")
+        return updated
+
+    def _mark_hire_request_rejected_conn(
+        self,
+        conn: sqlite3.Connection,
+        request_id: str,
+        *,
+        actor_user_id: int,
+    ) -> PendingHireRequest:
+        row = self._get_hire_request_row(conn, request_id)
+        request = self._row_to_pending_hire_request(row)
+        if request is None:
+            raise ValueError(f"unknown_hire_request:{request_id}")
+        if request.status != "pending":
+            return request
+        decided_at = self._normalise_timestamp(
+            time.time(),
+            field_name="hire_request_decided_at",
+            allow_zero=False,
+        )
+        conn.execute(
+            """
+            UPDATE project_hire_requests
+            SET status = 'rejected',
+                decided_at = ?,
+                decided_by_user_id = ?
+            WHERE request_id = ?
+            """,
+            (
+                decided_at,
+                actor_user_id,
+                request_id,
+            ),
+        )
+        updated = self._row_to_pending_hire_request(
+            self._get_hire_request_row(conn, request_id)
+        )
+        if updated is None:
+            raise ValueError(f"rejected_hire_request_missing:{request_id}")
+        return updated
 
     def _bind_project_chat_conn(
         self,
@@ -2464,6 +2777,48 @@ class StateDB:
         ).fetchall()
         return tuple(str(row["specialist_role"]) for row in rows)
 
+    def _get_hire_request_row(
+        self,
+        conn: sqlite3.Connection,
+        request_id: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT request_id, project_id, specialist_role, reason, source,
+                   status, created_at, decided_at, decided_by_user_id
+            FROM project_hire_requests
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+
+    def _get_pending_hire_request_row(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+        specialist_role: str,
+        source: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT request_id, project_id, specialist_role, reason, source,
+                   status, created_at, decided_at, decided_by_user_id
+            FROM project_hire_requests
+            WHERE project_id = ?
+              AND specialist_role = ?
+              AND source = ?
+              AND status = 'pending'
+            ORDER BY created_at ASC, request_id ASC
+            LIMIT 1
+            """,
+            (
+                project_id,
+                specialist_role,
+                source,
+            ),
+        ).fetchone()
+
     def _get_project_row_by_id(
         self,
         conn: sqlite3.Connection,
@@ -2663,6 +3018,16 @@ class StateDB:
             raise ValueError(f"non_ascii_{field_name}")
         if not _TASK_ID_RE.fullmatch(normalized):
             raise ValueError(f"invalid_{field_name}:{normalized}")
+        return normalized
+
+    @staticmethod
+    def _normalize_hire_request_id(value: str) -> str:
+        StateDB._validate_non_empty_text(value, "hire_request_id")
+        normalized = value.strip().lower()
+        if not normalized.isascii():
+            raise ValueError(f"invalid_hire_request_id:{normalized}")
+        if not re.fullmatch(r"^[a-z0-9][a-z0-9_-]{0,127}$", normalized):
+            raise ValueError(f"invalid_hire_request_id:{normalized}")
         return normalized
 
     @staticmethod

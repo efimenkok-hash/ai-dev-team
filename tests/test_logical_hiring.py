@@ -84,11 +84,14 @@ def test_run_from_hints_with_empty_hints_returns_no_candidates(tmp_path: Path):
 
 
 def test_run_from_hints_hires_absent_specialist(tmp_path: Path):
-    registry = _registry(tmp_path)
+    immediate_snapshot = _snapshot(
+        policy=_policy(require_owner_approval_for_hires=False),
+    )
+    registry = _registry(tmp_path, snapshot=immediate_snapshot)
     service = LogicalHiringService(registry)
 
     result = service.run_from_hints(
-        _snapshot(),
+        immediate_snapshot,
         _hints(("security_agent", "Auth and secrets are in scope.")),
     )
 
@@ -116,11 +119,14 @@ def test_run_from_hints_returns_already_satisfied_for_existing_role(tmp_path: Pa
 
 
 def test_run_from_hints_hires_multiple_roles_in_deterministic_order(tmp_path: Path):
-    registry = _registry(tmp_path)
+    immediate_snapshot = _snapshot(
+        policy=_policy(require_owner_approval_for_hires=False),
+    )
+    registry = _registry(tmp_path, snapshot=immediate_snapshot)
     service = LogicalHiringService(registry)
 
     result = service.run_from_hints(
-        _snapshot(),
+        immediate_snapshot,
         _hints(
             ("data_agent", "Schema and migrations are risky."),
             ("security_agent", "Secrets and trust boundaries are risky."),
@@ -198,10 +204,8 @@ def test_apply_plan_reloads_current_persisted_roster_before_hiring(
     assert "не потребовался" in result.message_text
 
 
-def test_require_owner_approval_for_hires_does_not_create_pending_flow(tmp_path: Path):
-    approval_snapshot = _snapshot(
-        policy=_policy(require_owner_approval_for_hires=True),
-    )
+def test_require_owner_approval_for_hires_creates_pending_request(tmp_path: Path):
+    approval_snapshot = _snapshot(policy=_policy(require_owner_approval_for_hires=True))
     registry = _registry(tmp_path, snapshot=approval_snapshot)
     service = LogicalHiringService(registry)
 
@@ -210,9 +214,38 @@ def test_require_owner_approval_for_hires_does_not_create_pending_flow(tmp_path:
         _hints(("security_agent", "Auth and secrets are in scope.")),
     )
 
-    assert result.status == "hired"
-    assert result.hired_roles == ("security_agent",)
-    assert "approval flow не запускались" in result.message_text
+    assert result.status == "pending_owner_approval"
+    assert result.hired_roles == ()
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == ()
+    pending = registry.list_pending_hire_requests("alpha_project")
+    assert len(pending) == 1
+    assert pending[0].specialist_role == "security_agent"
+    assert pending[0].source == "logical_hiring_pm_hint"
+    assert pending[0].request_id in result.message_text
+
+
+def test_run_from_hints_reuses_existing_pending_owner_approval_request(
+    tmp_path: Path,
+):
+    approval_snapshot = _snapshot(policy=_policy(require_owner_approval_for_hires=True))
+    registry = _registry(tmp_path, snapshot=approval_snapshot)
+    service = LogicalHiringService(registry)
+
+    first = service.run_from_hints(
+        approval_snapshot,
+        _hints(("security_agent", "Auth and secrets are in scope.")),
+    )
+    second = service.run_from_hints(
+        approval_snapshot,
+        _hints(("security_agent", "Auth and secrets are in scope.")),
+    )
+
+    assert first.status == "pending_owner_approval"
+    assert second.status == "pending_owner_approval"
+    pending = registry.list_pending_hire_requests("alpha_project")
+    assert len(pending) == 1
+    assert pending[0].request_id in first.message_text
+    assert pending[0].request_id in second.message_text
 
 
 def test_logical_hiring_plan_rejects_duplicate_candidates():

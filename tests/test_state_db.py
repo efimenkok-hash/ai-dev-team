@@ -17,6 +17,7 @@ from core.agent_dm_models import (
     AgentDmSession,
 )
 from core.agent_owner_notifications import AgentOwnerNotification
+from core.hire_approval import PendingHireRequest
 from core.project_models import (
     Project,
     ProjectChatBinding,
@@ -73,6 +74,20 @@ def _policy(**overrides: object) -> ProjectPolicy:
     }
     data.update(overrides)
     return ProjectPolicy(**data)
+
+
+def _pending_hire_request(**overrides: object) -> PendingHireRequest:
+    data: dict[str, object] = {
+        "request_id": "hire-1000-abcd1234",
+        "project_id": "alpha_project",
+        "specialist_role": "security_agent",
+        "reason": "Auth and secrets are in scope.",
+        "source": "logical_hiring_pm_hint",
+        "status": "pending",
+        "created_at": 1000.0,
+    }
+    data.update(overrides)
+    return PendingHireRequest(**data)
 
 
 def _membership(**overrides: object) -> ProjectMembership:
@@ -1241,12 +1256,12 @@ def test_constructor_creates_database_file(tmp_path: Path):
 
 def test_schema_version_is_current(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 10
+    assert db.schema_version() == 11
 
 
 def test_fresh_schema_creates_project_tables(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 10
+    assert db.schema_version() == 11
     assert _table_names(db.path) >= {
         "schema_meta",
         "tier_sessions",
@@ -1256,6 +1271,7 @@ def test_fresh_schema_creates_project_tables(tmp_path: Path):
         "project_policies",
         "project_members",
         "project_specialist_roster",
+        "project_hire_requests",
         "project_chat_bindings",
         "project_runtime_bindings",
         "agent_dm_sessions",
@@ -2165,6 +2181,80 @@ def test_project_specialist_methods_reject_invalid_project_id(tmp_path: Path):
         db.get_project_specialist_roster("bad-id")
 
 
+def test_create_hire_request_round_trip_and_list_pending(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+
+    created = db.create_hire_request(_pending_hire_request())
+
+    assert created.status == "pending"
+    assert db.get_hire_request(created.request_id) == created
+    assert db.list_pending_hire_requests("alpha_project") == (created,)
+
+
+def test_create_hire_request_dedupes_identical_pending_request(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+
+    first = db.create_hire_request(_pending_hire_request())
+    second = db.create_hire_request(
+        _pending_hire_request(request_id="hire-1001-efef5678")
+    )
+
+    assert second == first
+    assert len(db.list_pending_hire_requests("alpha_project")) == 1
+
+
+def test_mark_hire_request_approved_adds_specialist_and_clears_pending(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    created = db.create_hire_request(_pending_hire_request())
+
+    approved = db.mark_hire_request_approved(created.request_id, 101)
+
+    assert approved.status == "approved"
+    assert approved.decided_by_user_id == 101
+    assert db.list_project_specialists("alpha_project") == ("security_agent",)
+    assert db.list_pending_hire_requests("alpha_project") == ()
+
+
+def test_mark_hire_request_rejected_keeps_roster_unchanged(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    created = db.create_hire_request(_pending_hire_request())
+
+    rejected = db.mark_hire_request_rejected(created.request_id, 101)
+
+    assert rejected.status == "rejected"
+    assert db.list_project_specialists("alpha_project") == ()
+    assert db.list_pending_hire_requests("alpha_project") == ()
+
+
+def test_mark_hire_request_approved_returns_existing_request_for_repeat_call(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    created = db.create_hire_request(_pending_hire_request())
+    db.mark_hire_request_approved(created.request_id, 101)
+
+    approved = db.mark_hire_request_approved(created.request_id, 101)
+
+    assert approved.status == "approved"
+    assert db.list_project_specialists("alpha_project") == ("security_agent",)
+
+
+def test_hire_request_methods_reject_invalid_public_input(tmp_path: Path):
+    db = _make_db(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid_hire_request_id"):
+        db.get_hire_request("bad id")
+    with pytest.raises(ValueError, match="invalid_project_id"):
+        db.list_pending_hire_requests("bad-id")
+    with pytest.raises(ValueError, match="invalid_hire_approval_actor_user_id"):
+        db.mark_hire_request_approved("hire-123-aaaa", 0)
+
+
 # ---------------------------------------------------------------------------
 # Project chat bindings
 # ---------------------------------------------------------------------------
@@ -2764,7 +2854,7 @@ def test_migrates_v1_schema_with_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 10
+    assert db.schema_version() == 11
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v1")
     assert task is not None
@@ -2785,7 +2875,7 @@ def test_migrates_v1_schema_without_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 10
+    assert db.schema_version() == 11
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(7.5)
 
@@ -2833,7 +2923,7 @@ def test_migrates_v2_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 10
+    assert db.schema_version() == 11
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v2")
     assert task is not None
@@ -2868,7 +2958,7 @@ def test_migrates_v3_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 10
+    assert db.schema_version() == 11
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(9.5)
     task = db.get_task("task-v3")
@@ -2901,7 +2991,7 @@ def test_migrates_v4_schema_to_v5_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 10
+    assert db.schema_version() == 11
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(10.5)
     task = db.get_task("task-v4")
@@ -2932,7 +3022,7 @@ def test_migrates_v5_schema_to_v6_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 10
+    assert db.schema_version() == 11
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -2968,7 +3058,7 @@ def test_migrates_v6_schema_to_v7_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 10
+    assert db.schema_version() == 11
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -3007,7 +3097,7 @@ def test_migrates_v7_schema_to_v9_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 10
+    assert db.schema_version() == 11
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -3055,7 +3145,7 @@ def test_migrates_v8_schema_to_v9_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 10
+    assert db.schema_version() == 11
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -3105,7 +3195,7 @@ def test_migrates_v9_schema_to_v10_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 10
+    assert db.schema_version() == 11
     assert db.get_project("alpha_project") == _project()
     thread = db.get_project_thread("alpha_project", "thread_000001")
     assert thread is not None

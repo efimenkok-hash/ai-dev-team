@@ -56,7 +56,7 @@ COMMAND_DESCRIPTIONS: dict[CommandName, str] = {
     CommandName.SWITCH: "статус project context (/switch [project])",
     CommandName.TEAM: (
         "specialist roster проекта "
-        "(/team [list|add <role>|remove <role>])"
+        "(/team [list|pending|add <role>|remove <role>|approve <request_id>|reject <request_id>])"
     ),
     CommandName.BUDGET: "бюджет (/budget [сумма])",
     CommandName.AGENTS: "текущая команда проекта или baseline template",

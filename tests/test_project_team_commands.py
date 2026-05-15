@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from core.bot_commands import parse_command
+from core.hire_approval import HireApprovalService
 from core.project_models import Project, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_team_commands import (
@@ -104,6 +105,27 @@ def test_parse_team_remove_accepts_specialist_role():
     )
 
 
+def test_parse_team_pending_maps_to_pending():
+    parsed = parse_project_team_command(parse_command("/team pending"))
+    assert parsed == ProjectTeamCommand(action="pending")
+
+
+def test_parse_team_approve_accepts_request_id():
+    parsed = parse_project_team_command(parse_command("/team approve hire-1-abcd"))
+    assert parsed == ProjectTeamCommand(
+        action="approve",
+        request_id="hire-1-abcd",
+    )
+
+
+def test_parse_team_reject_accepts_request_id():
+    parsed = parse_project_team_command(parse_command("/team reject hire-1-abcd"))
+    assert parsed == ProjectTeamCommand(
+        action="reject",
+        request_id="hire-1-abcd",
+    )
+
+
 def test_parse_team_rejects_invalid_subcommand():
     with pytest.raises(ValueError, match="project_team_invalid_subcommand"):
         parse_project_team_command(parse_command("/team hire security_agent"))
@@ -154,6 +176,36 @@ def test_project_team_add_updates_persisted_roster(tmp_path: Path):
     assert "добавлен" in result.message_text.lower()
 
 
+def test_project_team_add_reconciles_matching_pending_hire_request(tmp_path: Path):
+    snapshot = _snapshot()
+    registry = _register_project(tmp_path, snapshot=snapshot)
+    pending = HireApprovalService(registry).request_sensitive_hire(
+        snapshot,
+        "security_agent",
+        "Auth and secrets are in scope.",
+        "logical_hiring_pm_hint",
+    )
+    service = ProjectTeamCommandService(registry)
+
+    add_result = service.handle(
+        ProjectTeamCommand(action="add", specialist_role="security_agent"),
+        _context(snapshot=snapshot),
+    )
+    pending_result = service.handle(
+        ProjectTeamCommand(action="pending"),
+        _context(snapshot=snapshot),
+    )
+
+    assert add_result.roster.specialist_roles == ("security_agent",)
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == (
+        "security_agent",
+    )
+    assert registry.list_pending_hire_requests("alpha_project") == ()
+    assert pending.request_id not in pending_result.message_text
+    assert "Pending hire requests:" in pending_result.message_text
+    assert pending_result.message_text.rstrip().endswith("- none")
+
+
 def test_project_team_remove_updates_persisted_roster(tmp_path: Path):
     registry = _register_project(tmp_path)
     registry.add_project_specialist("alpha_project", "security_agent")
@@ -167,6 +219,73 @@ def test_project_team_remove_updates_persisted_roster(tmp_path: Path):
     assert result.roster.specialist_roles == ()
     assert registry.get_project_specialist_roster("alpha_project").specialist_roles == ()
     assert "удалён" in result.message_text.lower()
+
+
+def test_project_team_pending_renders_request_id_and_role(tmp_path: Path):
+    snapshot = _snapshot()
+    registry = _register_project(tmp_path, snapshot=snapshot)
+    HireApprovalService(registry).request_sensitive_hire(
+        snapshot,
+        "security_agent",
+        "Auth and secrets are in scope.",
+        "logical_hiring_pm_hint",
+    )
+    service = ProjectTeamCommandService(registry)
+
+    result = service.handle(
+        ProjectTeamCommand(action="pending"),
+        _context(snapshot=snapshot),
+    )
+
+    assert "Pending hire requests:" in result.message_text
+    assert "security_agent" in result.message_text
+    assert "hire-" in result.message_text
+
+
+def test_project_team_approve_updates_roster_and_clears_pending(tmp_path: Path):
+    snapshot = _snapshot()
+    registry = _register_project(tmp_path, snapshot=snapshot)
+    approval_service = HireApprovalService(registry)
+    pending = approval_service.request_sensitive_hire(
+        snapshot,
+        "security_agent",
+        "Auth and secrets are in scope.",
+        "logical_hiring_pm_hint",
+    )
+    service = ProjectTeamCommandService(registry)
+
+    result = service.handle(
+        ProjectTeamCommand(action="approve", request_id=pending.request_id),
+        _context(snapshot=snapshot),
+    )
+
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == (
+        "security_agent",
+    )
+    assert registry.list_pending_hire_requests("alpha_project") == ()
+    assert "approved" in result.message_text.lower()
+
+
+def test_project_team_reject_keeps_roster_unchanged_and_clears_pending(tmp_path: Path):
+    snapshot = _snapshot()
+    registry = _register_project(tmp_path, snapshot=snapshot)
+    approval_service = HireApprovalService(registry)
+    pending = approval_service.request_sensitive_hire(
+        snapshot,
+        "security_agent",
+        "Auth and secrets are in scope.",
+        "logical_hiring_pm_hint",
+    )
+    service = ProjectTeamCommandService(registry)
+
+    result = service.handle(
+        ProjectTeamCommand(action="reject", request_id=pending.request_id),
+        _context(snapshot=snapshot),
+    )
+
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == ()
+    assert registry.list_pending_hire_requests("alpha_project") == ()
+    assert "отклонён" in result.message_text.lower()
 
 
 def test_project_team_duplicate_add_is_rejected_truthfully(tmp_path: Path):
@@ -209,6 +328,24 @@ def test_project_team_non_owner_cannot_mutate(tmp_path: Path):
         )
 
 
+def test_project_team_non_owner_cannot_approve_or_reject(tmp_path: Path):
+    snapshot = _snapshot()
+    registry = _register_project(tmp_path, snapshot=snapshot)
+    pending = HireApprovalService(registry).request_sensitive_hire(
+        snapshot,
+        "security_agent",
+        "Auth and secrets are in scope.",
+        "logical_hiring_pm_hint",
+    )
+    service = ProjectTeamCommandService(registry)
+
+    with pytest.raises(ValueError, match="project_team_mutation_requires_owner"):
+        service.handle(
+            ProjectTeamCommand(action="approve", request_id=pending.request_id),
+            _context(snapshot=snapshot, actor_user_id=999),
+        )
+
+
 def test_project_team_allow_hiring_false_blocks_mutation(tmp_path: Path):
     registry = _register_project(
         tmp_path,
@@ -224,6 +361,45 @@ def test_project_team_allow_hiring_false_blocks_mutation(tmp_path: Path):
             ProjectTeamCommand(action="add", specialist_role="security_agent"),
             _context(snapshot=_snapshot(policy=_policy(allow_hiring=False))),
         )
+
+
+def test_project_team_add_reloads_persisted_policy_before_mutation(tmp_path: Path):
+    snapshot = _snapshot(policy=_policy(allow_hiring=True))
+    registry = _register_project(tmp_path, snapshot=snapshot)
+    registry.set_project_policy(_policy(allow_hiring=False))
+    service = ProjectTeamCommandService(registry)
+
+    with pytest.raises(
+        ValueError,
+        match="project_team_mutation_disallowed_by_policy",
+    ):
+        service.handle(
+            ProjectTeamCommand(action="add", specialist_role="security_agent"),
+            _context(snapshot=snapshot),
+        )
+
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == ()
+
+
+def test_project_team_remove_reloads_persisted_policy_before_mutation(tmp_path: Path):
+    snapshot = _snapshot(policy=_policy(allow_hiring=True))
+    registry = _register_project(tmp_path, snapshot=snapshot)
+    registry.add_project_specialist("alpha_project", "security_agent")
+    registry.set_project_policy(_policy(allow_hiring=False))
+    service = ProjectTeamCommandService(registry)
+
+    with pytest.raises(
+        ValueError,
+        match="project_team_mutation_disallowed_by_policy",
+    ):
+        service.handle(
+            ProjectTeamCommand(action="remove", specialist_role="security_agent"),
+            _context(snapshot=snapshot),
+        )
+
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == (
+        "security_agent",
+    )
 
 
 def test_project_team_context_rejects_invalid_context_source():

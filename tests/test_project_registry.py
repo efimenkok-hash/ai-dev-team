@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from core.hire_approval import PendingHireRequest
 from core.project_models import (
     Project,
     ProjectChatBinding,
@@ -106,6 +107,20 @@ def _snapshot(**overrides: object) -> ProjectSnapshot:
     }
     data.update(overrides)
     return ProjectSnapshot(**data)
+
+
+def _pending_hire_request(**overrides: object) -> PendingHireRequest:
+    data: dict[str, object] = {
+        "request_id": "hire-1000-abcd1234",
+        "project_id": "alpha_project",
+        "specialist_role": "security_agent",
+        "reason": "Auth and secrets are in scope.",
+        "source": "logical_hiring_pm_hint",
+        "status": "pending",
+        "created_at": 1000.0,
+    }
+    data.update(overrides)
+    return PendingHireRequest(**data)
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +350,38 @@ def test_registry_project_specialist_roster_is_isolated_per_project(
         "security_agent",
     )
     assert registry.get_project_specialist_roster("beta_project").specialist_roles == ()
+
+
+def test_registry_pending_hire_request_round_trip_and_approval(
+    tmp_path: Path,
+):
+    registry = ProjectRegistry(_make_db(tmp_path))
+    registry.register_project(_snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path))))
+
+    created = registry.create_pending_hire_request(_pending_hire_request())
+    assert registry.get_hire_request(created.request_id) == created
+    assert registry.list_pending_hire_requests("alpha_project") == (created,)
+
+    approved = registry.approve_hire_request(created.request_id, 101)
+
+    assert approved.status == "approved"
+    assert registry.list_pending_hire_requests("alpha_project") == ()
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == (
+        "security_agent",
+    )
+
+
+def test_registry_pending_hire_requests_persist_across_instances(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    first = ProjectRegistry(db)
+    first.register_project(_snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path))))
+    created = first.create_pending_hire_request(_pending_hire_request())
+
+    second = ProjectRegistry(StateDB(db.path))
+
+    assert second.list_pending_hire_requests("alpha_project") == (created,)
 
 
 def test_register_project_saves_snapshot_without_policy(tmp_path: Path):
@@ -729,3 +776,5 @@ def test_registry_mutation_methods_reject_bad_public_input_types(tmp_path: Path)
         registry.bind_project_chat("bad")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="invalid_project_runtime_binding_type"):
         registry.set_project_runtime_binding("bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="invalid_pending_hire_request_type"):
+        registry.create_pending_hire_request("bad")  # type: ignore[arg-type]

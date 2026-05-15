@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from core.hire_approval import PendingHireRequest
 from core.project_models import (
     Project,
     ProjectChatBinding,
@@ -223,6 +224,44 @@ class ProjectRegistry:
     ) -> ProjectSpecialistRoster:
         self._state_db.remove_project_specialist(project_id, specialist_role)
         return self._state_db.get_project_specialist_roster(project_id)
+
+    def create_pending_hire_request(
+        self,
+        request: PendingHireRequest,
+    ) -> PendingHireRequest:
+        return self._state_db.create_hire_request(request)
+
+    def get_hire_request(
+        self,
+        request_id: str,
+    ) -> PendingHireRequest | None:
+        return self._state_db.get_hire_request(request_id)
+
+    def list_pending_hire_requests(
+        self,
+        project_id: str,
+    ) -> tuple[PendingHireRequest, ...]:
+        return self._state_db.list_pending_hire_requests(project_id)
+
+    def approve_hire_request(
+        self,
+        request_id: str,
+        actor_user_id: int,
+    ) -> PendingHireRequest:
+        return self._state_db.mark_hire_request_approved(
+            request_id,
+            actor_user_id,
+        )
+
+    def reject_hire_request(
+        self,
+        request_id: str,
+        actor_user_id: int,
+    ) -> PendingHireRequest:
+        return self._state_db.mark_hire_request_rejected(
+            request_id,
+            actor_user_id,
+        )
 
     def set_project_runtime_binding(
         self,

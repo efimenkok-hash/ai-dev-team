@@ -53,6 +53,7 @@ from core.bot_runner import (
 )
 from core.confirmation_gate import ConfirmationGate
 from core.coordinator_role import COORDINATOR_ROLE
+from core.hire_approval import HireApprovalService
 from core.llm_dispatcher import (
     LLMAttempt,
     LLMDispatcher,
@@ -2570,6 +2571,253 @@ def test_team_command_owner_dm_single_project_list_add_remove_work(tmp_path):
     assert registry.get_project_specialist_roster("alpha_project").specialist_roles == ()
 
 
+def test_team_pending_approve_and_reject_work_for_owner(tmp_path):
+    db = StateDB(tmp_path / "team-pending-owner.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "team-pending-owner-repo")
+    snapshot = _project_snapshot(
+        repo,
+        project=_project(owner_user_id=777),
+        policy=_policy(project_id="alpha_project"),
+        chat_binding=_chat_binding(chat_id=-100123450907),
+    )
+    registry.register_project(snapshot)
+    pending = HireApprovalService(registry).request_sensitive_hire(
+        snapshot,
+        "security_agent",
+        "Auth and secrets are in scope.",
+        "logical_hiring_pm_hint",
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: BridgeReply(
+            persona_role="architect_agent",
+            body="task ok",
+        ),
+        project_context_resolver=resolver,
+    )
+
+    pending_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450907,
+            user_id=777,
+            message_id=1,
+            text="/team pending",
+        )
+    )
+    approve_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450907,
+            user_id=777,
+            message_id=2,
+            text=f"/team approve {pending.request_id}",
+        )
+    )
+    list_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450907,
+            user_id=777,
+            message_id=3,
+            text="/team list",
+        )
+    )
+
+    assert pending_result.reason == "command"
+    assert approve_result.reason == "command"
+    assert list_result.reason == "command"
+    assert pending.request_id in captured[0].text
+    assert "security_agent" in captured[0].text
+    assert "approved" in captured[1].text.lower()
+    assert "security_agent" in captured[2].text
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == (
+        "security_agent",
+    )
+
+    second_pending = HireApprovalService(registry).request_sensitive_hire(
+        snapshot,
+        "devops_agent",
+        "Deployability is in scope.",
+        "logical_hiring_pm_hint",
+    )
+    reject_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450907,
+            user_id=777,
+            message_id=4,
+            text=f"/team reject {second_pending.request_id}",
+        )
+    )
+
+    assert reject_result.reason == "command"
+    assert "отклонён" in captured[3].text.lower()
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == (
+        "security_agent",
+    )
+
+
+def test_team_add_reconciles_matching_pending_request_for_owner(tmp_path):
+    db = StateDB(tmp_path / "team-add-reconciles-pending.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "team-add-reconciles-pending-repo")
+    snapshot = _project_snapshot(
+        repo,
+        project=_project(owner_user_id=777),
+        policy=_policy(project_id="alpha_project"),
+        chat_binding=_chat_binding(chat_id=-100123450910),
+    )
+    registry.register_project(snapshot)
+    pending = HireApprovalService(registry).request_sensitive_hire(
+        snapshot,
+        "security_agent",
+        "Auth and secrets are in scope.",
+        "logical_hiring_pm_hint",
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: BridgeReply(
+            persona_role="architect_agent",
+            body="task ok",
+        ),
+        project_context_resolver=resolver,
+    )
+
+    add_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450910,
+            user_id=777,
+            message_id=1,
+            text="/team add security_agent",
+        )
+    )
+    pending_result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450910,
+            user_id=777,
+            message_id=2,
+            text="/team pending",
+        )
+    )
+
+    assert add_result.reason == "command"
+    assert pending_result.reason == "command"
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == (
+        "security_agent",
+    )
+    assert registry.list_pending_hire_requests("alpha_project") == ()
+    assert "security_agent" in captured[0].text
+    assert "marked approved" in captured[0].text
+    assert pending.request_id not in captured[1].text
+    assert "Pending hire requests:" in captured[1].text
+    assert captured[1].text.rstrip().endswith("- none")
+
+
+def test_team_pending_empty_renders_none(tmp_path):
+    db = StateDB(tmp_path / "team-pending-empty.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "team-pending-empty-repo")
+    registry.register_project(
+        _project_snapshot(
+            repo,
+            project=_project(owner_user_id=777),
+            policy=_policy(project_id="alpha_project"),
+            chat_binding=_chat_binding(chat_id=-100123450908),
+        )
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: BridgeReply(
+            persona_role="architect_agent",
+            body="task ok",
+        ),
+        project_context_resolver=resolver,
+    )
+
+    result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450908,
+            user_id=777,
+            message_id=1,
+            text="/team pending",
+        )
+    )
+
+    assert result.reason == "command"
+    assert "Pending hire requests:" in captured[0].text
+    assert "- none" in captured[0].text
+
+
+def test_team_approve_and_reject_require_owner(tmp_path):
+    db = StateDB(tmp_path / "team-approve-non-owner.db")
+    registry = ProjectRegistry(db)
+    repo = _git_repo(tmp_path, "team-approve-non-owner-repo")
+    snapshot = _project_snapshot(
+        repo,
+        project=_project(owner_user_id=777),
+        policy=_policy(project_id="alpha_project"),
+        chat_binding=_chat_binding(chat_id=-100123450909),
+    )
+    registry.register_project(snapshot)
+    pending = HireApprovalService(registry).request_sensitive_hire(
+        snapshot,
+        "security_agent",
+        "Auth and secrets are in scope.",
+        "logical_hiring_pm_hint",
+    )
+    resolver = ProjectContextResolver(registry, (777,))
+    commands = build_command_registry(
+        default_registry(),
+        project_context_resolver=resolver,
+    )
+    send, captured = _captured_send()
+    bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=send,
+        commands=commands,
+        task_handler=lambda text, msg: BridgeReply(
+            persona_role="architect_agent",
+            body="task ok",
+        ),
+        project_context_resolver=resolver,
+    )
+
+    result = bridge.handle(
+        IncomingMessage(
+            chat_id=-100123450909,
+            user_id=999,
+            message_id=1,
+            text=f"/team approve {pending.request_id}",
+        )
+    )
+
+    assert result.reason == "command"
+    assert "только owner" in captured[0].text.lower()
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == ()
+
+
 def test_team_command_in_ambiguous_owner_dm_does_not_guess_project(tmp_path):
     db = StateDB(tmp_path / "team-ambiguous.db")
     registry = ProjectRegistry(db)
@@ -2639,7 +2887,10 @@ def test_team_list_shows_specialist_added_by_logical_hiring_after_restart(
     snapshot = _project_snapshot(
         repo,
         project=_project(owner_user_id=777),
-        policy=_policy(project_id="alpha_project"),
+        policy=_policy(
+            project_id="alpha_project",
+            require_owner_approval_for_hires=False,
+        ),
         chat_binding=_chat_binding(chat_id=-100123450906),
     )
     registry.register_project(snapshot)
