@@ -24,6 +24,7 @@ from core.project_models import (
     ProjectPolicy,
 )
 from core.project_runtime import ProjectRuntimeBinding
+from core.project_team_state import ProjectSpecialistRoster
 from core.state_db import StateDB
 from core.task_history import TaskSummary
 
@@ -1090,6 +1091,127 @@ def _build_v8_db(path: Path, repo_path: Path) -> None:
         conn.close()
 
 
+def _build_v9_db(path: Path, repo_path: Path) -> None:
+    _build_v8_db(path, repo_path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE project_threads (
+                project_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                opened_by_role TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                last_message_at REAL NOT NULL,
+                task_id TEXT NULL,
+                PRIMARY KEY(project_id, thread_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE agent_bus_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                sender_role TEXT NOT NULL,
+                recipient_role TEXT NOT NULL,
+                message_kind TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                in_reply_to_project_id TEXT NULL,
+                in_reply_to_thread_id TEXT NULL,
+                in_reply_to_message_id TEXT NULL,
+                UNIQUE(project_id, thread_id, message_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX idx_project_threads_project_activity
+            ON project_threads(project_id, last_message_at DESC, thread_id ASC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX idx_agent_bus_messages_thread_id_asc
+            ON agent_bus_messages(project_id, thread_id, id ASC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX idx_agent_bus_messages_inbox_id_asc
+            ON agent_bus_messages(project_id, recipient_role, id ASC)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO project_threads(
+                project_id,
+                thread_id,
+                opened_by_role,
+                status,
+                created_at,
+                last_message_at,
+                task_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "alpha_project",
+                "thread_000001",
+                "coordinator_agent",
+                "open",
+                1000.0,
+                1001.0,
+                "task-v9",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_bus_messages(
+                project_id,
+                thread_id,
+                message_id,
+                sender_role,
+                recipient_role,
+                message_kind,
+                body,
+                created_at,
+                in_reply_to_project_id,
+                in_reply_to_thread_id,
+                in_reply_to_message_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "alpha_project",
+                "thread_000001",
+                "msg_000001",
+                "coordinator_agent",
+                "writer_agent",
+                "request",
+                "Need a first draft",
+                1001.0,
+                None,
+                None,
+                None,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE schema_meta
+            SET value = '9'
+            WHERE key = 'schema_version'
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Construction / schema
 # ---------------------------------------------------------------------------
@@ -1119,12 +1241,12 @@ def test_constructor_creates_database_file(tmp_path: Path):
 
 def test_schema_version_is_current(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 9
+    assert db.schema_version() == 10
 
 
 def test_fresh_schema_creates_project_tables(tmp_path: Path):
     db = _make_db(tmp_path)
-    assert db.schema_version() == 9
+    assert db.schema_version() == 10
     assert _table_names(db.path) >= {
         "schema_meta",
         "tier_sessions",
@@ -1133,6 +1255,7 @@ def test_fresh_schema_creates_project_tables(tmp_path: Path):
         "projects",
         "project_policies",
         "project_members",
+        "project_specialist_roster",
         "project_chat_bindings",
         "project_runtime_bindings",
         "agent_dm_sessions",
@@ -1172,6 +1295,10 @@ def test_fresh_schema_creates_project_tables(tmp_path: Path):
         "member_type",
         "role_name",
         "status",
+    ]
+    assert _table_columns(db.path, "project_specialist_roster") == [
+        "project_id",
+        "specialist_role",
     ]
     assert _table_columns(db.path, "project_chat_bindings") == [
         "project_id",
@@ -1931,6 +2058,114 @@ def test_membership_methods_reject_invalid_project_or_member_id(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Project specialist roster
+# ---------------------------------------------------------------------------
+
+
+def test_project_specialist_roster_round_trip_with_empty_default(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+
+    assert db.get_project_specialist_roster("alpha_project") == (
+        ProjectSpecialistRoster(
+            project_id="alpha_project",
+            specialist_roles=(),
+        )
+    )
+
+
+def test_add_project_specialist_persists_and_orders_roles(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+
+    db.add_project_specialist("alpha_project", "data_agent")
+    db.add_project_specialist("alpha_project", "security_agent")
+
+    assert db.list_project_specialists("alpha_project") == (
+        "security_agent",
+        "data_agent",
+    )
+
+
+def test_remove_project_specialist_persists(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.add_project_specialist("alpha_project", "security_agent")
+
+    db.remove_project_specialist("alpha_project", "security_agent")
+
+    assert db.list_project_specialists("alpha_project") == ()
+
+
+def test_project_specialist_roster_persists_across_db_instances(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.add_project_specialist("alpha_project", "security_agent")
+    db.add_project_specialist("alpha_project", "devops_agent")
+
+    reopened = StateDB(db.path)
+
+    assert reopened.get_project_specialist_roster("alpha_project") == (
+        ProjectSpecialistRoster(
+            project_id="alpha_project",
+            specialist_roles=("security_agent", "devops_agent"),
+        )
+    )
+
+
+def test_project_specialist_roster_is_isolated_per_project(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project(project_id="alpha_project", slug="alpha-project"))
+    db.upsert_project(_project(project_id="beta_project", slug="beta-project"))
+    db.add_project_specialist("alpha_project", "security_agent")
+
+    assert db.list_project_specialists("alpha_project") == ("security_agent",)
+    assert db.list_project_specialists("beta_project") == ()
+
+
+def test_add_project_specialist_rejects_duplicate_assignment(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+    db.add_project_specialist("alpha_project", "security_agent")
+
+    with pytest.raises(
+        ValueError,
+        match="duplicate_project_specialist:alpha_project:security_agent",
+    ):
+        db.add_project_specialist("alpha_project", "security_agent")
+
+
+def test_remove_project_specialist_rejects_absent_assignment(tmp_path: Path):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+
+    with pytest.raises(
+        ValueError,
+        match="unknown_project_specialist:alpha_project:security_agent",
+    ):
+        db.remove_project_specialist("alpha_project", "security_agent")
+
+
+@pytest.mark.parametrize("role", ("writer_agent", "coordinator_agent", "ghost_agent"))
+def test_project_specialist_methods_reject_non_specialist_roles(
+    tmp_path: Path,
+    role: str,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project())
+
+    with pytest.raises(ValueError, match=fr"unknown_specialist_role:{role}"):
+        db.add_project_specialist("alpha_project", role)
+
+
+def test_project_specialist_methods_reject_invalid_project_id(tmp_path: Path):
+    db = _make_db(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid_project_id"):
+        db.get_project_specialist_roster("bad-id")
+
+
+# ---------------------------------------------------------------------------
 # Project chat bindings
 # ---------------------------------------------------------------------------
 
@@ -2519,7 +2754,7 @@ def test_trim_agent_dm_messages_supports_manual_windowing(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v1 -> v9
+# Migration v1 -> v10
 # ---------------------------------------------------------------------------
 
 
@@ -2529,7 +2764,7 @@ def test_migrates_v1_schema_with_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 9
+    assert db.schema_version() == 10
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v1")
     assert task is not None
@@ -2550,7 +2785,7 @@ def test_migrates_v1_schema_without_schema_meta(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 9
+    assert db.schema_version() == 10
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(7.5)
 
@@ -2588,7 +2823,7 @@ def test_v1_migration_adds_autoincrement_id_to_task_history(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v2 -> v9
+# Migration v2 -> v10
 # ---------------------------------------------------------------------------
 
 
@@ -2598,7 +2833,7 @@ def test_migrates_v2_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 9
+    assert db.schema_version() == 10
     assert db.get_tier(1) == "STANDARD"
     task = db.get_task("task-v2")
     assert task is not None
@@ -2623,7 +2858,7 @@ def test_v2_migration_adds_project_tables(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v3 -> v9
+# Migration v3 -> v10
 # ---------------------------------------------------------------------------
 
 
@@ -2633,7 +2868,7 @@ def test_migrates_v3_schema_to_v4_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 9
+    assert db.schema_version() == 10
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(9.5)
     task = db.get_task("task-v3")
@@ -2656,7 +2891,7 @@ def test_v3_migration_adds_project_runtime_bindings_table(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v4 -> v9
+# Migration v4 -> v10
 # ---------------------------------------------------------------------------
 
 
@@ -2666,7 +2901,7 @@ def test_migrates_v4_schema_to_v5_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 9
+    assert db.schema_version() == 10
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(10.5)
     task = db.get_task("task-v4")
@@ -2686,7 +2921,7 @@ def test_v4_migration_adds_task_history_project_id_column(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v5 -> v9
+# Migration v5 -> v10
 # ---------------------------------------------------------------------------
 
 
@@ -2697,7 +2932,7 @@ def test_migrates_v5_schema_to_v6_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 9
+    assert db.schema_version() == 10
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -2722,7 +2957,7 @@ def test_v5_migration_adds_agent_dm_sessions_table(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v6 -> v9
+# Migration v6 -> v10
 # ---------------------------------------------------------------------------
 
 
@@ -2733,7 +2968,7 @@ def test_migrates_v6_schema_to_v7_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 9
+    assert db.schema_version() == 10
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -2761,7 +2996,7 @@ def test_v6_migration_adds_agent_dm_messages_table(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v7 -> v9
+# Migration v7 -> v10
 # ---------------------------------------------------------------------------
 
 
@@ -2772,7 +3007,7 @@ def test_migrates_v7_schema_to_v9_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 9
+    assert db.schema_version() == 10
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -2809,7 +3044,7 @@ def test_v7_migration_adds_agent_owner_notifications_table(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Migration v8 -> v9
+# Migration v8 -> v10
 # ---------------------------------------------------------------------------
 
 
@@ -2820,7 +3055,7 @@ def test_migrates_v8_schema_to_v9_and_preserves_existing_data(tmp_path: Path):
 
     db = StateDB(db_path)
 
-    assert db.schema_version() == 9
+    assert db.schema_version() == 10
     assert db.get_tier(1) == "STANDARD"
     assert db.get_budget(1) == pytest.approx(11.5)
     task = db.get_task("task-v5")
@@ -2855,3 +3090,46 @@ def test_v8_migration_adds_agent_bus_tables(tmp_path: Path):
 
     assert "project_threads" in _table_names(db_path)
     assert "agent_bus_messages" in _table_names(db_path)
+    assert "project_specialist_roster" in _table_names(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Migration v9 -> v10
+# ---------------------------------------------------------------------------
+
+
+def test_migrates_v9_schema_to_v10_and_preserves_existing_data(tmp_path: Path):
+    db_path = tmp_path / "v9.db"
+    repo = _git_repo(tmp_path, "v9-repo")
+    _build_v9_db(db_path, repo)
+
+    db = StateDB(db_path)
+
+    assert db.schema_version() == 10
+    assert db.get_project("alpha_project") == _project()
+    thread = db.get_project_thread("alpha_project", "thread_000001")
+    assert thread is not None
+    assert thread.task_id == "task-v9"
+    message = db.get_agent_bus_message(
+        "alpha_project",
+        "thread_000001",
+        "msg_000001",
+    )
+    assert message is not None
+    assert message.body == "Need a first draft"
+    assert db.get_project_specialist_roster("alpha_project") == (
+        ProjectSpecialistRoster(
+            project_id="alpha_project",
+            specialist_roles=(),
+        )
+    )
+
+
+def test_v9_migration_adds_project_specialist_roster_table(tmp_path: Path):
+    db_path = tmp_path / "v9-roster.db"
+    repo = _git_repo(tmp_path, "v9-roster-repo")
+    _build_v9_db(db_path, repo)
+
+    StateDB(db_path)
+
+    assert "project_specialist_roster" in _table_names(db_path)

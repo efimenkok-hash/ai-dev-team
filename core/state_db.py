@@ -19,14 +19,14 @@ Design goals:
 CONTRACTS:
 1. StateDB(path) requires a Path; constructor creates parent directories and
    initializes/migrates the schema eagerly.
-2. Current schema version is 9. Unknown future versions raise ValueError.
+2. Current schema version is 10. Unknown future versions raise ValueError.
 3. Every public method validates arguments via isinstance/ValueError.
 4. Writes are serialized with a process-local lock; reads use independent
    SQLite connections and remain safe under concurrent access.
 5. task_history keeps an append-only audit log. get_task(task_id) returns the
    newest record for that task_id; recent_tasks(n) returns newest-last order.
 6. schema migration supports v1 -> v2 -> v3 -> v4 -> v5 -> v6 -> v7 -> v8
-   -> v9:
+   -> v9 -> v10:
    - v1 -> v2: tier_sessions.tier_name -> active_tier
    - v1 -> v2: task_history gains AUTOINCREMENT id for stable append-order
      semantics
@@ -40,6 +40,8 @@ CONTRACTS:
      notifications that can be delivered later into an active agent thread
    - v8 -> v9: adds project_threads and agent_bus_messages for durable
      backend agent-bus history
+   - v9 -> v10: adds project_specialist_roster for persisted per-project
+     optional specialist assignments
 7. Identity model is explicit:
    - Project.owner_user_id is a positive Telegram owner user id stored in
      projects.owner_user_id.
@@ -77,9 +79,13 @@ from core.project_models import (
     ProjectPolicy,
 )
 from core.project_runtime import ProjectRuntimeBinding
+from core.project_team_state import (
+    ProjectSpecialistAssignment,
+    ProjectSpecialistRoster,
+)
 from core.task_history import TaskSummary
 
-_CURRENT_SCHEMA_VERSION = 9
+_CURRENT_SCHEMA_VERSION = 10
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -151,6 +157,14 @@ CREATE TABLE IF NOT EXISTS project_members (
     role_name TEXT NOT NULL,
     status TEXT NOT NULL,
     PRIMARY KEY(project_id, member_id)
+)
+"""
+
+_CREATE_PROJECT_SPECIALIST_ROSTER = """
+CREATE TABLE IF NOT EXISTS project_specialist_roster (
+    project_id TEXT NOT NULL,
+    specialist_role TEXT NOT NULL,
+    PRIMARY KEY(project_id, specialist_role)
 )
 """
 
@@ -642,6 +656,57 @@ class StateDB:
             for row in rows
             if row is not None
         ]
+
+    def list_project_specialists(
+        self,
+        project_id: str,
+    ) -> tuple[str, ...]:
+        return self.get_project_specialist_roster(project_id).specialist_roles
+
+    def add_project_specialist(
+        self,
+        project_id: str,
+        specialist_role: str,
+    ) -> None:
+        assignment = ProjectSpecialistAssignment(
+            project_id=project_id,
+            specialist_role=specialist_role,
+        )
+        self._run_write_transaction(
+            lambda conn: self._add_project_specialist_conn(conn, assignment)
+        )
+
+    def remove_project_specialist(
+        self,
+        project_id: str,
+        specialist_role: str,
+    ) -> None:
+        assignment = ProjectSpecialistAssignment(
+            project_id=project_id,
+            specialist_role=specialist_role,
+        )
+        self._run_write_transaction(
+            lambda conn: self._remove_project_specialist_conn(conn, assignment)
+        )
+
+    def get_project_specialist_roster(
+        self,
+        project_id: str,
+    ) -> ProjectSpecialistRoster:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        with self._connect() as conn:
+            self._ensure_project_exists(conn, normalized_project_id)
+            specialist_roles = self._list_project_specialist_roles_conn(
+                conn,
+                normalized_project_id,
+            )
+        return ProjectSpecialistRoster(
+            project_id=normalized_project_id,
+            specialist_roles=specialist_roles,
+        )
 
     def bind_project_chat(self, binding: ProjectChatBinding) -> None:
         if not isinstance(binding, ProjectChatBinding):
@@ -1173,7 +1238,7 @@ class StateDB:
         with self._lock, self._connect() as conn:
             version = self._detect_schema_version(conn)
             if version == 0:
-                self._create_v9_schema(conn)
+                self._create_v10_schema(conn)
                 return
             if version > _CURRENT_SCHEMA_VERSION:
                 raise ValueError(
@@ -1212,9 +1277,13 @@ class StateDB:
                     self._migrate_v8_to_v9(conn)
                     version = 9
                     continue
+                if version == 9:
+                    self._migrate_v9_to_v10(conn)
+                    version = 10
+                    continue
                 raise ValueError(f"unsupported_schema_version:{version}")
 
-    def _create_v9_schema(self, conn: sqlite3.Connection) -> None:
+    def _create_v10_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE_SCHEMA_META)
         conn.execute(_CREATE_TIER_SESSIONS)
         conn.execute(_CREATE_TASK_HISTORY)
@@ -1222,6 +1291,7 @@ class StateDB:
         conn.execute(_CREATE_PROJECTS)
         conn.execute(_CREATE_PROJECT_POLICIES)
         conn.execute(_CREATE_PROJECT_MEMBERS)
+        conn.execute(_CREATE_PROJECT_SPECIALIST_ROSTER)
         conn.execute(_CREATE_PROJECT_CHAT_BINDINGS)
         conn.execute(_CREATE_PROJECT_RUNTIME_BINDINGS)
         conn.execute(_CREATE_AGENT_DM_SESSIONS)
@@ -1285,6 +1355,10 @@ class StateDB:
         conn.execute(_CREATE_INDEX_AGENT_BUS_MESSAGES_THREAD_ID)
         conn.execute(_CREATE_INDEX_AGENT_BUS_MESSAGES_INBOX_ID)
         self._set_schema_version(conn, 9)
+
+    def _migrate_v9_to_v10(self, conn: sqlite3.Connection) -> None:
+        conn.execute(_CREATE_PROJECT_SPECIALIST_ROSTER)
+        self._set_schema_version(conn, 10)
 
     def _migrate_tier_sessions_to_v2(self, conn: sqlite3.Connection) -> None:
         columns = self._table_columns(conn, "tier_sessions")
@@ -1771,6 +1845,54 @@ class StateDB:
                 membership.status,
             ),
         )
+
+    def _add_project_specialist_conn(
+        self,
+        conn: sqlite3.Connection,
+        assignment: ProjectSpecialistAssignment,
+    ) -> None:
+        self._ensure_project_exists(conn, assignment.project_id)
+        try:
+            conn.execute(
+                """
+                INSERT INTO project_specialist_roster(
+                    project_id,
+                    specialist_role
+                )
+                VALUES (?, ?)
+                """,
+                (
+                    assignment.project_id,
+                    assignment.specialist_role,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                "duplicate_project_specialist:"
+                f"{assignment.project_id}:{assignment.specialist_role}"
+            ) from exc
+
+    def _remove_project_specialist_conn(
+        self,
+        conn: sqlite3.Connection,
+        assignment: ProjectSpecialistAssignment,
+    ) -> None:
+        self._ensure_project_exists(conn, assignment.project_id)
+        cursor = conn.execute(
+            """
+            DELETE FROM project_specialist_roster
+            WHERE project_id = ? AND specialist_role = ?
+            """,
+            (
+                assignment.project_id,
+                assignment.specialist_role,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError(
+                "unknown_project_specialist:"
+                f"{assignment.project_id}:{assignment.specialist_role}"
+            )
 
     def _bind_project_chat_conn(
         self,
@@ -2325,6 +2447,22 @@ class StateDB:
             """,
             (project_id, thread_id, message_id),
         ).fetchone()
+
+    def _list_project_specialist_roles_conn(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+    ) -> tuple[str, ...]:
+        rows = conn.execute(
+            """
+            SELECT specialist_role
+            FROM project_specialist_roster
+            WHERE project_id = ?
+            ORDER BY specialist_role ASC
+            """,
+            (project_id,),
+        ).fetchall()
+        return tuple(str(row["specialist_role"]) for row in rows)
 
     def _get_project_row_by_id(
         self,

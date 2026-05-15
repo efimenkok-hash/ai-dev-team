@@ -115,6 +115,7 @@ from core.project_runtime_router import (
     ResolvedProjectRuntime,
     describe_project_runtime_error,
 )
+from core.project_team_state import ProjectSpecialistRoster
 from core.runtime_validator import RuntimeValidator, ValidationStrategy
 from core.sandbox_runtime_hook import make_sandbox_hook
 from core.sandbox_workspace import (
@@ -652,14 +653,21 @@ def make_real_task_handler(
 
     def _build_initial_artifacts(
         onboarding_context: ProjectCaptainOnboardingContext | None,
+        project_specialist_roster: ProjectSpecialistRoster | None = None,
     ) -> dict[str, str] | None:
         if onboarding_context is None:
             return None
+        if project_specialist_roster is None:
+            project_specialist_roster = ProjectSpecialistRoster(
+                project_id=onboarding_context.snapshot.project.project_id,
+                specialist_roles=(),
+            )
         team_assembly_context = CoordinatorTeamAssemblyContext(
             snapshot=onboarding_context.snapshot,
             owner_task_text=onboarding_context.owner_task_text,
             context_source=onboarding_context.context_source,
             personas=personas,
+            project_specialist_roster=project_specialist_roster,
             specialization_hints=SpecializationHints.empty(),
         )
         team_assembly = team_assembly_service.assemble_team(
@@ -1071,7 +1079,17 @@ def make_real_task_handler(
                 onboarding_context,
                 owner_task_text=text,
             )
-            initial_artifacts = _build_initial_artifacts(onboarding_context)
+            project_specialist_roster = (
+                None
+                if resolved_runtime is None
+                else runtime_router.registry.get_project_specialist_roster(
+                    resolved_runtime.snapshot.project.project_id
+                )
+            )
+            initial_artifacts = _build_initial_artifacts(
+                onboarding_context,
+                project_specialist_roster,
+            )
         except ValueError as exc:
             return BridgeReply(
                 persona_role=COORDINATOR_ROLE,

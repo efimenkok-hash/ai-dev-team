@@ -844,8 +844,9 @@ def test_bound_project_chat_seeds_coordinator_artifacts_before_planning(
     assert "assembly_mode: baseline_internal_team" in seen["proposal"]
     assert "coordinator_agent" in seen["proposal"]
     assert "project captain" in seen["proposal"].lower()
-    assert "Specialization hints:" in seen["proposal"]
+    assert "Project specialists:" in seen["proposal"]
     assert "- none" in seen["proposal"]
+    assert "Specialization hints:" in seen["proposal"]
     assert memory.get_artifact(task_id, "team_proposal") == seen["proposal"]
 
 
@@ -921,8 +922,87 @@ def test_owner_dm_single_project_seeds_coordinator_artifacts_before_planning(
     assert "assembly_mode: baseline_internal_team" in seen["proposal"]
     assert "owner DM fallback" in seen["proposal"]
     assert "Prepare the release branch." in seen["proposal"]
-    assert "Specialization hints:" in seen["proposal"]
+    assert "Project specialists:" in seen["proposal"]
     assert "- none" in seen["proposal"]
+    assert "Specialization hints:" in seen["proposal"]
+
+
+def test_project_aware_path_injects_current_project_specialists_into_proposal_surface(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send, _captured = _make_progress_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="bound-roster-brief.db",
+    )
+    runtime_router.registry.add_project_specialist(
+        "alpha_project",
+        "security_agent",
+    )
+    runtime_router.registry.add_project_specialist(
+        "alpha_project",
+        "data_agent",
+    )
+    task_id = "task-bound-roster-brief-001"
+    memory = PipelineMemory()
+    seen: dict[str, str | None] = {}
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    def _planning_agent(task_prompt: str) -> str:
+        seen["proposal"] = memory.get_artifact(task_id, "team_proposal")
+        seen["prompt"] = task_prompt
+        return '{"plan": "ok"}'
+
+    def _agents(_tier):
+        agents = happy_agents(None)
+        agents["planning_agent"] = _planning_agent
+        return agents
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=_agents,
+            memory_factory=lambda: memory,
+            task_id_factory=lambda: task_id,
+        )
+        handler(
+            "Build the deployment checker.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Build the deployment checker.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        _wait_until_idle(runner)
+
+    assert seen["proposal"] is not None
+    assert "Project specialists:" in seen["proposal"]
+    assert "- role_id: security_agent" in seen["proposal"]
+    assert "- role_id: data_agent" in seen["proposal"]
 
 
 def test_legacy_non_context_path_does_not_seed_fake_coordinator_artifacts(

@@ -21,6 +21,7 @@ from core.project_models import (
     ProjectPolicy,
 )
 from core.project_runtime import ProjectRuntimeBinding
+from core.project_team_state import ProjectSpecialistRoster
 from core.state_db import StateDB
 
 
@@ -200,6 +201,28 @@ class ProjectRegistry:
 
     def bind_project_chat(self, binding: ProjectChatBinding) -> None:
         self._state_db.bind_project_chat(binding)
+
+    def get_project_specialist_roster(
+        self,
+        project_id: str,
+    ) -> ProjectSpecialistRoster:
+        return self._state_db.get_project_specialist_roster(project_id)
+
+    def add_project_specialist(
+        self,
+        project_id: str,
+        specialist_role: str,
+    ) -> ProjectSpecialistRoster:
+        self._state_db.add_project_specialist(project_id, specialist_role)
+        return self._state_db.get_project_specialist_roster(project_id)
+
+    def remove_project_specialist(
+        self,
+        project_id: str,
+        specialist_role: str,
+    ) -> ProjectSpecialistRoster:
+        self._state_db.remove_project_specialist(project_id, specialist_role)
+        return self._state_db.get_project_specialist_roster(project_id)
 
     def set_project_runtime_binding(
         self,

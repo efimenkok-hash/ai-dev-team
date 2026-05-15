@@ -39,8 +39,19 @@ class CoordinatorTeamProposalService:
             f"- assembly_mode: {assembly.assembly_mode}",
             f"- captain_role: {assembly.captain_role}",
             "",
-            "Specialization hints:",
+            "Project specialists:",
         ]
+        if assembly.project_specialist_roster.is_empty:
+            lines.append("- none")
+        else:
+            for specialist_role in assembly.project_specialist_roster.specialist_roles:
+                lines.append(f"- role_id: {specialist_role}")
+        lines.extend(
+            [
+                "",
+            "Specialization hints:",
+            ]
+        )
         if assembly.specialization_hints.is_empty:
             lines.append("- none")
         else:

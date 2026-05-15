@@ -15,6 +15,7 @@ from core.coordinator_team_assembly import (
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
+from core.project_team_state import ProjectSpecialistRoster
 from core.specialization_hints import SpecializationHint, SpecializationHints
 
 
@@ -141,6 +142,13 @@ def _hints() -> SpecializationHints:
     )
 
 
+def _roster(*roles: str) -> ProjectSpecialistRoster:
+    return ProjectSpecialistRoster(
+        project_id="alpha_project",
+        specialist_roles=tuple(roles),
+    )
+
+
 def test_context_happy_path_for_bound_chat(tmp_path):
     repo = _git_repo(tmp_path)
     context = CoordinatorTeamAssemblyContext(
@@ -151,6 +159,7 @@ def test_context_happy_path_for_bound_chat(tmp_path):
     )
 
     assert context.context_source == "bound_chat"
+    assert context.project_specialist_roster == _roster()
 
 
 def test_context_happy_path_for_owner_dm_single_project(tmp_path):
@@ -220,6 +229,18 @@ def test_context_rejects_bad_personas_type(tmp_path):
         )
 
 
+def test_context_rejects_bad_project_specialist_roster_type(tmp_path):
+    repo = _git_repo(tmp_path)
+    with pytest.raises(ValueError, match="invalid_project_specialist_roster_type"):
+        CoordinatorTeamAssemblyContext(
+            snapshot=_snapshot(repo),
+            owner_task_text="Task",
+            context_source="bound_chat",
+            personas=default_registry(),
+            project_specialist_roster="bad",  # type: ignore[arg-type]
+        )
+
+
 def test_context_rejects_missing_required_roles(tmp_path):
     repo = _git_repo(tmp_path)
     with pytest.raises(ValueError, match="missing_required_persona_roles"):
@@ -228,6 +249,24 @@ def test_context_rejects_missing_required_roles(tmp_path):
             owner_task_text="Task",
             context_source="bound_chat",
             personas=_registry_without("fixer_agent"),
+        )
+
+
+def test_context_rejects_project_specialist_roster_project_id_mismatch(tmp_path):
+    repo = _git_repo(tmp_path)
+    with pytest.raises(
+        ValueError,
+        match="project_specialist_roster_project_id_mismatch",
+    ):
+        CoordinatorTeamAssemblyContext(
+            snapshot=_snapshot(repo),
+            owner_task_text="Task",
+            context_source="bound_chat",
+            personas=default_registry(),
+            project_specialist_roster=ProjectSpecialistRoster(
+                project_id="beta_project",
+                specialist_roles=("security_agent",),
+            ),
         )
 
 
@@ -430,6 +469,7 @@ def test_assembly_carries_specialization_hints_without_changing_roster(tmp_path)
     assert tuple(
         hint.specialist_role for hint in assembly.specialization_hints.items
     ) == ("security_agent", "data_agent")
+    assert assembly.project_specialist_roster == _roster()
 
 
 def test_format_team_assembly_includes_project_context_and_stable_roster(tmp_path):
@@ -451,8 +491,9 @@ def test_format_team_assembly_includes_project_context_and_stable_roster(tmp_pat
     assert "Alpha Project" in rendered
     assert "owner DM fallback" in rendered
     assert "captain_role: coordinator_agent" in rendered
-    assert "Specialization hints:" in rendered
+    assert "Project specialists:" in rendered
     assert "- none" in rendered
+    assert "Specialization hints:" in rendered
     last_index = -1
     for role in BASELINE_INTERNAL_TEAM_ROLE_ORDER:
         idx = rendered.index(f"- role_id: {role}")
@@ -479,6 +520,29 @@ def test_format_team_assembly_renders_non_empty_hints_in_stable_order(tmp_path):
     assert security_index < data_index
     assert "Task touches auth and secrets." in rendered
     assert "Task touches schema and analytics shape." in rendered
+
+
+def test_format_team_assembly_renders_non_empty_project_specialists_in_stable_order(
+    tmp_path,
+):
+    repo = _git_repo(tmp_path)
+    assembly = CoordinatorTeamAssemblyService().assemble_team(
+        CoordinatorTeamAssemblyContext(
+            snapshot=_snapshot(repo),
+            owner_task_text="Prepare the release branch.",
+            context_source="owner_dm_single_project",
+            personas=default_registry(),
+            project_specialist_roster=_roster("data_agent", "security_agent"),
+        )
+    )
+
+    rendered = CoordinatorTeamAssemblyService().format_team_assembly(assembly)
+
+    assert "Project specialists:" in rendered
+    security_index = rendered.index("- role_id: security_agent")
+    data_index = rendered.index("- role_id: data_agent")
+    roster_index = rendered.index("Roster:")
+    assert security_index < data_index < roster_index
 
 
 def test_formatting_is_deterministic(tmp_path):

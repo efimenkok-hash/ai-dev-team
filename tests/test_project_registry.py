@@ -14,6 +14,7 @@ from core.project_models import (
 )
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
+from core.project_team_state import ProjectSpecialistRoster
 from core.state_db import StateDB
 
 
@@ -256,6 +257,84 @@ def test_register_project_saves_full_snapshot(tmp_path: Path):
     registry.register_project(snapshot)
 
     assert registry.get_project_snapshot("alpha_project") == snapshot
+
+
+def test_registry_returns_empty_project_specialist_roster_for_new_project(
+    tmp_path: Path,
+):
+    registry = ProjectRegistry(_make_db(tmp_path))
+    registry.register_project(_snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path))))
+
+    roster = registry.get_project_specialist_roster("alpha_project")
+
+    assert roster == ProjectSpecialistRoster(
+        project_id="alpha_project",
+        specialist_roles=(),
+    )
+
+
+def test_registry_add_and_remove_project_specialist_return_updated_roster(
+    tmp_path: Path,
+):
+    registry = ProjectRegistry(_make_db(tmp_path))
+    registry.register_project(_snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path))))
+
+    added = registry.add_project_specialist("alpha_project", "security_agent")
+    assert added.specialist_roles == ("security_agent",)
+
+    removed = registry.remove_project_specialist(
+        "alpha_project",
+        "security_agent",
+    )
+    assert removed.specialist_roles == ()
+
+
+def test_registry_project_specialist_roster_persists_across_instances(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    first = ProjectRegistry(db)
+    first.register_project(_snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path))))
+    first.add_project_specialist("alpha_project", "security_agent")
+    first.add_project_specialist("alpha_project", "data_agent")
+
+    second = ProjectRegistry(StateDB(db.path))
+
+    assert second.get_project_specialist_roster("alpha_project").specialist_roles == (
+        "security_agent",
+        "data_agent",
+    )
+
+
+def test_registry_project_specialist_roster_is_isolated_per_project(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    registry = ProjectRegistry(db)
+    registry.register_project(_snapshot(runtime_binding=_runtime_binding(_git_repo(tmp_path, "alpha"))))
+    registry.register_project(
+        _snapshot(
+            project=_project(
+                project_id="beta_project",
+                slug="beta-project",
+                name="Beta Project",
+            ),
+            policy=_policy(project_id="beta_project"),
+            memberships=(),
+            chat_binding=_binding(project_id="beta_project", chat_id=-100999),
+            runtime_binding=_runtime_binding(
+                _git_repo(tmp_path, "beta"),
+                project_id="beta_project",
+                adapter_name="beta_adapter",
+            ),
+        )
+    )
+    registry.add_project_specialist("alpha_project", "security_agent")
+
+    assert registry.get_project_specialist_roster("alpha_project").specialist_roles == (
+        "security_agent",
+    )
+    assert registry.get_project_specialist_roster("beta_project").specialist_roles == ()
 
 
 def test_register_project_saves_snapshot_without_policy(tmp_path: Path):
