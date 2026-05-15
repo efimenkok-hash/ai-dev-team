@@ -37,6 +37,7 @@ from core.llm_dispatcher import (
 from core.model_tier import DEFAULT_TIERS, REQUIRED_ROLES, TierConfig
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
+from core.specialization_hints import SpecializationHint, SpecializationHints
 from core.state_db import StateDB
 
 # ---------------------------------------------------------------------------
@@ -50,6 +51,9 @@ def _make_tier() -> TierConfig:
         description="test tier",
         estimated_cost_usd=0.5,
         models_per_role={role: ("model-x",) for role in REQUIRED_ROLES},
+        specialist_models_per_role={
+            role: ("specialist-model-x",) for role in SPECIALIST_ROLE_ORDER
+        },
     )
 
 
@@ -656,6 +660,62 @@ class TestSpecialistDispatchRequest:
         assert "project_id=alpha_project" in user_content
         assert "task_id=task-42" in user_content
 
+    def test_build_specialist_dispatch_request_includes_matching_augmentation(
+        self,
+    ):
+        request = build_specialist_dispatch_request(
+            "security_agent",
+            "Проверь security assumptions",
+            specialization_hints=SpecializationHints(
+                (
+                    SpecializationHint(
+                        specialist_role="security_agent",
+                        reason="Задача затрагивает auth и secrets.",
+                    ),
+                )
+            ),
+        )
+
+        user_content = request.messages[1]["content"]
+        assert "Specialization context" in user_content
+        assert "role: security_agent" in user_content
+        assert "task_specific_hint: Задача затрагивает auth и secrets." in user_content
+        assert "focus_areas:" in user_content
+        assert "non_goals:" in user_content
+
+    def test_build_specialist_dispatch_request_keeps_kb_only_path_without_hints(
+        self,
+    ):
+        request = build_specialist_dispatch_request(
+            "devops_agent",
+            "Проверь deployability",
+        )
+
+        user_content = request.messages[1]["content"]
+        assert "Specialization context" in user_content
+        assert "role: devops_agent" in user_content
+        assert "task_specific_hint: none" in user_content
+
+    def test_build_specialist_dispatch_request_does_not_leak_unrelated_hint(
+        self,
+    ):
+        request = build_specialist_dispatch_request(
+            "security_agent",
+            "Проверь hardening",
+            specialization_hints=SpecializationHints(
+                (
+                    SpecializationHint(
+                        specialist_role="data_agent",
+                        reason="Есть migration risk.",
+                    ),
+                )
+            ),
+        )
+
+        user_content = request.messages[1]["content"]
+        assert "task_specific_hint: none" in user_content
+        assert "Есть migration risk." not in user_content
+
     def test_specialist_prompts_are_distinct_and_not_json_locked(self):
         security_request = build_specialist_dispatch_request("security_agent", "A")
         devops_request = build_specialist_dispatch_request("devops_agent", "A")
@@ -696,6 +756,16 @@ class TestSpecialistDispatchRequest:
                 "data_agent",
                 "Check data invariants",
                 context_block=context_block,
+            )
+
+    def test_build_specialist_dispatch_request_rejects_invalid_specialization_hints_type(
+        self,
+    ):
+        with pytest.raises(ValueError, match="invalid_specialization_hints_type:list"):
+            build_specialist_dispatch_request(
+                "security_agent",
+                "Task",
+                specialization_hints=[],  # type: ignore[arg-type]
             )
 
 
@@ -901,6 +971,58 @@ class TestDispatcherAgentCollaboration:
         assert messages[1].in_reply_to.message_id == messages[0].message_id
         assert sent_envelopes[0].sender_role == "planning_agent"
         assert sent_envelopes[1].sender_role == "reviewer_agent"
+
+    def test_live_collaboration_registry_propagates_matching_specialization_hint(
+        self,
+        tmp_path,
+    ):
+        dispatcher = _make_dispatcher()
+        tier = _make_tier()
+        factory = build_dispatcher_agent_registry_factory(dispatcher)
+        projecting_bus, thread, _sent_envelopes = _make_collaboration_bus(tmp_path)
+        call_counts: dict[str, int] = {}
+
+        def _dispatch(req: LLMRequest, _tier: TierConfig) -> LLMResponse:
+            call_counts[req.agent_role] = call_counts.get(req.agent_role, 0) + 1
+            if req.agent_role == "planning_agent" and call_counts[req.agent_role] == 1:
+                return _make_response(
+                    '{"action":"ask_another_agent","recipient_role":"security_agent","question":"Нужен security review"}'
+                )
+            if req.agent_role == "security_agent":
+                user_content = req.messages[1]["content"]
+                assert "Specialization context" in user_content
+                assert "role: security_agent" in user_content
+                assert (
+                    "task_specific_hint: Задача затрагивает auth, secrets и trust boundaries."
+                    in user_content
+                )
+                return _make_response("Проверь authz и secret handling.")
+            if req.agent_role == "planning_agent":
+                assert "INTERNAL CONSULTATION TRANSCRIPT" in req.messages[1]["content"]
+                return _make_response('{"plan":"ok"}')
+            raise AssertionError(f"unexpected role {req.agent_role}")
+
+        dispatcher.dispatch = MagicMock(side_effect=_dispatch)  # type: ignore[method-assign]
+        registry = factory.build_collaboration_registry(
+            tier,
+            project_id="alpha_project",
+            task_id="task-42",
+            thread=thread,
+            owner_task_text="Owner task",
+            bus=projecting_bus,
+            specialization_hints=SpecializationHints(
+                (
+                    SpecializationHint(
+                        specialist_role="security_agent",
+                        reason="Задача затрагивает auth, secrets и trust boundaries.",
+                    ),
+                )
+            ),
+        )
+
+        result = registry["planning_agent"]("Нужен план")
+
+        assert result == '{"plan":"ok"}'
 
     def test_repeated_consultation_beyond_limit_is_rejected(self, tmp_path):
         dispatcher = _make_dispatcher()

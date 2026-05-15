@@ -21,6 +21,7 @@ from core.llm_dispatcher import LLMAttempt, LLMDispatcher, LLMResponse
 from core.model_tier import REQUIRED_ROLES, TierConfig
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
+from core.specialization_hints import SpecializationHint, SpecializationHints
 from core.state_db import StateDB
 
 
@@ -362,6 +363,120 @@ def test_consult_only_dispatch_prompt_contains_expected_context_and_forbids_nest
     assert "caller_role: architect_agent" in user_content
     assert "Собери endpoint для billing" in user_content
     assert "Где риск?" in user_content
+
+
+def test_specialist_consult_prompt_includes_matching_specialization_augmentation(
+    tmp_path: Path,
+):
+    _, bus, projecting_bus, thread, _ = _make_bus(tmp_path)
+    dispatcher = _make_dispatcher()
+    dispatcher.dispatch = MagicMock(return_value=_make_response("Короткий ответ"))  # type: ignore[method-assign]
+    service = AgentCollaborationService(bus, dispatcher, _make_tier())
+    context = AgentCollaborationContext(
+        project_id="alpha_project",
+        task_id="task-42",
+        thread=thread,
+        caller_role="writer_agent",
+        owner_task_text="Почини auth middleware",
+        specialization_hints=SpecializationHints(
+            (
+                SpecializationHint(
+                    specialist_role="security_agent",
+                    reason="Задача затрагивает auth, secrets и trust boundaries.",
+                ),
+            )
+        ),
+    )
+    request = service.parse_consultation_request(
+        '{"action":"ask_another_agent","recipient_role":"security_agent","question":"Где главный security risk?"}'
+    )
+    assert request is not None
+
+    result = service.run_consultation(context, request, created_at=1001.0)
+
+    user_content = dispatcher.dispatch.call_args[0][0].messages[1]["content"]
+    assert "Specialization context" in user_content
+    assert "role: security_agent" in user_content
+    assert (
+        "task_specific_hint: Задача затрагивает auth, secrets и trust boundaries."
+        in user_content
+    )
+    assert "focus_areas:" in user_content
+    assert "non_goals:" in user_content
+    messages = projecting_bus.list_thread_messages("alpha_project", thread.thread_id)
+    assert tuple(message.message_kind for message in messages) == ("request", "reply")
+    assert result.recipient_role == "security_agent"
+
+
+def test_specialist_consult_prompt_falls_back_to_kb_only_without_matching_hint(
+    tmp_path: Path,
+):
+    _, bus, _projecting_bus, thread, _ = _make_bus(tmp_path)
+    dispatcher = _make_dispatcher()
+    dispatcher.dispatch = MagicMock(return_value=_make_response("Короткий ответ"))  # type: ignore[method-assign]
+    service = AgentCollaborationService(bus, dispatcher, _make_tier())
+    context = AgentCollaborationContext(
+        project_id="alpha_project",
+        task_id="task-42",
+        thread=thread,
+        caller_role="writer_agent",
+        owner_task_text="Проверь API",
+        specialization_hints=SpecializationHints(
+            (
+                SpecializationHint(
+                    specialist_role="devops_agent",
+                    reason="Нужен rollback review.",
+                ),
+            )
+        ),
+    )
+    request = service.parse_consultation_request(
+        '{"action":"ask_another_agent","recipient_role":"security_agent","question":"Где security risk?"}'
+    )
+    assert request is not None
+
+    service.run_consultation(context, request, created_at=1001.0)
+
+    user_content = dispatcher.dispatch.call_args[0][0].messages[1]["content"]
+    assert "Specialization context" in user_content
+    assert "role: security_agent" in user_content
+    assert "task_specific_hint: none" in user_content
+    assert "Нужен rollback review." not in user_content
+
+
+def test_baseline_recipient_does_not_get_specialist_augmentation(
+    tmp_path: Path,
+):
+    _, bus, _projecting_bus, thread, _ = _make_bus(tmp_path)
+    dispatcher = _make_dispatcher()
+    dispatcher.dispatch = MagicMock(return_value=_make_response("Короткий ответ"))  # type: ignore[method-assign]
+    service = AgentCollaborationService(bus, dispatcher, _make_tier())
+    context = AgentCollaborationContext(
+        project_id="alpha_project",
+        task_id="task-42",
+        thread=thread,
+        caller_role="writer_agent",
+        owner_task_text="Проверь API",
+        specialization_hints=SpecializationHints(
+            (
+                SpecializationHint(
+                    specialist_role="security_agent",
+                    reason="Есть security-sensitive path.",
+                ),
+            )
+        ),
+    )
+    request = service.parse_consultation_request(
+        '{"action":"ask_another_agent","recipient_role":"reviewer_agent","question":"Где review risk?"}'
+    )
+    assert request is not None
+
+    service.run_consultation(context, request, created_at=1001.0)
+
+    user_content = dispatcher.dispatch.call_args[0][0].messages[1]["content"]
+    assert "Specialization context" not in user_content
+    assert "task_specific_hint:" not in user_content
+    assert "Есть security-sensitive path." not in user_content
 
 
 def test_nested_consultation_from_recipient_is_rejected_without_fake_reply(

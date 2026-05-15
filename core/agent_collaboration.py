@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from core.agent_bus_models import (
     AgentMessage,
@@ -25,13 +25,18 @@ from core.agent_bus_models import (
 )
 from core.agent_bus_projection import ProjectingAgentBus
 from core.agent_bus_projection_throttle import ThrottledProjectingAgentBus
-from core.agent_role_catalog import is_selectable_agent_role
+from core.agent_role_catalog import is_selectable_agent_role, is_specialist_role
 from core.json_extractor import extract_json_object
 from core.llm_dispatcher import LLMDispatcher, LLMRequest
 from core.model_tier import REQUIRED_ROLES, TierConfig
+from core.specialization_hints import SpecializationHints
+from core.specialization_prompt_augmentation import (
+    SpecializationPromptAugmentor,
+)
 
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_SPECIALIZATION_PROMPT_AUGMENTOR = SpecializationPromptAugmentor()
 
 
 def _normalize_identifier(value: str, *, field_name: str) -> str:
@@ -80,6 +85,9 @@ class AgentCollaborationContext:
     thread: ProjectThread
     caller_role: str
     owner_task_text: str
+    specialization_hints: SpecializationHints = field(
+        default_factory=SpecializationHints.empty
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -107,6 +115,11 @@ class AgentCollaborationContext:
             "owner_task_text",
             _normalize_text(self.owner_task_text, field_name="owner_task_text"),
         )
+        if not isinstance(self.specialization_hints, SpecializationHints):
+            raise ValueError(
+                "invalid_specialization_hints_type:"
+                f"{type(self.specialization_hints).__name__}"
+            )
         if self.thread.project_id != self.project_id:
             raise ValueError(
                 "thread_project_id_mismatch:"
@@ -354,6 +367,10 @@ class AgentCollaborationService:
         )
 
         self._last_dispatch_usage = None
+        augmentation_block = self._build_specialist_augmentation_block(
+            request.recipient_role,
+            context.specialization_hints,
+        )
         consult_request = LLMRequest(
             agent_role=request.recipient_role,
             messages=(
@@ -369,6 +386,7 @@ class AgentCollaborationService:
                     "content": self._build_consult_user_prompt(
                         context,
                         request,
+                        augmentation_block=augmentation_block,
                     ),
                 },
             ),
@@ -470,6 +488,18 @@ class AgentCollaborationService:
         return self._bus.publish_reply(reply).message
 
     @staticmethod
+    def _build_specialist_augmentation_block(
+        recipient_role: str,
+        specialization_hints: SpecializationHints,
+    ) -> str | None:
+        if not is_specialist_role(recipient_role):
+            return None
+        return _SPECIALIZATION_PROMPT_AUGMENTOR.render_block(
+            recipient_role,
+            specialization_hints,
+        )
+
+    @staticmethod
     def _build_consult_system_prompt(
         *,
         caller_role: str,
@@ -491,13 +521,24 @@ class AgentCollaborationService:
     def _build_consult_user_prompt(
         context: AgentCollaborationContext,
         request: AgentConsultationRequest,
+        *,
+        augmentation_block: str | None = None,
     ) -> str:
-        return "\n".join(
+        lines = [
+            "Internal consultation context",
+            f"project_id: {context.project_id}",
+            f"task_id: {context.task_id}",
+            f"caller_role: {context.caller_role}",
+        ]
+        if augmentation_block is not None:
+            lines.extend(
+                (
+                    "",
+                    augmentation_block,
+                )
+            )
+        lines.extend(
             (
-                "Internal consultation context",
-                f"project_id: {context.project_id}",
-                f"task_id: {context.task_id}",
-                f"caller_role: {context.caller_role}",
                 "",
                 "Owner task text:",
                 context.owner_task_text,
@@ -508,6 +549,7 @@ class AgentCollaborationService:
                 "Ответь кратко и по существу.",
             )
         )
+        return "\n".join(lines)
 
 
 def format_consultation_followup_block(

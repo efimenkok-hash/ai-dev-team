@@ -87,6 +87,7 @@ from core.coordinator_team_proposal import (
     CoordinatorTeamProposalService,
 )
 from core.fsm import State
+from core.json_extractor import extract_json_object
 from core.memory import PipelineMemory
 from core.model_tier import TierConfig
 from core.observability import Observability
@@ -416,6 +417,18 @@ def make_real_task_handler(
                 )
 
                 memory = memory_factory()
+
+                def _resolve_runtime_specialization_hints() -> SpecializationHints:
+                    pm_artifact = memory.get_artifact(task_id, "pm")
+                    if pm_artifact is None:
+                        return SpecializationHints.empty()
+                    pm_payload = extract_json_object(pm_artifact)
+                    if pm_payload is None or not isinstance(pm_payload, dict):
+                        raise ValueError(
+                            "invalid_pm_specialization_hints_payload"
+                        )
+                    return SpecializationHints.from_pm_payload(pm_payload)
+
                 collaboration_registry_builder = getattr(
                     agent_registry_factory,
                     "build_collaboration_registry",
@@ -441,6 +454,9 @@ def make_real_task_handler(
                         thread=collaboration_thread,
                         owner_task_text=owner_task_text,
                         bus=collaboration_bus,
+                        specialization_hints_provider=(
+                            _resolve_runtime_specialization_hints
+                        ),
                     )
                 else:
                     base_registry = agent_registry_factory(tier)

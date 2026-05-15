@@ -2423,6 +2423,122 @@ def test_project_aware_pipeline_uses_collaboration_bus_and_public_projection(
     assert any("Готово" in text for text in projection_texts)
 
 
+def test_project_aware_runtime_propagates_pm_specialization_hints_to_specialist_consult_prompt(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import MagicMock, patch
+
+    tier_store.set_active(-100123, "STANDARD")
+    send_envelope, captured = _make_progress_envelope_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="specialist-hints-runtime.db",
+    )
+    dispatcher = _make_dispatcher()
+    factory = build_dispatcher_agent_registry_factory(dispatcher)
+    architect_calls = 0
+
+    def _dispatch(req, _tier):
+        nonlocal architect_calls
+        if req.agent_role == "planning_agent":
+            return _make_dispatch_response('{"plan":"ok"}')
+        if req.agent_role == "pm_agent":
+            return _make_dispatch_response(
+                '{"tasks":[],"specialization_hints":[{"specialist_role":"security_agent","reason":"Задача затрагивает auth, secrets и trust boundaries."}]}'
+            )
+        if req.agent_role == "architect_agent":
+            architect_calls += 1
+            if architect_calls == 1:
+                return _make_dispatch_response(
+                    '{"action":"ask_another_agent","recipient_role":"security_agent","question":"Нужен security review по API"}'
+                )
+            assert "INTERNAL CONSULTATION TRANSCRIPT" in req.messages[1]["content"]
+            return _make_dispatch_response('{"arch":"spec"}')
+        if req.agent_role == "security_agent":
+            user_content = req.messages[1]["content"]
+            assert "Specialization context" in user_content
+            assert "role: security_agent" in user_content
+            assert (
+                "task_specific_hint: Задача затрагивает auth, secrets и trust boundaries."
+                in user_content
+            )
+            return _make_dispatch_response(
+                "Проверь authz, secret handling и trust boundaries."
+            )
+        if req.agent_role == "writer_agent":
+            return _make_dispatch_response("def f(): return 42")
+        if req.agent_role == "reviewer_agent":
+            return _make_dispatch_response('{"verdict":"APPROVED"}')
+        if req.agent_role == "tester_agent":
+            return _make_dispatch_response("tests pass")
+        if req.agent_role == "qa_agent":
+            return _make_dispatch_response('{"verdict":"PASS"}')
+        if req.agent_role == "fixer_agent":
+            return _make_dispatch_response("def f(): return 42")
+        raise AssertionError(f"unexpected role {req.agent_role}")
+
+    dispatcher.dispatch = MagicMock(side_effect=_dispatch)  # type: ignore[method-assign]
+    mock_report = _ok_validation_report()
+    mock_hook_fn = MagicMock(return_value=mock_report)
+
+    with (
+        patch("core.project_runtime_router._build_sandbox", return_value=sandbox),
+        patch("core.real_task_handler.make_sandbox_hook", return_value=mock_hook_fn),
+        patch.object(sandbox, "commit_in_worktree", return_value="abc123def456789"),
+    ):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress_envelope=send_envelope,
+            agent_registry_factory=factory,
+            task_id_factory=lambda: "task-42",
+        )
+        reply = handler(
+            "Собери безопасный API для billing.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Собери безопасный API для billing.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        assert isinstance(reply, BridgeReply)
+        _wait_until_idle(runner)
+        _wait_for_count(
+            captured,
+            lambda envelopes: any("Готово" in env.message.text for env in envelopes),
+        )
+
+    backend_bus = StateBackedAgentBus(runtime_router.registry.state_db)
+    thread = backend_bus.get_task_thread("alpha_project", "task-42")
+    assert thread is not None
+    messages = backend_bus.list_thread_messages("alpha_project", thread.thread_id)
+    assert tuple(message.message_kind for message in messages) == ("request", "reply")
+    assert messages[0].sender_role == "architect_agent"
+    assert messages[0].recipient_role == "security_agent"
+    assert messages[1].sender_role == "security_agent"
+    assert messages[1].in_reply_to is not None
+    assert messages[1].in_reply_to.message_id == messages[0].message_id
+
+    projection_texts = [env.message.text for env in captured]
+    assert any("Маршрут: architect_agent -> security_agent" in text for text in projection_texts)
+    assert any("Маршрут: security_agent -> architect_agent" in text for text in projection_texts)
+    assert any("Готово" in text for text in projection_texts)
+
+
 def test_non_project_dispatcher_path_stays_legacy_without_collaboration(
     runner,
     sandbox,

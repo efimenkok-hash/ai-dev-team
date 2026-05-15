@@ -54,6 +54,10 @@ from core.agent_role_catalog import SPECIALIST_ROLE_ORDER
 from core.llm_dispatcher import LLMDispatcher, LLMRequest
 from core.model_tier import REQUIRED_ROLES, TierConfig
 from core.orchestrator import AgentRegistry
+from core.specialization_hints import SpecializationHints
+from core.specialization_prompt_augmentation import (
+    SpecializationPromptAugmentor,
+)
 
 # ---------------------------------------------------------------------------
 # System prompts — static role/rules blocks from core/agents.py
@@ -833,6 +837,8 @@ _SYSTEM_PROMPTS = {
     "data_agent": _DATA_SYSTEM,
 }
 
+_SPECIALIZATION_PROMPT_AUGMENTOR = SpecializationPromptAugmentor()
+
 
 def _normalize_specialist_role(agent_role: str) -> str:
     if not isinstance(agent_role, str):
@@ -858,11 +864,24 @@ def build_specialist_dispatch_request(
     task_text: str,
     *,
     context_block: str | None = None,
+    specialization_hints: SpecializationHints | None = None,
 ) -> LLMRequest:
     normalized_role = _normalize_specialist_role(agent_role)
     normalized_task_text = _normalize_non_empty_text(
         task_text,
         field_name="specialist_task_text",
+    )
+    if (
+        specialization_hints is not None
+        and not isinstance(specialization_hints, SpecializationHints)
+    ):
+        raise ValueError(
+            "invalid_specialization_hints_type:"
+            f"{type(specialization_hints).__name__}"
+        )
+    augmentation_block = _SPECIALIZATION_PROMPT_AUGMENTOR.render_block(
+        normalized_role,
+        specialization_hints,
     )
     user_lines = [
         "Specialist expert task",
@@ -874,6 +893,7 @@ def build_specialist_dispatch_request(
             field_name="specialist_context_block",
         )
         user_lines.extend(("", "Context:", normalized_context_block))
+    user_lines.extend(("", augmentation_block))
     user_lines.extend(
         (
             "",
@@ -1025,12 +1045,32 @@ def build_dispatcher_agent_registry_factory(
         project_id: str | None = None,
         task_id: str | None = None,
         owner_task_text: str | None = None,
+        specialization_hints: SpecializationHints | None = None,
+        specialization_hints_provider: Callable[[], SpecializationHints] | None = None,
         collaboration_policy: AgentCollaborationPolicy | None = None,
     ) -> AgentRegistry:
         if not isinstance(tier, TierConfig):
             raise ValueError(
                 f"invalid_tier_type:{type(tier).__name__}"
             )
+        if (
+            specialization_hints is not None
+            and not isinstance(specialization_hints, SpecializationHints)
+        ):
+            raise ValueError(
+                "invalid_specialization_hints_type:"
+                f"{type(specialization_hints).__name__}"
+            )
+        if (
+            specialization_hints_provider is not None
+            and not callable(specialization_hints_provider)
+        ):
+            raise ValueError("specialization_hints_provider_not_callable")
+        normalized_specialization_hints = (
+            specialization_hints
+            if specialization_hints is not None
+            else SpecializationHints.empty()
+        )
 
         d = config.dispatcher
         response_usage: dict[str, tuple[tuple, str, int, int, float]] = {}
@@ -1083,6 +1123,17 @@ def build_dispatcher_agent_registry_factory(
                     attempts_count,
                 ),
             )
+
+        def _resolve_specialization_hints() -> SpecializationHints:
+            if specialization_hints_provider is None:
+                return normalized_specialization_hints
+            resolved_hints = specialization_hints_provider()
+            if not isinstance(resolved_hints, SpecializationHints):
+                raise ValueError(
+                    "invalid_specialization_hints_type:"
+                    f"{type(resolved_hints).__name__}"
+                )
+            return resolved_hints
 
         def _make_cost_estimator() -> Callable[[str, tuple, str], tuple[int, int, float]]:
             def _estimator(
@@ -1183,6 +1234,7 @@ def build_dispatcher_agent_registry_factory(
                         thread=collaboration_thread,
                         caller_role=agent_role,
                         owner_task_text=owner_task_text,
+                        specialization_hints=_resolve_specialization_hints(),
                     ),
                     consultation_request,
                     created_at=time.time(),
@@ -1276,6 +1328,8 @@ def build_dispatcher_agent_registry_factory(
         thread: ProjectThread,
         owner_task_text: str,
         bus: ThrottledProjectingAgentBus | ProjectingAgentBus,
+        specialization_hints: SpecializationHints | None = None,
+        specialization_hints_provider: Callable[[], SpecializationHints] | None = None,
         policy: AgentCollaborationPolicy | None = None,
     ) -> AgentRegistry:
         return _build_registry(
@@ -1285,6 +1339,8 @@ def build_dispatcher_agent_registry_factory(
             project_id=project_id,
             task_id=task_id,
             owner_task_text=owner_task_text,
+            specialization_hints=specialization_hints,
+            specialization_hints_provider=specialization_hints_provider,
             collaboration_policy=policy,
         )
 
