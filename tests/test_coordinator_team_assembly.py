@@ -15,6 +15,7 @@ from core.coordinator_team_assembly import (
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
+from core.specialization_hints import SpecializationHint, SpecializationHints
 
 
 def _git_repo(tmp_path: Path, name: str = "repo") -> Path:
@@ -123,6 +124,21 @@ def _assembly(repo_path: Path, **overrides) -> CoordinatorTeamAssembly:
     }
     data.update(overrides)
     return CoordinatorTeamAssembly(**data)
+
+
+def _hints() -> SpecializationHints:
+    return SpecializationHints(
+        (
+            SpecializationHint(
+                "data_agent",
+                "Task touches schema and analytics shape.",
+            ),
+            SpecializationHint(
+                "security_agent",
+                "Task touches auth and secrets.",
+            ),
+        )
+    )
 
 
 def test_context_happy_path_for_bound_chat(tmp_path):
@@ -396,6 +412,26 @@ def test_service_ignores_extra_specialist_personas_and_keeps_baseline_shape(
     )
 
 
+def test_assembly_carries_specialization_hints_without_changing_roster(tmp_path):
+    repo = _git_repo(tmp_path)
+    assembly = CoordinatorTeamAssemblyService().assemble_team(
+        CoordinatorTeamAssemblyContext(
+            snapshot=_snapshot(repo, chat_binding=_chat_binding()),
+            owner_task_text="Implement the release workflow.",
+            context_source="bound_chat",
+            personas=default_registry(),
+            specialization_hints=_hints(),
+        )
+    )
+
+    assert tuple(member.persona.agent_role for member in assembly.members) == (
+        BASELINE_INTERNAL_TEAM_ROLE_ORDER
+    )
+    assert tuple(
+        hint.specialist_role for hint in assembly.specialization_hints.items
+    ) == ("security_agent", "data_agent")
+
+
 def test_format_team_assembly_includes_project_context_and_stable_roster(tmp_path):
     repo = _git_repo(tmp_path)
     assembly = CoordinatorTeamAssemblyService().assemble_team(
@@ -415,11 +451,34 @@ def test_format_team_assembly_includes_project_context_and_stable_roster(tmp_pat
     assert "Alpha Project" in rendered
     assert "owner DM fallback" in rendered
     assert "captain_role: coordinator_agent" in rendered
+    assert "Specialization hints:" in rendered
+    assert "- none" in rendered
     last_index = -1
     for role in BASELINE_INTERNAL_TEAM_ROLE_ORDER:
         idx = rendered.index(f"- role_id: {role}")
         assert idx > last_index
         last_index = idx
+
+
+def test_format_team_assembly_renders_non_empty_hints_in_stable_order(tmp_path):
+    repo = _git_repo(tmp_path)
+    assembly = CoordinatorTeamAssemblyService().assemble_team(
+        CoordinatorTeamAssemblyContext(
+            snapshot=_snapshot(repo),
+            owner_task_text="Prepare the release branch.",
+            context_source="owner_dm_single_project",
+            personas=default_registry(),
+            specialization_hints=_hints(),
+        )
+    )
+    rendered = CoordinatorTeamAssemblyService().format_team_assembly(assembly)
+
+    assert "Specialization hints:" in rendered
+    security_index = rendered.index("- specialist_role: security_agent")
+    data_index = rendered.index("- specialist_role: data_agent")
+    assert security_index < data_index
+    assert "Task touches auth and secrets." in rendered
+    assert "Task touches schema and analytics shape." in rendered
 
 
 def test_formatting_is_deterministic(tmp_path):

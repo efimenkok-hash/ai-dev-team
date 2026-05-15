@@ -125,6 +125,12 @@ task: str — описание задачи на любом языке
 {
   "plan_id": "<uuid4>",
   "task_summary": "<суть задачи, максимум 20 слов>",
+  "specialization_hints": [
+    {
+      "specialist_role": "security_agent",
+      "reason": "Задача затрагивает auth, secrets и trust boundaries."
+    }
+  ],
   "subtasks": [
     {
       "id": "T-001",
@@ -156,20 +162,26 @@ RECEIVE → DECOMPOSE → VALIDATE → EMIT
 4. Один subtask — один агент.
 5. depends_on ссылается только на существующие T-ID.
 6. acceptance_criteria не может содержать: "работает корректно", "выглядит хорошо", "функционирует", "функционирует согласно", "исправлены", "готово".
-7. self_check содержит false → исправить перед выводом.
-8. Если задача неоднозначна → заполнить blockers[], продолжить декомпозицию.
-9. priority: 1=критично, 2=важно, 3=стандарт, 4=желательно, 5=опционально.
-10. Не изобретать подзадачи, не следующие из task.
-11. EXACT USER CONTRACT: если пользователь указал точную сигнатуру, типы, path,
+7. specialization_hints ОБЯЗАНО присутствовать всегда: либо список объектов
+   {"specialist_role","reason"}, либо [] если hints нет.
+8. specialization_hints — это recommendation surface, а не hiring-команда и не
+   auto-selection. Не добавляй baseline roles или coordinator_agent в hints.
+9. self_check содержит false → исправить перед выводом.
+10. Если задача неоднозначна → заполнить blockers[], продолжить декомпозицию.
+11. priority: 1=критично, 2=важно, 3=стандарт, 4=желательно, 5=опционально.
+12. Не изобретать подзадачи, не следующие из task.
+13. EXACT USER CONTRACT: если пользователь указал точную сигнатуру, типы, path,
     имя функции, строку assert, literal value или конкретное поведение — перенеси
     это дословно в acceptance_criteria. Нельзя заменять int на float, менять
     assert square(3) == 9 на другой assert, переименовывать функции или пути.
-12. Для задач формата "добавь X в существующий файл" acceptance_criteria должен
+14. Для задач формата "добавь X в существующий файл" acceptance_criteria должен
     явно требовать preservation: существующий публичный код и существующие тесты
     не удалять и не переписывать, если пользователь прямо не попросил удалить.
 
 ## SELF-CHECK
 Перед выводом проверь:
+- specialization_hints поле присутствует всегда
+- specialization_hints не содержит baseline roles и coordinator_agent
 - каждый subtask имеет assigned_to из списка агентов
 - все depends_on ссылаются на существующие T-ID
 - нет циклических зависимостей

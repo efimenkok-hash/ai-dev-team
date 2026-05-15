@@ -10,6 +10,7 @@ from core.coordinator_team_proposal import CoordinatorTeamProposalService
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
+from core.specialization_hints import SpecializationHint, SpecializationHints
 
 
 def _git_repo(tmp_path: Path, name: str = "repo") -> Path:
@@ -88,7 +89,28 @@ def _snapshot(
     return ProjectSnapshot(**data)
 
 
-def _assembly(tmp_path: Path, *, context_source: str, bound: bool):
+def _hints() -> SpecializationHints:
+    return SpecializationHints(
+        (
+            SpecializationHint(
+                "devops_agent",
+                "Task depends on deploy and rollback safety.",
+            ),
+            SpecializationHint(
+                "security_agent",
+                "Task touches auth and secrets.",
+            ),
+        )
+    )
+
+
+def _assembly(
+    tmp_path: Path,
+    *,
+    context_source: str,
+    bound: bool,
+    specialization_hints: SpecializationHints | None = None,
+):
     repo = _git_repo(tmp_path)
     snapshot = _snapshot(repo, chat_binding=_chat_binding() if bound else None)
     return CoordinatorTeamAssemblyService().assemble_team(
@@ -97,6 +119,11 @@ def _assembly(tmp_path: Path, *, context_source: str, bound: bool):
             owner_task_text="Implement the release workflow.",
             context_source=context_source,
             personas=default_registry(),
+            specialization_hints=(
+                specialization_hints
+                if specialization_hints is not None
+                else SpecializationHints.empty()
+            ),
         )
     )
 
@@ -119,6 +146,8 @@ def test_team_proposal_artifact_includes_project_anchor_context_and_captain(
     assert "control-plane lead" in artifact.lower()
     assert "Implement the release workflow." in artifact
     assert "Hiring and external roles are not auto-activated" in artifact
+    assert "Specialization hints:" in artifact
+    assert "- none" in artifact
 
 
 def test_team_proposal_builds_from_assembled_team_in_stable_order(tmp_path):
@@ -158,3 +187,23 @@ def test_team_proposal_is_deterministic(tmp_path):
     second = service.build_team_proposal_artifact(assembly)
 
     assert first == second
+
+
+def test_team_proposal_renders_non_empty_hints_in_stable_order(tmp_path):
+    assembly = _assembly(
+        tmp_path,
+        context_source="bound_chat",
+        bound=True,
+        specialization_hints=_hints(),
+    )
+
+    artifact = CoordinatorTeamProposalService().build_team_proposal_artifact(
+        assembly
+    )
+
+    assert "Specialization hints:" in artifact
+    security_index = artifact.index("- specialist_role: security_agent")
+    devops_index = artifact.index("- specialist_role: devops_agent")
+    assert security_index < devops_index
+    assert "Task touches auth and secrets." in artifact
+    assert "Task depends on deploy and rollback safety." in artifact

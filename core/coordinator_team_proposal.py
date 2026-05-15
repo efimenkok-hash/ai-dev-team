@@ -39,6 +39,21 @@ class CoordinatorTeamProposalService:
             f"- assembly_mode: {assembly.assembly_mode}",
             f"- captain_role: {assembly.captain_role}",
             "",
+            "Specialization hints:",
+        ]
+        if assembly.specialization_hints.is_empty:
+            lines.append("- none")
+        else:
+            for hint in assembly.specialization_hints.items:
+                lines.extend(
+                    [
+                        f"- specialist_role: {hint.specialist_role}",
+                        f"  reason: {hint.reason}",
+                    ]
+                )
+        lines.extend(
+            [
+            "",
             "Project captain:",
             f"- role_id: {captain.persona.agent_role}",
             f"  human_name: {captain.persona.human_name}",
@@ -50,7 +65,8 @@ class CoordinatorTeamProposalService:
             ),
             "",
             "Proposed internal team:",
-        ]
+            ]
+        )
         for member in assembly.members:
             lines.extend(
                 [

@@ -121,6 +121,7 @@ from core.sandbox_workspace import (
     SandboxWorkspace,
     WorktreeHandle,
 )
+from core.specialization_hints import SpecializationHints
 from core.task_history import TaskHistory, TaskSummary
 from core.telegram_bridge import (
     BridgeReply,
@@ -643,6 +644,7 @@ def make_real_task_handler(
             owner_task_text=onboarding_context.owner_task_text,
             context_source=onboarding_context.context_source,
             personas=personas,
+            specialization_hints=SpecializationHints.empty(),
         )
         team_assembly = team_assembly_service.assemble_team(
             team_assembly_context

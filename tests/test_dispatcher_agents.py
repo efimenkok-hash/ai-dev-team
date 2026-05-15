@@ -339,6 +339,32 @@ class TestPmAgent:
         with pytest.raises(LLMDispatchError):
             registry["pm_agent"]("task")
 
+    def test_pm_system_prompt_includes_specialization_hints_field(self):
+        d, registry, _ = _patched_registry()
+
+        registry["pm_agent"]("planning output")
+
+        req: LLMRequest = d.dispatch.call_args[0][0]
+        system_prompt = req.messages[0]["content"]
+        assert '"specialization_hints": [' in system_prompt
+        assert '"specialization_hints": []' not in system_prompt
+        assert "specialization_hints ОБЯЗАНО присутствовать всегда" in system_prompt
+        assert "recommendation surface" in system_prompt
+
+    def test_pm_system_prompt_keeps_baseline_available_agents_only(self):
+        d, registry, _ = _patched_registry()
+
+        registry["pm_agent"]("planning output")
+
+        req: LLMRequest = d.dispatch.call_args[0][0]
+        system_prompt = req.messages[0]["content"]
+        available_agents_block = system_prompt.split("## INPUT", 1)[0]
+        assert "- writer_agent" in available_agents_block
+        assert "- fixer_agent" in available_agents_block
+        assert "security_agent" not in available_agents_block
+        assert "devops_agent" not in available_agents_block
+        assert "data_agent" not in available_agents_block
+
 
 class TestArchitectAgent:
     def test_returns_response_text(self):

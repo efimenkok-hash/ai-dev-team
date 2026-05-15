@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from core.agent_personas import AgentPersona, PersonaRegistry
 from core.agent_role_catalog import BASELINE_INTERNAL_TEAM_ROLE_ORDER
 from core.coordinator_onboarding import describe_context_source
 from core.coordinator_role import COORDINATOR_ROLE
 from core.project_registry import ProjectSnapshot
+from core.specialization_hints import SpecializationHints
 
 _VALID_TEAM_ASSEMBLY_CONTEXT_SOURCES = frozenset(
     {"bound_chat", "owner_dm_single_project"}
@@ -67,6 +68,9 @@ class CoordinatorTeamAssemblyContext:
     owner_task_text: str
     context_source: str
     personas: PersonaRegistry
+    specialization_hints: SpecializationHints = field(
+        default_factory=SpecializationHints.empty
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, ProjectSnapshot):
@@ -88,6 +92,11 @@ class CoordinatorTeamAssemblyContext:
         if not isinstance(self.personas, PersonaRegistry):
             raise ValueError(
                 f"invalid_persona_registry_type:{type(self.personas).__name__}"
+            )
+        if not isinstance(self.specialization_hints, SpecializationHints):
+            raise ValueError(
+                "invalid_specialization_hints_type:"
+                f"{type(self.specialization_hints).__name__}"
             )
         _validate_required_roles(self.personas)
 
@@ -130,6 +139,9 @@ class CoordinatorTeamAssembly:
     assembly_mode: str
     captain_role: str
     members: tuple[AssembledTeamMember, ...]
+    specialization_hints: SpecializationHints = field(
+        default_factory=SpecializationHints.empty
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, ProjectSnapshot):
@@ -154,6 +166,11 @@ class CoordinatorTeamAssembly:
             raise ValueError(f"invalid_captain_role:{self.captain_role!r}")
         if not isinstance(self.members, tuple) or not self.members:
             raise ValueError("members_must_be_non_empty_tuple")
+        if not isinstance(self.specialization_hints, SpecializationHints):
+            raise ValueError(
+                "invalid_specialization_hints_type:"
+                f"{type(self.specialization_hints).__name__}"
+            )
 
         member_roles: list[str] = []
         captain_count = 0
@@ -236,6 +253,7 @@ class CoordinatorTeamAssemblyService:
             assembly_mode="baseline_internal_team",
             captain_role=COORDINATOR_ROLE,
             members=members,
+            specialization_hints=context.specialization_hints,
         )
 
     def format_team_assembly(
@@ -256,8 +274,24 @@ class CoordinatorTeamAssemblyService:
             f"- context_source: {describe_context_source(assembly.context_source)}",
             f"- captain_role: {assembly.captain_role}",
             "",
-            "Roster:",
+            "Specialization hints:",
         ]
+        if assembly.specialization_hints.is_empty:
+            lines.append("- none")
+        else:
+            for hint in assembly.specialization_hints.items:
+                lines.extend(
+                    [
+                        f"- specialist_role: {hint.specialist_role}",
+                        f"  reason: {hint.reason}",
+                    ]
+                )
+        lines.extend(
+            [
+                "",
+            "Roster:",
+            ]
+        )
         for member in assembly.members:
             lines.extend(
                 [
