@@ -144,6 +144,12 @@
             <p class="summary-empty">No pending hire requests.</p>
           {% endif %}
         </div>
+
+        <div class="project-card-footer">
+          <a class="project-card-link" href="{{ request.url_for('project_team_view', project_id=project.project_id) }}">
+            Open team page
+          </a>
+        </div>
       </article>
 
       <article class="detail-card summary-card">

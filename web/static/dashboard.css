@@ -329,12 +329,28 @@ code {
   margin-bottom: 16px;
 }
 
+.page-chrome-split {
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+
+.page-context {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 0.92rem;
+}
+
 .hero-project {
   grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.7fr);
 }
 
 .project-facts {
   align-content: start;
+}
+
+.project-identity-grid-compact {
+  grid-template-columns: repeat(2, minmax(0, 220px));
 }
 
 .project-identity-grid {
@@ -484,6 +500,115 @@ code {
   line-height: 1.68;
 }
 
+.team-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  margin-top: 18px;
+}
+
+.team-card {
+  align-content: start;
+}
+
+.team-card-wide {
+  grid-column: 1 / -1;
+}
+
+.team-note {
+  margin-top: -6px;
+}
+
+.role-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.role-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 8px 12px;
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  font-size: 0.92rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.role-chip-baseline,
+.role-chip-resolved {
+  background: rgba(255, 255, 255, 0.78);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.role-chip-approved {
+  background: var(--green-soft);
+  border-color: rgba(30, 107, 74, 0.15);
+  color: var(--green);
+}
+
+.request-list {
+  display: grid;
+  gap: 12px;
+}
+
+.request-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px 18px;
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+}
+
+.request-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 12px;
+}
+
+.request-role {
+  color: var(--green);
+}
+
+.request-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.request-meta div {
+  display: grid;
+  gap: 6px;
+}
+
+.request-meta dt {
+  color: var(--text-soft);
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.request-meta dd {
+  margin: 0;
+  color: var(--text);
+}
+
+.request-reason {
+  margin: 0;
+  color: var(--text-muted);
+  line-height: 1.62;
+}
+
 @media (max-width: 920px) {
   .dashboard-shell {
     width: min(var(--content-width), calc(100vw - 24px));
@@ -492,12 +617,14 @@ code {
 
   .hero,
   .detail-grid,
-  .summary-grid {
+  .summary-grid,
+  .team-grid {
     grid-template-columns: 1fr;
   }
 
   .summary-metrics,
-  .policy-meta {
+  .policy-meta,
+  .request-meta {
     grid-template-columns: 1fr;
   }
 }
@@ -522,6 +649,12 @@ code {
 
   .project-card-header,
   .section-header {
+    flex-direction: column;
+    align-items: start;
+  }
+
+  .request-card-header,
+  .page-chrome-split {
     flex-direction: column;
     align-items: start;
   }

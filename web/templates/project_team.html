@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+
+{% block title %}{{ project.name }} team · AI Dev Team Web Office{% endblock %}
+
+{% block body %}
+  <main class="dashboard-shell">
+    <div class="page-chrome page-chrome-split">
+      <a class="back-link" href="{{ request.url_for('project_view', project_id=project.project_id) }}">Back to project</a>
+      <p class="page-context"><code>{{ project.project_id }}</code></p>
+    </div>
+
+    <section class="hero hero-project">
+      <div class="hero-copy">
+        <p class="hero-label">Project team</p>
+        <h1>{{ project.name }}</h1>
+        <p class="hero-text">
+          Persisted logical team state only. Approved specialists and pending hire requests are tracked separately and do not imply runtime activation.
+        </p>
+
+        <div class="project-identity-grid project-identity-grid-compact">
+          <article class="identity-item">
+            <span class="identity-label">Project status</span>
+            <strong class="identity-value identity-status">{{ project.status }}</strong>
+          </article>
+          <article class="identity-item">
+            <span class="identity-label">Project ID</span>
+            <strong class="identity-value"><code>{{ project.project_id }}</code></strong>
+          </article>
+        </div>
+      </div>
+
+      <div class="hero-metrics project-facts" aria-label="team metrics">
+        <article class="metric-card">
+          <span class="metric-label">Baseline internal team</span>
+          <strong class="metric-value">{{ team_summary.baseline_internal_team_size }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Approved specialists</span>
+          <strong class="metric-value">{{ team_summary.approved_specialist_count }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Pending hire requests</span>
+          <strong class="metric-value">{{ team_summary.pending_hire_request_count }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Resolved team size</span>
+          <strong class="metric-value">{{ team_summary.resolved_team_size }}</strong>
+        </article>
+      </div>
+    </section>
+
+    <section class="team-grid" aria-label="project team sections">
+      <article class="detail-card team-card">
+        <div class="detail-card-header">
+          <p class="section-kicker">Baseline</p>
+          <h2>Internal team</h2>
+        </div>
+        <p class="summary-empty team-note">These roles are part of the baseline internal team for every project.</p>
+        <ul class="role-list">
+          {% for role in baseline_internal_team_roles %}
+            <li class="role-chip role-chip-baseline" data-baseline-role="{{ role }}">
+              <code>{{ role }}</code>
+            </li>
+          {% endfor %}
+        </ul>
+      </article>
+
+      <article class="detail-card team-card">
+        <div class="detail-card-header">
+          <p class="section-kicker">Approved</p>
+          <h2>Specialist roster</h2>
+        </div>
+        {% if approved_specialists %}
+          <ul class="role-list">
+            {% for role in approved_specialists %}
+              <li class="role-chip role-chip-approved" data-approved-role="{{ role }}">
+                <code>{{ role }}</code>
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p class="summary-empty">No approved specialists yet.</p>
+        {% endif %}
+      </article>
+
+      <article class="detail-card team-card team-card-wide">
+        <div class="detail-card-header">
+          <p class="section-kicker">Pending</p>
+          <h2>Hire requests</h2>
+        </div>
+        <p class="summary-empty team-note">Pending requests stay outside resolved membership until approved.</p>
+        {% if pending_hire_requests %}
+          <div class="request-list">
+            {% for request_item in pending_hire_requests %}
+              <article
+                class="request-card"
+                data-request-id="{{ request_item.request_id }}"
+                data-pending-role="{{ request_item.specialist_role }}"
+              >
+                <div class="request-card-header">
+                  <strong><code>{{ request_item.request_id }}</code></strong>
+                  <span class="request-role"><code>{{ request_item.specialist_role }}</code></span>
+                </div>
+                <dl class="request-meta">
+                  <div>
+                    <dt>Source</dt>
+                    <dd>{{ request_item.source }}</dd>
+                  </div>
+                  <div>
+                    <dt>Created at</dt>
+                    <dd>{{ request_item.created_at }}</dd>
+                  </div>
+                </dl>
+                <p class="request-reason">{{ request_item.reason }}</p>
+              </article>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="summary-empty">No pending hire requests.</p>
+        {% endif %}
+      </article>
+
+      <article class="detail-card team-card team-card-wide">
+        <div class="detail-card-header">
+          <p class="section-kicker">Resolved</p>
+          <h2>Resolved team roles</h2>
+        </div>
+        <p class="summary-empty team-note">Resolved team roles include baseline first, then approved specialists only.</p>
+        <ul class="role-list">
+          {% for role in resolved_team_roles %}
+            <li class="role-chip role-chip-resolved" data-resolved-role="{{ role }}">
+              <code>{{ role }}</code>
+            </li>
+          {% endfor %}
+        </ul>
+      </article>
+    </section>
+  </main>
+{% endblock %}

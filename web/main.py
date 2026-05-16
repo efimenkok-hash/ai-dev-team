@@ -415,6 +415,37 @@ def _serialize_project_view_context(
     }
 
 
+def _serialize_project_team_view_context(
+    registry: ProjectRegistry,
+    project_id: str,
+) -> dict[str, object]:
+    if not isinstance(registry, ProjectRegistry):
+        raise ValueError(
+            f"invalid_project_registry_type:{type(registry).__name__}"
+        )
+    snapshot = _get_project_snapshot_or_404(registry, project_id)
+    normalized_project_id = snapshot.project.project_id
+    roster = registry.get_project_specialist_roster(normalized_project_id)
+    pending_requests = registry.list_pending_hire_requests(normalized_project_id)
+
+    return {
+        "project": _serialize_project(snapshot),
+        "team_summary": {
+            "baseline_internal_team_size": len(BASELINE_INTERNAL_TEAM_ROLE_ORDER),
+            "approved_specialist_count": len(roster.specialist_roles),
+            "pending_hire_request_count": len(pending_requests),
+            "resolved_team_size": len(roster.resolved_team_roles()),
+        },
+        "baseline_internal_team_roles": list(BASELINE_INTERNAL_TEAM_ROLE_ORDER),
+        "approved_specialists": list(roster.specialist_roles),
+        "pending_hire_requests": [
+            _serialize_pending_hire_request(request)
+            for request in pending_requests
+        ],
+        "resolved_team_roles": list(roster.resolved_team_roles()),
+    }
+
+
 def create_app(config: WebAppConfig | None = None) -> FastAPI:
     resolved_config = config if config is not None else WebAppConfig.from_env()
     if not isinstance(resolved_config, WebAppConfig):
@@ -478,6 +509,19 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
         return templates.TemplateResponse(
             request,
             name="project.html",
+            context={
+                "request": request,
+                **context,
+            },
+        )
+
+    @app.get("/projects/{project_id}/team", response_class=HTMLResponse)
+    def project_team_view(project_id: str, request: Request):
+        registry = get_project_registry(request)
+        context = _serialize_project_team_view_context(registry, project_id)
+        return templates.TemplateResponse(
+            request,
+            name="project_team.html",
             context={
                 "request": request,
                 **context,
