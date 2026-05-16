@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 
 from core.agent_bus_models import ProjectThread
 from core.agent_role_catalog import BASELINE_INTERNAL_TEAM_ROLE_ORDER
@@ -17,6 +18,11 @@ from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_team_state import ProjectSpecialistRoster
 from core.state_db import StateDB
 from core.task_history import TaskSummary
+from web.project_events import (
+    ProjectEventsStreamConfig,
+    resolve_project_snapshot,
+    stream_project_events,
+)
 
 DEFAULT_WEB_APP_NAME = "AI Dev Team Web Office API"
 DEFAULT_STATE_DB_PATH = Path("~/.ai-dev-team/state.db").expanduser()
@@ -54,6 +60,7 @@ class WebAppConfig:
     state_db_path: Path
     app_name: str = DEFAULT_WEB_APP_NAME
     debug: bool = False
+    project_events_poll_interval_seconds: float = 1.0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -66,6 +73,28 @@ class WebAppConfig:
         object.__setattr__(self, "app_name", self.app_name.strip())
         if not isinstance(self.debug, bool):
             raise ValueError(f"invalid_web_app_debug_type:{type(self.debug).__name__}")
+        if (
+            isinstance(self.project_events_poll_interval_seconds, bool)
+            or not isinstance(
+                self.project_events_poll_interval_seconds,
+                (int, float),
+            )
+        ):
+            raise ValueError(
+                "invalid_project_events_poll_interval_seconds:"
+                f"{self.project_events_poll_interval_seconds!r}"
+            )
+        normalized_poll_interval = float(self.project_events_poll_interval_seconds)
+        if not math.isfinite(normalized_poll_interval) or normalized_poll_interval <= 0:
+            raise ValueError(
+                "invalid_project_events_poll_interval_seconds:"
+                f"{self.project_events_poll_interval_seconds!r}"
+            )
+        object.__setattr__(
+            self,
+            "project_events_poll_interval_seconds",
+            normalized_poll_interval,
+        )
 
     @classmethod
     def from_env(cls) -> WebAppConfig:
@@ -97,25 +126,15 @@ def _get_project_snapshot_or_404(
     registry: ProjectRegistry,
     project_id: str,
 ) -> ProjectSnapshot:
-    if not isinstance(registry, ProjectRegistry):
-        raise ValueError(
-            "invalid_project_registry_type:"
-            f"{type(registry).__name__}"
-        )
     try:
-        snapshot = registry.get_project_snapshot(project_id)
+        snapshot = resolve_project_snapshot(registry, project_id)
     except ValueError as exc:
-        if str(exc).startswith("invalid_project_id:"):
+        if str(exc).startswith("unknown_project_id:") or str(exc) == "missing_project_id":
             raise HTTPException(
                 status_code=404,
                 detail=f"unknown_project_id:{project_id}",
             ) from exc
         raise
-    if snapshot is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"unknown_project_id:{project_id}",
-        )
     return snapshot
 
 
@@ -321,6 +340,9 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
     app.state.state_db = state_db
     app.state.state_db_fallback_in_use = state_db_fallback_in_use
     app.state.project_registry = project_registry
+    app.state.project_events_stream_config = ProjectEventsStreamConfig(
+        poll_interval_seconds=resolved_config.project_events_poll_interval_seconds
+    )
     app.state.coordinator_team_assembly_service = coordinator_team_assembly_service
     app.state.coordinator_team_proposal_service = coordinator_team_proposal_service
 
@@ -406,6 +428,24 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
         normalized_project_id = snapshot.project.project_id
         items = registry.list_project_threads(normalized_project_id)
         return _serialize_project_threads(normalized_project_id, items)
+
+    @app.websocket("/ws/events")
+    async def websocket_project_events(websocket: WebSocket) -> None:
+        registry = getattr(websocket.app.state, "project_registry", None)
+        if not isinstance(registry, ProjectRegistry):
+            raise RuntimeError("web_project_registry_unavailable")
+        stream_config = getattr(
+            websocket.app.state,
+            "project_events_stream_config",
+            None,
+        )
+        if not isinstance(stream_config, ProjectEventsStreamConfig):
+            raise RuntimeError("web_project_events_stream_config_unavailable")
+        await stream_project_events(
+            websocket,
+            registry=registry,
+            config=stream_config,
+        )
 
     return app
 
