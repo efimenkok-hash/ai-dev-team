@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from core.agent_bus_models import ProjectThread
 from core.hire_approval import PendingHireRequest
 from core.project_models import (
     Project,
@@ -198,6 +199,12 @@ class ProjectRegistry:
         limit: int = 20,
     ) -> list[TaskSummary]:
         return self._state_db.list_project_tasks(project_id, limit=limit)
+
+    def list_project_threads(
+        self,
+        project_id: str,
+    ) -> tuple[ProjectThread, ...]:
+        return self._state_db.list_project_threads(project_id)
 
     def set_project_policy(self, policy: ProjectPolicy) -> None:
         self._state_db.set_project_policy(policy)

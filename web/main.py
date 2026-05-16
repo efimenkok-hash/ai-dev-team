@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 
+from core.agent_bus_models import ProjectThread
 from core.agent_role_catalog import BASELINE_INTERNAL_TEAM_ROLE_ORDER
 from core.coordinator_team_assembly import CoordinatorTeamAssemblyService
 from core.coordinator_team_proposal import CoordinatorTeamProposalService
@@ -252,6 +253,40 @@ def _serialize_project_team(
     }
 
 
+def _serialize_project_thread(thread: ProjectThread) -> dict[str, object]:
+    if not isinstance(thread, ProjectThread):
+        raise ValueError(f"invalid_project_thread_type:{type(thread).__name__}")
+    return {
+        "thread_id": thread.thread_id,
+        "opened_by_role": thread.opened_by_role,
+        "status": thread.status,
+        "created_at": float(thread.created_at),
+        "last_message_at": float(thread.last_message_at),
+        "task_id": thread.task_id,
+    }
+
+
+def _serialize_project_threads(
+    project_id: str,
+    items: tuple[ProjectThread, ...],
+) -> dict[str, object]:
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise ValueError("empty_project_id")
+    if not isinstance(items, tuple):
+        raise ValueError(
+            f"invalid_project_threads_type:{type(items).__name__}"
+        )
+    serialized_items = [
+        _serialize_project_thread(thread)
+        for thread in items
+    ]
+    return {
+        "project_id": project_id,
+        "items": serialized_items,
+        "count": len(serialized_items),
+    }
+
+
 def create_app(config: WebAppConfig | None = None) -> FastAPI:
     resolved_config = config if config is not None else WebAppConfig.from_env()
     if not isinstance(resolved_config, WebAppConfig):
@@ -363,6 +398,14 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
             roster,
             pending_requests,
         )
+
+    @app.get("/api/projects/{project_id}/threads")
+    def project_threads(project_id: str, request: Request) -> dict[str, object]:
+        registry = get_project_registry(request)
+        snapshot = _get_project_snapshot_or_404(registry, project_id)
+        normalized_project_id = snapshot.project.project_id
+        items = registry.list_project_threads(normalized_project_id)
+        return _serialize_project_threads(normalized_project_id, items)
 
     return app
 
