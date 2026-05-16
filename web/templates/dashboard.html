@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+
+{% block title %}AI Dev Team Web Office{% endblock %}
+
+{% block body %}
+  <main class="dashboard-shell">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="hero-label">Web Office</p>
+        <h1>Project control plane</h1>
+        <p class="hero-text">
+          Persisted project state, surfaced truthfully from the backend contour without demo data or synthetic placeholders.
+        </p>
+      </div>
+      <div class="hero-metrics" aria-label="dashboard metrics">
+        <article class="metric-card">
+          <span class="metric-label">Total projects</span>
+          <strong class="metric-value">{{ metrics.total_projects }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Active projects</span>
+          <strong class="metric-value">{{ metrics.active_projects }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Runtime wired</span>
+          <strong class="metric-value">{{ metrics.runtime_bound_projects }}</strong>
+        </article>
+      </div>
+    </section>
+
+    <section class="projects-section" aria-labelledby="projects-heading">
+      <div class="section-header">
+        <div>
+          <p class="section-kicker">Persisted overview</p>
+          <h2 id="projects-heading">Projects</h2>
+        </div>
+        <p class="section-meta">{{ metrics.total_projects }} total</p>
+      </div>
+
+      {% if projects %}
+        <div class="project-grid">
+          {% for project in projects %}
+            <article class="project-card" data-project-id="{{ project.project_id }}">
+              <div class="project-card-header">
+                <div>
+                  <p class="project-status status-{{ project.status|lower }}">{{ project.status }}</p>
+                  <h3>{{ project.name }}</h3>
+                </div>
+                <p class="project-owner">Owner {{ project.owner_user_id }}</p>
+              </div>
+
+              <dl class="project-meta">
+                <div>
+                  <dt>Project ID</dt>
+                  <dd><code>{{ project.project_id }}</code></dd>
+                </div>
+                <div>
+                  <dt>Slug</dt>
+                  <dd><code>{{ project.slug }}</code></dd>
+                </div>
+              </dl>
+
+              <p class="project-description">{{ project.description }}</p>
+
+              <ul class="binding-list" aria-label="project bindings">
+                <li class="binding-pill binding-{{ 'ready' if project.has_policy else 'missing' }}">
+                  {{ "Policy wired" if project.has_policy else "Policy missing" }}
+                </li>
+                <li class="binding-pill binding-{{ 'ready' if project.has_chat_binding else 'missing' }}">
+                  {{ "Chat bound" if project.has_chat_binding else "Chat unbound" }}
+                </li>
+                <li class="binding-pill binding-{{ 'ready' if project.has_runtime_binding else 'missing' }}">
+                  {{ "Runtime bound" if project.has_runtime_binding else "Runtime unbound" }}
+                </li>
+              </ul>
+            </article>
+          {% endfor %}
+        </div>
+      {% else %}
+        <article class="empty-state" aria-live="polite">
+          <h3>No persisted projects yet.</h3>
+          <p>
+            The Web Office is wired to the real project registry. Register a project and it will appear here without any fake sample cards.
+          </p>
+        </article>
+      {% endif %}
+    </section>
+  </main>
+{% endblock %}

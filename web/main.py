@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 from core.agent_bus_models import ProjectThread
 from core.agent_role_catalog import BASELINE_INTERNAL_TEAM_ROLE_ORDER
@@ -30,6 +33,9 @@ DEFAULT_FALLBACK_STATE_DB_PATH = (
     Path(tempfile.gettempdir()) / "ai-dev-team-web" / "state.db"
 )
 DEFAULT_PROJECT_HISTORY_LIMIT = 20
+WEB_ROOT = Path(__file__).resolve().parent
+TEMPLATES_DIR = WEB_ROOT / "templates"
+STATIC_DIR = WEB_ROOT / "static"
 
 
 def _normalize_state_db_path(path: Path) -> Path:
@@ -306,6 +312,50 @@ def _serialize_project_threads(
     }
 
 
+def _collect_dashboard_projects(
+    registry: ProjectRegistry,
+) -> list[dict[str, object]]:
+    if not isinstance(registry, ProjectRegistry):
+        raise ValueError(
+            f"invalid_project_registry_type:{type(registry).__name__}"
+        )
+    return [
+        _serialize_project_snapshot(snapshot)
+        for snapshot in sorted(
+            registry.list_project_snapshots(),
+            key=lambda snapshot: snapshot.project.project_id,
+        )
+    ]
+
+
+def _serialize_dashboard_context(
+    projects: list[dict[str, object]],
+) -> dict[str, object]:
+    if not isinstance(projects, list):
+        raise ValueError(
+            f"invalid_dashboard_projects_type:{type(projects).__name__}"
+        )
+    total_projects = len(projects)
+    active_projects = sum(
+        1
+        for project in projects
+        if project.get("status") == "active"
+    )
+    runtime_bound_projects = sum(
+        1
+        for project in projects
+        if project.get("has_runtime_binding") is True
+    )
+    return {
+        "projects": projects,
+        "metrics": {
+            "total_projects": total_projects,
+            "active_projects": active_projects,
+            "runtime_bound_projects": runtime_bound_projects,
+        },
+    }
+
+
 def create_app(config: WebAppConfig | None = None) -> FastAPI:
     resolved_config = config if config is not None else WebAppConfig.from_env()
     if not isinstance(resolved_config, WebAppConfig):
@@ -331,20 +381,36 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
     project_registry = ProjectRegistry(state_db)
     coordinator_team_assembly_service = CoordinatorTeamAssemblyService()
     coordinator_team_proposal_service = CoordinatorTeamProposalService()
+    templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
     app = FastAPI(
         title=resolved_config.app_name,
         debug=resolved_config.debug,
     )
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.state.config = resolved_config
     app.state.state_db = state_db
     app.state.state_db_fallback_in_use = state_db_fallback_in_use
     app.state.project_registry = project_registry
+    app.state.templates = templates
     app.state.project_events_stream_config = ProjectEventsStreamConfig(
         poll_interval_seconds=resolved_config.project_events_poll_interval_seconds
     )
     app.state.coordinator_team_assembly_service = coordinator_team_assembly_service
     app.state.coordinator_team_proposal_service = coordinator_team_proposal_service
+
+    @app.get("/", response_class=HTMLResponse)
+    def dashboard(request: Request):
+        registry = get_project_registry(request)
+        context = _serialize_dashboard_context(_collect_dashboard_projects(registry))
+        return templates.TemplateResponse(
+            request,
+            name="dashboard.html",
+            context={
+                "request": request,
+                **context,
+            },
+        )
 
     @app.get("/healthz")
     def healthz(request: Request) -> dict[str, object]:
@@ -380,13 +446,7 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
     @app.get("/api/projects")
     def list_projects(request: Request) -> dict[str, object]:
         registry = get_project_registry(request)
-        items = [
-            _serialize_project_snapshot(snapshot)
-            for snapshot in sorted(
-                registry.list_project_snapshots(),
-                key=lambda snapshot: snapshot.project.project_id,
-            )
-        ]
+        items = _collect_dashboard_projects(registry)
         return {
             "items": items,
             "count": len(items),
