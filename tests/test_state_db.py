@@ -1669,6 +1669,57 @@ def test_recent_tasks_keeps_duplicate_entries_in_audit_log(tmp_path: Path):
     assert [item.final_state for item in recent] == ["FAIL", "SUCCESS"]
 
 
+def test_list_project_tasks_returns_newest_first_for_existing_project(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project(project_id="alpha_project", slug="alpha-project"))
+    db.record_task(
+        _summary(
+            task_id="task-old",
+            branch="feature/task-old",
+            finished_at=1000.0,
+            project_id="alpha_project",
+        )
+    )
+    db.record_task(
+        _summary(
+            task_id="task-new",
+            branch="feature/task-new",
+            finished_at=1001.0,
+            project_id="alpha_project",
+        )
+    )
+
+    recent = db.list_project_tasks("alpha_project", limit=20)
+
+    assert [item.task_id for item in recent] == ["task-new", "task-old"]
+
+
+def test_list_project_tasks_excludes_other_projects_and_legacy_rows(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project(project_id="alpha_project", slug="alpha-project"))
+    db.upsert_project(_project(project_id="beta_project", slug="beta-project"))
+    db.record_task(_summary(task_id="task-legacy", project_id=None))
+    db.record_task(_summary(task_id="task-beta", project_id="beta_project"))
+    db.record_task(_summary(task_id="task-alpha", project_id="alpha_project"))
+
+    recent = db.list_project_tasks("alpha_project", limit=20)
+
+    assert [item.task_id for item in recent] == ["task-alpha"]
+
+
+def test_list_project_tasks_returns_empty_for_existing_project_without_history(
+    tmp_path: Path,
+):
+    db = _make_db(tmp_path)
+    db.upsert_project(_project(project_id="alpha_project", slug="alpha-project"))
+
+    assert db.list_project_tasks("alpha_project", limit=20) == []
+
+
 def test_record_task_rejects_non_summary(tmp_path: Path):
     db = _make_db(tmp_path)
     with pytest.raises(ValueError, match="invalid_summary_type"):

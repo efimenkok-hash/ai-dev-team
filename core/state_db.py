@@ -499,6 +499,35 @@ class StateDB:
         ]
         return [summary for summary in summaries if summary is not None]
 
+    def list_project_tasks(
+        self,
+        project_id: str,
+        limit: int = 20,
+    ) -> list[TaskSummary]:
+        normalized_project_id = self._normalize_project_identifier(
+            project_id,
+            field_name="project_id",
+        )
+        self._validate_positive_int(limit, "limit")
+        with self._connect() as conn:
+            self._ensure_project_exists(conn, normalized_project_id)
+            rows = conn.execute(
+                """
+                SELECT task_id, branch, commit_sha, final_state,
+                       failure_reason, tier_name, finished_at, project_id
+                FROM task_history
+                WHERE project_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (normalized_project_id, limit),
+            ).fetchall()
+        summaries = [
+            self._row_to_task_summary(row)
+            for row in rows
+        ]
+        return [summary for summary in summaries if summary is not None]
+
     def trim_task_history(self, max_entries: int) -> None:
         self._validate_positive_int(max_entries, "max_entries")
         with self._lock, self._connect() as conn:

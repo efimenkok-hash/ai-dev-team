@@ -12,12 +12,14 @@ from core.coordinator_team_assembly import CoordinatorTeamAssemblyService
 from core.coordinator_team_proposal import CoordinatorTeamProposalService
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.state_db import StateDB
+from core.task_history import TaskSummary
 
 DEFAULT_WEB_APP_NAME = "AI Dev Team Web Office API"
 DEFAULT_STATE_DB_PATH = Path("~/.ai-dev-team/state.db").expanduser()
 DEFAULT_FALLBACK_STATE_DB_PATH = (
     Path(tempfile.gettempdir()) / "ai-dev-team-web" / "state.db"
 )
+DEFAULT_PROJECT_HISTORY_LIMIT = 20
 
 
 def _normalize_state_db_path(path: Path) -> Path:
@@ -163,6 +165,39 @@ def _serialize_project_status(snapshot: ProjectSnapshot) -> dict[str, object]:
     }
 
 
+def _serialize_task_summary(summary: TaskSummary) -> dict[str, object]:
+    if not isinstance(summary, TaskSummary):
+        raise ValueError(f"invalid_task_summary_type:{type(summary).__name__}")
+    return {
+        "task_id": summary.task_id,
+        "branch": summary.branch,
+        "commit_sha": summary.commit_sha,
+        "final_state": summary.final_state,
+        "failure_reason": summary.failure_reason,
+        "tier_name": summary.tier_name,
+        "finished_at": float(summary.finished_at),
+    }
+
+
+def _serialize_project_history(
+    project_id: str,
+    items: list[TaskSummary],
+) -> dict[str, object]:
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise ValueError("empty_project_id")
+    if not isinstance(items, list):
+        raise ValueError(f"invalid_history_items_type:{type(items).__name__}")
+    serialized_items = [
+        _serialize_task_summary(summary)
+        for summary in items
+    ]
+    return {
+        "project_id": project_id,
+        "items": serialized_items,
+        "count": len(serialized_items),
+    }
+
+
 def create_app(config: WebAppConfig | None = None) -> FastAPI:
     resolved_config = config if config is not None else WebAppConfig.from_env()
     if not isinstance(resolved_config, WebAppConfig):
@@ -251,6 +286,16 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
         registry = get_project_registry(request)
         snapshot = _get_project_snapshot_or_404(registry, project_id)
         return _serialize_project_status(snapshot)
+
+    @app.get("/api/projects/{project_id}/history")
+    def project_history(project_id: str, request: Request) -> dict[str, object]:
+        registry = get_project_registry(request)
+        snapshot = _get_project_snapshot_or_404(registry, project_id)
+        items = registry.list_project_task_history(
+            snapshot.project.project_id,
+            limit=DEFAULT_PROJECT_HISTORY_LIMIT,
+        )
+        return _serialize_project_history(snapshot.project.project_id, items)
 
     return app
 

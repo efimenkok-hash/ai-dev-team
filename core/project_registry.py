@@ -24,6 +24,7 @@ from core.project_models import (
 from core.project_runtime import ProjectRuntimeBinding
 from core.project_team_state import ProjectSpecialistRoster
 from core.state_db import StateDB
+from core.task_history import TaskSummary
 
 
 @dataclass(frozen=True)
@@ -190,6 +191,13 @@ class ProjectRegistry:
             self._build_snapshot(project)
             for project in self.list_projects()
         ]
+
+    def list_project_task_history(
+        self,
+        project_id: str,
+        limit: int = 20,
+    ) -> list[TaskSummary]:
+        return self._state_db.list_project_tasks(project_id, limit=limit)
 
     def set_project_policy(self, policy: ProjectPolicy) -> None:
         self._state_db.set_project_policy(policy)
