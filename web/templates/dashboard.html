@@ -73,6 +73,12 @@
                   {{ "Runtime bound" if project.has_runtime_binding else "Runtime unbound" }}
                 </li>
               </ul>
+
+              <div class="project-card-footer">
+                <a class="project-card-link" href="{{ request.url_for('project_view', project_id=project.project_id) }}">
+                  Open project overview
+                </a>
+              </div>
             </article>
           {% endfor %}
         </div>

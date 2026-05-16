@@ -192,6 +192,8 @@ def test_dashboard_renders_persisted_projects_in_deterministic_order_with_truthf
     assert "Total projects" in body
     assert "Active projects" in body
     assert "Runtime wired" in body
+    assert "/projects/alpha_project" in body
+    assert "/projects/alpha-project" not in body
     assert "/api/projects/alpha_project/team" not in body
     assert "Pending hire requests" not in body
     assert "Task history" not in body

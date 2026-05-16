@@ -33,6 +33,7 @@ DEFAULT_FALLBACK_STATE_DB_PATH = (
     Path(tempfile.gettempdir()) / "ai-dev-team-web" / "state.db"
 )
 DEFAULT_PROJECT_HISTORY_LIMIT = 20
+DEFAULT_PROJECT_OVERVIEW_PREVIEW_LIMIT = 3
 WEB_ROOT = Path(__file__).resolve().parent
 TEMPLATES_DIR = WEB_ROOT / "templates"
 STATIC_DIR = WEB_ROOT / "static"
@@ -356,6 +357,64 @@ def _serialize_dashboard_context(
     }
 
 
+def _serialize_project_view_context(
+    registry: ProjectRegistry,
+    project_id: str,
+) -> dict[str, object]:
+    if not isinstance(registry, ProjectRegistry):
+        raise ValueError(
+            f"invalid_project_registry_type:{type(registry).__name__}"
+        )
+    snapshot = _get_project_snapshot_or_404(registry, project_id)
+    normalized_project_id = snapshot.project.project_id
+    status_payload = _serialize_project_status(snapshot)
+    roster = registry.get_project_specialist_roster(normalized_project_id)
+    pending_requests = registry.list_pending_hire_requests(normalized_project_id)
+    history_items = registry.list_project_task_history(
+        normalized_project_id,
+        limit=DEFAULT_PROJECT_HISTORY_LIMIT,
+    )
+    thread_items = registry.list_project_threads(normalized_project_id)
+
+    history_preview = [
+        _serialize_task_summary(summary)
+        for summary in history_items[:DEFAULT_PROJECT_OVERVIEW_PREVIEW_LIMIT]
+    ]
+    thread_preview = [
+        _serialize_project_thread(thread)
+        for thread in thread_items[:DEFAULT_PROJECT_OVERVIEW_PREVIEW_LIMIT]
+    ]
+    pending_preview = [
+        _serialize_pending_hire_request(request)
+        for request in pending_requests[:DEFAULT_PROJECT_OVERVIEW_PREVIEW_LIMIT]
+    ]
+
+    return {
+        "project": status_payload["project"],
+        "bindings": status_payload["bindings"],
+        "policy": status_payload["policy"],
+        "team_summary": {
+            "approved_specialist_count": len(roster.specialist_roles),
+            "pending_hire_request_count": len(pending_requests),
+            "resolved_team_size": len(roster.resolved_team_roles()),
+            "approved_specialists_preview": list(
+                roster.specialist_roles[:DEFAULT_PROJECT_OVERVIEW_PREVIEW_LIMIT]
+            ),
+            "pending_hire_requests_preview": pending_preview,
+        },
+        "history_summary": {
+            "recent_task_count": len(history_items),
+            "latest_task": history_preview[0] if history_preview else None,
+            "preview_items": history_preview,
+        },
+        "threads_summary": {
+            "thread_count": len(thread_items),
+            "latest_thread": thread_preview[0] if thread_preview else None,
+            "preview_items": thread_preview,
+        },
+    }
+
+
 def create_app(config: WebAppConfig | None = None) -> FastAPI:
     resolved_config = config if config is not None else WebAppConfig.from_env()
     if not isinstance(resolved_config, WebAppConfig):
@@ -406,6 +465,19 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
         return templates.TemplateResponse(
             request,
             name="dashboard.html",
+            context={
+                "request": request,
+                **context,
+            },
+        )
+
+    @app.get("/projects/{project_id}", response_class=HTMLResponse)
+    def project_view(project_id: str, request: Request):
+        registry = get_project_registry(request)
+        context = _serialize_project_view_context(registry, project_id)
+        return templates.TemplateResponse(
+            request,
+            name="project.html",
             context={
                 "request": request,
                 **context,

@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+
+{% block title %}{{ project.name }} · AI Dev Team Web Office{% endblock %}
+
+{% block body %}
+  <main class="dashboard-shell">
+    <div class="page-chrome">
+      <a class="back-link" href="{{ request.url_for('dashboard') }}">Back to dashboard</a>
+    </div>
+
+    <section class="hero hero-project">
+      <div class="hero-copy">
+        <p class="hero-label">Project overview</p>
+        <h1>{{ project.name }}</h1>
+        <p class="hero-text">{{ project.description }}</p>
+
+        <div class="project-identity-grid">
+          <article class="identity-item">
+            <span class="identity-label">Project status</span>
+            <strong class="identity-value identity-status">{{ project.status }}</strong>
+          </article>
+          <article class="identity-item">
+            <span class="identity-label">Owner user</span>
+            <strong class="identity-value">{{ project.owner_user_id }}</strong>
+          </article>
+          <article class="identity-item">
+            <span class="identity-label">Project ID</span>
+            <strong class="identity-value"><code>{{ project.project_id }}</code></strong>
+          </article>
+          <article class="identity-item">
+            <span class="identity-label">Slug</span>
+            <strong class="identity-value"><code>{{ project.slug }}</code></strong>
+          </article>
+        </div>
+      </div>
+
+      <div class="hero-metrics project-facts" aria-label="project facts">
+        <article class="metric-card">
+          <span class="metric-label">Resolved team size</span>
+          <strong class="metric-value">{{ team_summary.resolved_team_size }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Recent tasks</span>
+          <strong class="metric-value">{{ history_summary.recent_task_count }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Persisted threads</span>
+          <strong class="metric-value">{{ threads_summary.thread_count }}</strong>
+        </article>
+      </div>
+    </section>
+
+    <section class="detail-grid" aria-label="project wiring and policy">
+      <article class="detail-card">
+        <div class="detail-card-header">
+          <p class="section-kicker">Wiring state</p>
+          <h2>Bindings</h2>
+        </div>
+        <ul class="binding-list">
+          <li class="binding-pill binding-{{ 'ready' if bindings.has_policy else 'missing' }}">
+            {{ "Policy wired" if bindings.has_policy else "Policy missing" }}
+          </li>
+          <li class="binding-pill binding-{{ 'ready' if bindings.has_chat_binding else 'missing' }}">
+            {{ "Chat bound" if bindings.has_chat_binding else "Chat unbound" }}
+          </li>
+          <li class="binding-pill binding-{{ 'ready' if bindings.has_runtime_binding else 'missing' }}">
+            {{ "Runtime bound" if bindings.has_runtime_binding else "Runtime unbound" }}
+          </li>
+        </ul>
+      </article>
+
+      <article class="detail-card">
+        <div class="detail-card-header">
+          <p class="section-kicker">Policy summary</p>
+          <h2>Project policy</h2>
+        </div>
+        {% if policy %}
+          <dl class="project-meta policy-meta">
+            <div>
+              <dt>Allow hiring</dt>
+              <dd>{{ "enabled" if policy.allow_hiring else "disabled" }}</dd>
+            </div>
+            <div>
+              <dt>Allow agent DM</dt>
+              <dd>{{ "enabled" if policy.allow_agent_dm else "disabled" }}</dd>
+            </div>
+            <div>
+              <dt>Owner approval for hires</dt>
+              <dd>{{ "required" if policy.require_owner_approval_for_hires else "not required" }}</dd>
+            </div>
+          </dl>
+        {% else %}
+          <p class="summary-empty">Policy is not configured for this project.</p>
+        {% endif %}
+      </article>
+    </section>
+
+    <section class="summary-grid" aria-label="project overview summaries">
+      <article class="detail-card summary-card">
+        <div class="detail-card-header">
+          <p class="section-kicker">Team state</p>
+          <h2>Team overview</h2>
+        </div>
+        <div class="summary-metrics">
+          <div>
+            <span class="summary-label">Approved specialists</span>
+            <strong class="summary-value">{{ team_summary.approved_specialist_count }}</strong>
+          </div>
+          <div>
+            <span class="summary-label">Pending hires</span>
+            <strong class="summary-value">{{ team_summary.pending_hire_request_count }}</strong>
+          </div>
+          <div>
+            <span class="summary-label">Resolved team size</span>
+            <strong class="summary-value">{{ team_summary.resolved_team_size }}</strong>
+          </div>
+        </div>
+
+        <div class="summary-subsection">
+          <h3>Approved specialists</h3>
+          {% if team_summary.approved_specialists_preview %}
+            <ul class="summary-list">
+              {% for role in team_summary.approved_specialists_preview %}
+                <li><code>{{ role }}</code></li>
+              {% endfor %}
+            </ul>
+          {% else %}
+            <p class="summary-empty">No approved specialists yet.</p>
+          {% endif %}
+        </div>
+
+        <div class="summary-subsection">
+          <h3>Pending hire requests</h3>
+          {% if team_summary.pending_hire_requests_preview %}
+            <ul class="summary-list">
+              {% for request_item in team_summary.pending_hire_requests_preview %}
+                <li>
+                  <strong><code>{{ request_item.specialist_role }}</code></strong>
+                  <span>{{ request_item.source }}</span>
+                </li>
+              {% endfor %}
+            </ul>
+          {% else %}
+            <p class="summary-empty">No pending hire requests.</p>
+          {% endif %}
+        </div>
+      </article>
+
+      <article class="detail-card summary-card">
+        <div class="detail-card-header">
+          <p class="section-kicker">Persisted history</p>
+          <h2>Recent tasks</h2>
+        </div>
+        <div class="summary-metrics single-metric">
+          <div>
+            <span class="summary-label">Recent persisted tasks</span>
+            <strong class="summary-value">{{ history_summary.recent_task_count }}</strong>
+          </div>
+        </div>
+
+        {% if history_summary.preview_items %}
+          <ul class="summary-list summary-list-dense">
+            {% for item in history_summary.preview_items %}
+              <li>
+                <strong><code>{{ item.task_id }}</code></strong>
+                <span>{{ item.final_state }} · {{ item.branch }}</span>
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p class="summary-empty">No persisted task history yet.</p>
+        {% endif %}
+      </article>
+
+      <article class="detail-card summary-card">
+        <div class="detail-card-header">
+          <p class="section-kicker">Backend threads</p>
+          <h2>Thread overview</h2>
+        </div>
+        <div class="summary-metrics single-metric">
+          <div>
+            <span class="summary-label">Persisted threads</span>
+            <strong class="summary-value">{{ threads_summary.thread_count }}</strong>
+          </div>
+        </div>
+
+        {% if threads_summary.preview_items %}
+          <ul class="summary-list summary-list-dense">
+            {% for item in threads_summary.preview_items %}
+              <li>
+                <strong><code>{{ item.thread_id }}</code></strong>
+                <span>{{ item.status }} · {{ item.opened_by_role }}{% if item.task_id %} · {{ item.task_id }}{% endif %}</span>
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p class="summary-empty">No persisted threads yet.</p>
+        {% endif %}
+      </article>
+    </section>
+  </main>
+{% endblock %}
