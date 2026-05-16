@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request
 
 from core.coordinator_team_assembly import CoordinatorTeamAssemblyService
 from core.coordinator_team_proposal import CoordinatorTeamProposalService
-from core.project_registry import ProjectRegistry
+from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.state_db import StateDB
 
 DEFAULT_WEB_APP_NAME = "AI Dev Team Web Office API"
@@ -87,6 +87,26 @@ def get_project_registry(request: Request) -> ProjectRegistry:
     return project_registry
 
 
+def _serialize_project_snapshot(snapshot: ProjectSnapshot) -> dict[str, object]:
+    if not isinstance(snapshot, ProjectSnapshot):
+        raise ValueError(
+            "invalid_project_snapshot_type:"
+            f"{type(snapshot).__name__}"
+        )
+    project = snapshot.project
+    return {
+        "project_id": project.project_id,
+        "slug": project.slug,
+        "name": project.name,
+        "description": project.description,
+        "status": project.status,
+        "owner_user_id": project.owner_user_id,
+        "has_policy": snapshot.policy is not None,
+        "has_chat_binding": snapshot.chat_binding is not None,
+        "has_runtime_binding": snapshot.runtime_binding is not None,
+    }
+
+
 def create_app(config: WebAppConfig | None = None) -> FastAPI:
     resolved_config = config if config is not None else WebAppConfig.from_env()
     if not isinstance(resolved_config, WebAppConfig):
@@ -153,6 +173,21 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
             "state_db_fallback_in_use": bool(
                 getattr(request.app.state, "state_db_fallback_in_use", False)
             ),
+        }
+
+    @app.get("/api/projects")
+    def list_projects(request: Request) -> dict[str, object]:
+        registry = get_project_registry(request)
+        items = [
+            _serialize_project_snapshot(snapshot)
+            for snapshot in sorted(
+                registry.list_project_snapshots(),
+                key=lambda snapshot: snapshot.project.project_id,
+            )
+        ]
+        return {
+            "items": items,
+            "count": len(items),
         }
 
     return app
