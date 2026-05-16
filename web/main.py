@@ -8,9 +8,12 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 
+from core.agent_role_catalog import BASELINE_INTERNAL_TEAM_ROLE_ORDER
 from core.coordinator_team_assembly import CoordinatorTeamAssemblyService
 from core.coordinator_team_proposal import CoordinatorTeamProposalService
+from core.hire_approval import PendingHireRequest
 from core.project_registry import ProjectRegistry, ProjectSnapshot
+from core.project_team_state import ProjectSpecialistRoster
 from core.state_db import StateDB
 from core.task_history import TaskSummary
 
@@ -198,6 +201,57 @@ def _serialize_project_history(
     }
 
 
+def _serialize_pending_hire_request(
+    request: PendingHireRequest,
+) -> dict[str, object]:
+    if not isinstance(request, PendingHireRequest):
+        raise ValueError(
+            "invalid_pending_hire_request_type:"
+            f"{type(request).__name__}"
+        )
+    return {
+        "request_id": request.request_id,
+        "specialist_role": request.specialist_role,
+        "reason": request.reason,
+        "source": request.source,
+        "created_at": float(request.created_at),
+    }
+
+
+def _serialize_project_team(
+    project_id: str,
+    roster: ProjectSpecialistRoster,
+    pending_requests: tuple[PendingHireRequest, ...],
+) -> dict[str, object]:
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise ValueError("empty_project_id")
+    if not isinstance(roster, ProjectSpecialistRoster):
+        raise ValueError(
+            "invalid_project_specialist_roster_type:"
+            f"{type(roster).__name__}"
+        )
+    if roster.project_id != project_id:
+        raise ValueError(
+            "project_specialist_roster_project_id_mismatch:"
+            f"{roster.project_id}!={project_id}"
+        )
+    if not isinstance(pending_requests, tuple):
+        raise ValueError(
+            "pending_hire_requests_must_be_tuple"
+        )
+    serialized_pending_requests = [
+        _serialize_pending_hire_request(request)
+        for request in pending_requests
+    ]
+    return {
+        "project_id": project_id,
+        "baseline_internal_team_roles": list(BASELINE_INTERNAL_TEAM_ROLE_ORDER),
+        "project_specialist_roster": list(roster.specialist_roles),
+        "resolved_team_roles": list(roster.resolved_team_roles()),
+        "pending_hire_requests": serialized_pending_requests,
+    }
+
+
 def create_app(config: WebAppConfig | None = None) -> FastAPI:
     resolved_config = config if config is not None else WebAppConfig.from_env()
     if not isinstance(resolved_config, WebAppConfig):
@@ -296,6 +350,19 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
             limit=DEFAULT_PROJECT_HISTORY_LIMIT,
         )
         return _serialize_project_history(snapshot.project.project_id, items)
+
+    @app.get("/api/projects/{project_id}/team")
+    def project_team(project_id: str, request: Request) -> dict[str, object]:
+        registry = get_project_registry(request)
+        snapshot = _get_project_snapshot_or_404(registry, project_id)
+        normalized_project_id = snapshot.project.project_id
+        roster = registry.get_project_specialist_roster(normalized_project_id)
+        pending_requests = registry.list_pending_hire_requests(normalized_project_id)
+        return _serialize_project_team(
+            normalized_project_id,
+            roster,
+            pending_requests,
+        )
 
     return app
 
