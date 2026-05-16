@@ -6,7 +6,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 
 from core.coordinator_team_assembly import CoordinatorTeamAssemblyService
 from core.coordinator_team_proposal import CoordinatorTeamProposalService
@@ -87,7 +87,33 @@ def get_project_registry(request: Request) -> ProjectRegistry:
     return project_registry
 
 
-def _serialize_project_snapshot(snapshot: ProjectSnapshot) -> dict[str, object]:
+def _get_project_snapshot_or_404(
+    registry: ProjectRegistry,
+    project_id: str,
+) -> ProjectSnapshot:
+    if not isinstance(registry, ProjectRegistry):
+        raise ValueError(
+            "invalid_project_registry_type:"
+            f"{type(registry).__name__}"
+        )
+    try:
+        snapshot = registry.get_project_snapshot(project_id)
+    except ValueError as exc:
+        if str(exc).startswith("invalid_project_id:"):
+            raise HTTPException(
+                status_code=404,
+                detail=f"unknown_project_id:{project_id}",
+            ) from exc
+        raise
+    if snapshot is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown_project_id:{project_id}",
+        )
+    return snapshot
+
+
+def _serialize_project(snapshot: ProjectSnapshot) -> dict[str, object]:
     if not isinstance(snapshot, ProjectSnapshot):
         raise ValueError(
             "invalid_project_snapshot_type:"
@@ -101,9 +127,39 @@ def _serialize_project_snapshot(snapshot: ProjectSnapshot) -> dict[str, object]:
         "description": project.description,
         "status": project.status,
         "owner_user_id": project.owner_user_id,
+    }
+
+
+def _serialize_project_snapshot(snapshot: ProjectSnapshot) -> dict[str, object]:
+    project = _serialize_project(snapshot)
+    return {
+        **project,
         "has_policy": snapshot.policy is not None,
         "has_chat_binding": snapshot.chat_binding is not None,
         "has_runtime_binding": snapshot.runtime_binding is not None,
+    }
+
+
+def _serialize_project_status(snapshot: ProjectSnapshot) -> dict[str, object]:
+    policy = snapshot.policy
+    return {
+        "project": _serialize_project(snapshot),
+        "bindings": {
+            "has_policy": policy is not None,
+            "has_chat_binding": snapshot.chat_binding is not None,
+            "has_runtime_binding": snapshot.runtime_binding is not None,
+        },
+        "policy": (
+            {
+                "allow_hiring": policy.allow_hiring,
+                "allow_agent_dm": policy.allow_agent_dm,
+                "require_owner_approval_for_hires": (
+                    policy.require_owner_approval_for_hires
+                ),
+            }
+            if policy is not None
+            else None
+        ),
     }
 
 
@@ -189,6 +245,12 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
             "items": items,
             "count": len(items),
         }
+
+    @app.get("/api/projects/{project_id}/status")
+    def project_status(project_id: str, request: Request) -> dict[str, object]:
+        registry = get_project_registry(request)
+        snapshot = _get_project_snapshot_or_404(registry, project_id)
+        return _serialize_project_status(snapshot)
 
     return app
 
