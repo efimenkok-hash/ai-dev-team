@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+
+{% block title %}{{ project.name }} history · AI Dev Team Web Office{% endblock %}
+
+{% block body %}
+  <main class="dashboard-shell">
+    <div class="page-chrome page-chrome-split">
+      <a class="back-link" href="{{ request.url_for('project_view', project_id=project.project_id) }}">Back to project</a>
+      <p class="page-context"><code>{{ project.project_id }}</code></p>
+    </div>
+
+    <section class="hero hero-project">
+      <div class="hero-copy">
+        <p class="hero-label">Project history</p>
+        <h1>{{ project.name }}</h1>
+        <p class="hero-text">
+          Persisted task history only. This page reflects the current recent-history window for this project and does not imply live activity, threads, or runtime internals.
+        </p>
+
+        <div class="project-identity-grid project-identity-grid-compact">
+          <article class="identity-item">
+            <span class="identity-label">Project status</span>
+            <strong class="identity-value identity-status">{{ project.status }}</strong>
+          </article>
+          <article class="identity-item">
+            <span class="identity-label">Project ID</span>
+            <strong class="identity-value"><code>{{ project.project_id }}</code></strong>
+          </article>
+        </div>
+      </div>
+
+      <div class="hero-metrics project-facts" aria-label="history metrics">
+        <article class="metric-card">
+          <span class="metric-label">Recent persisted tasks</span>
+          <strong class="metric-value">{{ history_summary.recent_task_count }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Latest final state</span>
+          <strong class="metric-value history-metric-copy">
+            {{ history_summary.latest_final_state if history_summary.latest_final_state else "No history" }}
+          </strong>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Latest branch</span>
+          <strong class="metric-value history-metric-copy">
+            {{ history_summary.latest_branch if history_summary.latest_branch else "None" }}
+          </strong>
+        </article>
+      </div>
+    </section>
+
+    <section class="history-section" aria-label="persisted task history">
+      <article class="detail-card history-card">
+        <div class="detail-card-header">
+          <p class="section-kicker">Persisted task history</p>
+          <h2>Recent tasks</h2>
+        </div>
+
+        {% if history_items %}
+          <div class="history-list">
+            {% for item in history_items %}
+              <article class="history-item" data-task-id="{{ item.task_id }}">
+                <div class="history-item-header">
+                  <div class="history-item-title">
+                    <strong><code>{{ item.task_id }}</code></strong>
+                    <span class="history-state-pill history-state-{{ item.final_state|lower }}">{{ item.final_state }}</span>
+                  </div>
+                  <span class="history-finished-at">{{ item.finished_at }}</span>
+                </div>
+
+                <dl class="history-meta">
+                  <div>
+                    <dt>Branch</dt>
+                    <dd><code>{{ item.branch }}</code></dd>
+                  </div>
+                  <div>
+                    <dt>Tier</dt>
+                    <dd>{{ item.tier_name }}</dd>
+                  </div>
+                  <div>
+                    <dt>Commit SHA</dt>
+                    <dd>{{ item.commit_sha if item.commit_sha else "None" }}</dd>
+                  </div>
+                </dl>
+
+                {% if item.failure_reason %}
+                  <p class="history-failure">Failure reason: {{ item.failure_reason }}</p>
+                {% endif %}
+              </article>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="summary-empty">No persisted task history yet.</p>
+        {% endif %}
+      </article>
+    </section>
+  </main>
+{% endblock %}

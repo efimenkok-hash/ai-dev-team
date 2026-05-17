@@ -446,6 +446,50 @@ def _serialize_project_team_view_context(
     }
 
 
+def _serialize_project_history_view_context(
+    registry: ProjectRegistry,
+    project_id: str,
+) -> dict[str, object]:
+    if not isinstance(registry, ProjectRegistry):
+        raise ValueError(
+            f"invalid_project_registry_type:{type(registry).__name__}"
+        )
+    snapshot = _get_project_snapshot_or_404(registry, project_id)
+    normalized_project_id = snapshot.project.project_id
+    history_items = registry.list_project_task_history(
+        normalized_project_id,
+        limit=DEFAULT_PROJECT_HISTORY_LIMIT,
+    )
+    serialized_items = [
+        _serialize_task_summary(summary)
+        for summary in history_items
+    ]
+    latest_task = serialized_items[0] if serialized_items else None
+    return {
+        "project": _serialize_project(snapshot),
+        "history_summary": {
+            "recent_task_count": len(serialized_items),
+            "latest_task": latest_task,
+            "latest_final_state": (
+                latest_task["final_state"]
+                if latest_task is not None
+                else None
+            ),
+            "latest_branch": (
+                latest_task["branch"]
+                if latest_task is not None
+                else None
+            ),
+            "latest_finished_at": (
+                latest_task["finished_at"]
+                if latest_task is not None
+                else None
+            ),
+        },
+        "history_items": serialized_items,
+    }
+
+
 def create_app(config: WebAppConfig | None = None) -> FastAPI:
     resolved_config = config if config is not None else WebAppConfig.from_env()
     if not isinstance(resolved_config, WebAppConfig):
@@ -522,6 +566,19 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
         return templates.TemplateResponse(
             request,
             name="project_team.html",
+            context={
+                "request": request,
+                **context,
+            },
+        )
+
+    @app.get("/projects/{project_id}/history", response_class=HTMLResponse)
+    def project_history_view(project_id: str, request: Request):
+        registry = get_project_registry(request)
+        context = _serialize_project_history_view_context(registry, project_id)
+        return templates.TemplateResponse(
+            request,
+            name="project_history.html",
             context={
                 "request": request,
                 **context,

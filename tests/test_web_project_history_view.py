@@ -6,8 +6,6 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from core.agent_bus_models import ProjectThread
-from core.hire_approval import PendingHireRequest
 from core.project_models import Project, ProjectChatBinding, ProjectPolicy
 from core.project_registry import ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
@@ -39,18 +37,12 @@ def _project(
     )
 
 
-def _policy(
-    project_id: str,
-    *,
-    allow_hiring: bool = True,
-    allow_agent_dm: bool = False,
-    require_owner_approval_for_hires: bool = True,
-) -> ProjectPolicy:
+def _policy(project_id: str) -> ProjectPolicy:
     return ProjectPolicy(
         project_id=project_id,
-        allow_hiring=allow_hiring,
-        allow_agent_dm=allow_agent_dm,
-        require_owner_approval_for_hires=require_owner_approval_for_hires,
+        allow_hiring=True,
+        allow_agent_dm=False,
+        require_owner_approval_for_hires=True,
     )
 
 
@@ -75,65 +67,6 @@ def _chat_binding(project_id: str, chat_id: int) -> ProjectChatBinding:
         project_id=project_id,
         chat_provider="telegram",
         chat_id=chat_id,
-    )
-
-
-def _pending_hire_request(
-    *,
-    request_id: str,
-    project_id: str,
-    specialist_role: str,
-    reason: str,
-    created_at: float,
-) -> PendingHireRequest:
-    return PendingHireRequest(
-        request_id=request_id,
-        project_id=project_id,
-        specialist_role=specialist_role,
-        reason=reason,
-        source="logical_hiring_pm_hint",
-        status="pending",
-        created_at=created_at,
-    )
-
-
-def _thread(
-    *,
-    project_id: str,
-    thread_id: str,
-    opened_by_role: str,
-    created_at: float,
-    last_message_at: float,
-    status: str = "open",
-    task_id: str | None = None,
-) -> ProjectThread:
-    return ProjectThread(
-        project_id=project_id,
-        thread_id=thread_id,
-        opened_by_role=opened_by_role,
-        status=status,
-        created_at=created_at,
-        last_message_at=last_message_at,
-        task_id=task_id,
-    )
-
-
-def _summary(
-    *,
-    task_id: str,
-    branch: str,
-    finished_at: float,
-    project_id: str,
-) -> TaskSummary:
-    return TaskSummary(
-        task_id=task_id,
-        branch=branch,
-        commit_sha="abc123def456789",
-        final_state="SUCCESS",
-        failure_reason=None,
-        tier_name="PREMIUM",
-        finished_at=finished_at,
-        project_id=project_id,
     )
 
 
@@ -181,14 +114,37 @@ def _snapshot(
     )
 
 
-def test_project_view_renders_truthful_happy_path_from_persisted_state(
+def _summary(
+    *,
+    task_id: str,
+    branch: str,
+    commit_sha: str | None = "abc123def456789",
+    final_state: str = "SUCCESS",
+    failure_reason: str | None = None,
+    tier_name: str = "PREMIUM",
+    finished_at: float = 1000.0,
+    project_id: str | None = None,
+) -> TaskSummary:
+    return TaskSummary(
+        task_id=task_id,
+        branch=branch,
+        commit_sha=commit_sha,
+        final_state=final_state,
+        failure_reason=failure_reason,
+        tier_name=tier_name,
+        finished_at=finished_at,
+        project_id=project_id,
+    )
+
+
+def test_project_history_view_renders_truthful_persisted_tasks_newest_first(
     tmp_path,
     monkeypatch,
 ):
     module = _import_web_main(tmp_path, monkeypatch)
     app = module.create_app(
         module.WebAppConfig(
-            state_db_path=tmp_path / "project-view.db",
+            state_db_path=tmp_path / "history-view.db",
             project_events_poll_interval_seconds=0.01,
         )
     )
@@ -206,95 +162,96 @@ def test_project_view_renders_truthful_happy_path_from_persisted_state(
             with_runtime_binding=True,
         )
     )
-    registry.add_project_specialist("alpha_project", "security_agent")
-    registry.create_pending_hire_request(
-        _pending_hire_request(
-            request_id="hire-alpha-devops",
-            project_id="alpha_project",
-            specialist_role="devops_agent",
-            reason="Deployment risk requires specialist review.",
-            created_at=1712345678.0,
+    registry.register_project(
+        _snapshot(
+            tmp_path,
+            project_id="beta_project",
+            slug="beta-project",
+            owner_user_id=202,
+            name="Beta Project",
+            description="Secondary project.",
+            with_policy=True,
+            with_chat_binding=True,
+            with_runtime_binding=True,
         )
     )
     app.state.state_db.record_task(
         _summary(
-            task_id="task-alpha-2",
-            branch="feature/task-alpha-2",
-            finished_at=2000.0,
+            task_id="task-alpha-older",
+            branch="feature/task-alpha-older",
+            commit_sha=None,
+            final_state="FAIL",
+            failure_reason="lint_failed",
+            tier_name="ECONOMY",
+            finished_at=1001.0,
             project_id="alpha_project",
         )
     )
     app.state.state_db.record_task(
         _summary(
-            task_id="task-alpha-1",
-            branch="feature/task-alpha-1",
-            finished_at=1000.0,
-            project_id="alpha_project",
+            task_id="task-beta-only",
+            branch="feature/task-beta-only",
+            finished_at=1002.0,
+            project_id="beta_project",
         )
     )
-    app.state.state_db.upsert_project_thread(
-        _thread(
-            project_id="alpha_project",
-            thread_id="thread_000002",
-            opened_by_role="architect_agent",
-            created_at=100.0,
-            last_message_at=300.0,
-            task_id="task-alpha-2",
+    app.state.state_db.record_task(
+        _summary(
+            task_id="task-legacy",
+            branch="feature/task-legacy",
+            finished_at=1003.0,
+            project_id=None,
         )
     )
-    app.state.state_db.upsert_project_thread(
-        _thread(
+    app.state.state_db.record_task(
+        _summary(
+            task_id="task-alpha-newer",
+            branch="feature/task-alpha-newer",
+            commit_sha="feedface12345678",
+            final_state="SUCCESS",
+            failure_reason=None,
+            tier_name="PREMIUM",
+            finished_at=1004.0,
             project_id="alpha_project",
-            thread_id="thread_000001",
-            opened_by_role="pm_agent",
-            created_at=50.0,
-            last_message_at=200.0,
-            task_id="task-alpha-1",
         )
     )
 
     with TestClient(app) as client:
-        response = client.get("/projects/alpha_project")
+        response = client.get("/projects/alpha_project/history")
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     body = response.text
     assert "Alpha Project" in body
     assert "alpha_project" in body
-    assert "alpha-project" in body
-    assert "Primary project." in body
-    assert "Owner user" in body
-    assert "Project status" in body
-    assert "Policy wired" in body
-    assert "Chat bound" in body
-    assert "Runtime bound" in body
-    assert "enabled" in body
-    assert "required" in body
-    assert "security_agent" in body
-    assert "devops_agent" in body
-    assert "Resolved team size" in body
-    assert "/projects/alpha_project/team" in body
-    assert "/projects/alpha-project/team" not in body
-    assert "/projects/alpha_project/history" in body
-    assert "/projects/alpha-project/history" not in body
+    assert "/projects/alpha_project" in body
+    assert "Project history" in body
+    assert "Persisted task history only." in body
     assert "Recent persisted tasks" in body
-    assert "task-alpha-2" in body
-    assert "feature/task-alpha-2" in body
-    assert "Persisted threads" in body
-    assert "thread_000002" in body
-    assert "architect_agent" in body
-    assert "Pending hire requests" in body
-    assert "Backend threads" in body
-    assert "Task history page" not in body
-    assert "Settings" not in body
+    assert body.index("task-alpha-newer") < body.index("task-alpha-older")
+    assert "feature/task-alpha-newer" in body
+    assert "SUCCESS" in body
+    assert "PREMIUM" in body
+    assert "feedface12345678" in body
+    assert "task-alpha-older" in body
+    assert "FAIL" in body
+    assert "ECONOMY" in body
+    assert "Failure reason: lint_failed" in body
+    assert "task-beta-only" not in body
+    assert "task-legacy" not in body
+    assert "thread_000001" not in body
+    assert "security_agent" not in body
+    assert "connected bot" not in body
 
 
-def test_project_view_renders_truthful_empty_sections_without_fake_activity(
+def test_project_history_view_renders_truthful_empty_state_without_fake_activity(
     tmp_path,
     monkeypatch,
 ):
     module = _import_web_main(tmp_path, monkeypatch)
-    app = module.create_app(module.WebAppConfig(state_db_path=tmp_path / "empty-sections.db"))
+    app = module.create_app(
+        module.WebAppConfig(state_db_path=tmp_path / "history-view-empty.db")
+    )
     app.state.project_registry.register_project(
         _snapshot(
             tmp_path,
@@ -303,38 +260,33 @@ def test_project_view_renders_truthful_empty_sections_without_fake_activity(
             owner_user_id=202,
             name="Beta Project",
             description="Secondary project.",
-            with_policy=False,
+            with_policy=True,
             with_chat_binding=False,
             with_runtime_binding=False,
         )
     )
 
     with TestClient(app) as client:
-        response = client.get("/projects/beta_project")
+        response = client.get("/projects/beta_project/history")
 
     assert response.status_code == 200
     body = response.text
     assert "Beta Project" in body
     assert "beta_project" in body
-    assert "beta-project" in body
-    assert "Policy missing" in body
-    assert "Chat unbound" in body
-    assert "Runtime unbound" in body
-    assert "Policy is not configured for this project." in body
-    assert "No approved specialists yet." in body
-    assert "No pending hire requests." in body
     assert "No persisted task history yet." in body
-    assert "No persisted threads yet." in body
     assert "task-alpha-1" not in body
-    assert "thread_000001" not in body
+    assert "feature/" not in body
+    assert "sample task" not in body.lower()
 
 
-def test_project_view_returns_truthful_404_for_unknown_and_slug_like_paths(
+def test_project_history_view_returns_truthful_404_for_unknown_and_slug_like_paths(
     tmp_path,
     monkeypatch,
 ):
     module = _import_web_main(tmp_path, monkeypatch)
-    app = module.create_app(module.WebAppConfig(state_db_path=tmp_path / "404.db"))
+    app = module.create_app(
+        module.WebAppConfig(state_db_path=tmp_path / "history-view-404.db")
+    )
     app.state.project_registry.register_project(
         _snapshot(
             tmp_path,
@@ -350,21 +302,21 @@ def test_project_view_returns_truthful_404_for_unknown_and_slug_like_paths(
     )
 
     with TestClient(app, raise_server_exceptions=False) as client:
-        unknown = client.get("/projects/ghost_project")
-        slug_like = client.get("/projects/alpha-project")
+        unknown = client.get("/projects/ghost_project/history")
+        slug_like = client.get("/projects/alpha-project/history")
 
     assert unknown.status_code == 404
     assert slug_like.status_code == 404
 
 
-def test_project_view_does_not_break_existing_web_surfaces(
+def test_project_history_view_does_not_break_existing_web_surfaces(
     tmp_path,
     monkeypatch,
 ):
     module = _import_web_main(tmp_path, monkeypatch)
     app = module.create_app(
         module.WebAppConfig(
-            state_db_path=tmp_path / "project-view-non-regression.db",
+            state_db_path=tmp_path / "history-view-non-regression.db",
             project_events_poll_interval_seconds=0.01,
         )
     )
@@ -385,6 +337,8 @@ def test_project_view_does_not_break_existing_web_surfaces(
     with TestClient(app) as client:
         dashboard = client.get("/")
         project_view = client.get("/projects/alpha_project")
+        team_view = client.get("/projects/alpha_project/team")
+        history_view = client.get("/projects/alpha_project/history")
         projects = client.get("/api/projects")
         status = client.get("/api/projects/alpha_project/status")
         history = client.get("/api/projects/alpha_project/history")
@@ -397,6 +351,8 @@ def test_project_view_does_not_break_existing_web_surfaces(
 
     assert dashboard.status_code == 200
     assert project_view.status_code == 200
+    assert team_view.status_code == 200
+    assert history_view.status_code == 200
     assert projects.status_code == 200
     assert status.status_code == 200
     assert history.status_code == 200

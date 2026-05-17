@@ -176,6 +176,12 @@
         {% else %}
           <p class="summary-empty">No persisted task history yet.</p>
         {% endif %}
+
+        <div class="project-card-footer">
+          <a class="project-card-link" href="{{ request.url_for('project_history_view', project_id=project.project_id) }}">
+            Open history page
+          </a>
+        </div>
       </article>
 
       <article class="detail-card summary-card">

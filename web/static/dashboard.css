@@ -145,6 +145,11 @@ code {
   letter-spacing: -0.04em;
 }
 
+.history-metric-copy {
+  font-size: 1.25rem;
+  line-height: 1.2;
+}
+
 .projects-section {
   display: grid;
   gap: 18px;
@@ -609,6 +614,108 @@ code {
   line-height: 1.62;
 }
 
+.history-section {
+  margin-top: 18px;
+}
+
+.history-card {
+  align-content: start;
+}
+
+.history-list {
+  display: grid;
+  gap: 12px;
+}
+
+.history-item {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+}
+
+.history-item-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 12px;
+}
+
+.history-item-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.history-state-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 6px 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.history-state-success {
+  background: var(--green-soft);
+  border-color: rgba(30, 107, 74, 0.15);
+  color: var(--green);
+}
+
+.history-state-fail {
+  background: var(--amber-soft);
+  border-color: rgba(143, 93, 18, 0.15);
+  color: var(--amber);
+}
+
+.history-finished-at {
+  color: var(--text-soft);
+  font-size: 0.92rem;
+  white-space: nowrap;
+}
+
+.history-meta,
+.request-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.history-meta div,
+.request-meta div {
+  display: grid;
+  gap: 6px;
+}
+
+.history-meta dt,
+.request-meta dt {
+  color: var(--text-soft);
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.history-meta dd,
+.request-meta dd {
+  margin: 0;
+  color: var(--text);
+}
+
+.history-failure {
+  margin: 0;
+  color: var(--amber);
+  line-height: 1.62;
+}
+
 @media (max-width: 920px) {
   .dashboard-shell {
     width: min(var(--content-width), calc(100vw - 24px));
@@ -624,7 +731,8 @@ code {
 
   .summary-metrics,
   .policy-meta,
-  .request-meta {
+  .request-meta,
+  .history-meta {
     grid-template-columns: 1fr;
   }
 }
@@ -654,7 +762,8 @@ code {
   }
 
   .request-card-header,
-  .page-chrome-split {
+  .page-chrome-split,
+  .history-item-header {
     flex-direction: column;
     align-items: start;
   }
