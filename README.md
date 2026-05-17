@@ -218,6 +218,8 @@ It does not use your real `REPO_PATH`; the test creates its own isolated temp re
 The active production roadmap lives in [docs/ROADMAP_TO_PRODUCTION.md](docs/ROADMAP_TO_PRODUCTION.md).
 The canonical pre-hosting operator runbook for the current architecture lives in
 [docs/DEPLOY_NEW_ARCHITECTURE.md](docs/DEPLOY_NEW_ARCHITECTURE.md).
+The canonical `C1.1` hosting provider decision record lives in
+[docs/HOSTING_PROVIDER_DECISION.md](docs/HOSTING_PROVIDER_DECISION.md).
 
 ## License
 

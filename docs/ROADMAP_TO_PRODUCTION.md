@@ -1,7 +1,9 @@
 # AI Dev Team v4 ULTRA — Roadmap to Production
 
 **Состояние на дату создания:** commit `4c58caf`, 1618 tests passed, ruff clean.
-**Бюджет:** ~$19 на оставшуюся работу + €5.83/mo за VPS.
+**Бюджет:** ~$19 на оставшуюся работу + текущий checked VPS baseline
+см. `docs/HOSTING_PROVIDER_DECISION.md` (`Hetzner Cloud CPX22`, `hel1`,
+`€8.49/mo` excl. VAT with `1 x Primary IPv4` on `2026-05-17`).
 
 Этот документ — самодостаточный план: можно дать любой нейросети (Sonnet 4.6 рекомендуется как основная модель, Opus только под аудит) и она поймёт, что делать. Каждая фаза имеет: цель, шаги, acceptance criteria, ориентировочную стоимость.
 
@@ -99,7 +101,9 @@
 
 ### Инфраструктура 24/7
 
-- **Hetzner CX22** (€5.83/mo) — 4GB Linux VPS
+- **Hetzner Cloud CPX22** (`hel1`) — current `C1.1` purchase-ready VPS choice;
+  exact checked cost and purchase status live in
+  `docs/HOSTING_PROVIDER_DECISION.md`
 - **systemd unit** для авто-рестарта при крашах
 - **nginx** reverse proxy с HTTPS через Let's Encrypt
 - **Daily backup** state.db в приватный GitHub-репо
@@ -190,7 +194,8 @@ class StateDB:
 
 #### C1. Hetzner setup (manual, ~30 min)
 1. Регистрация на hetzner.cloud
-2. Создать сервер CX22 (Ubuntu 24.04, дефолтный регион Helsinki)
+2. Создать сервер CPX22 (Ubuntu 24.04, `hel1` / Helsinki; exact checked
+   purchase-ready spec in `docs/HOSTING_PROVIDER_DECISION.md`)
 3. SSH-ключ в проект → подключение
 4. `apt update && apt install python3.12 python3.12-venv git nginx ufw`
 5. Установить gh CLI: https://cli.github.com (скрипт от GitHub)
@@ -447,7 +452,8 @@ The user mentioned: PostgreSQL. Apply these domain-specific guidelines:
 **Влезает в $19.33 ровно.** Если что-то пойдёт дольше — выкидывай в порядке: H4 → H1 → D (web) → E4 → G2.
 
 **Регулярные затраты после deploy**:
-- Hetzner CX22 — €5.83/mo (~$6.50/mo)
+- Hetzner Cloud CPX22 + `1 x Primary IPv4` — `€8.49/mo` excl. VAT (checked on
+  `2026-05-17`; see `docs/HOSTING_PROVIDER_DECISION.md`)
 - OpenRouter API — зависит от использования; ECONOMY tier ~$0.20-1 за задачу
 - Domain (опционально) — ~$10/yr
 
