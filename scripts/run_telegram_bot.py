@@ -10,16 +10,22 @@ Usage:
     python scripts/run_telegram_bot.py --log-level=DEBUG
 
 Required env (loaded from .env via python-dotenv):
-    TELEGRAM_BOT_TOKEN          — token from @BotFather
     TELEGRAM_OWNER_CHAT_ID      — your numeric chat id (whitelist)
+    TELEGRAM_BOT_TOKEN          — coordinator / single-bot compatibility token
 
 Optional env:
-    OPENAI_API_KEY              — enables voice (Whisper)
-    OPENROUTER_API_KEY          — enables vision (image description)
-    REPO_PATH                   — git repo path; enables real LLM pipeline
-                                  (requires OPENROUTER_API_KEY)
-    WORKTREE_ROOT               — optional custom worktree directory
+    STATE_DB_PATH               — canonical SQLite state path
+    TELEGRAM_AGENT_TOKENS       — canonical multi-bot role-to-env-key mapping
+    OPENROUTER_API_KEY          — canonical LLM + vision key
+    OPENAI_API_KEY              — Whisper voice transcription only
     BOT_COST_THRESHOLD_USD      — confirmation gate cost threshold (default 1.0)
+    OBS_LOG_PATH                — observability JSONL sink
+    LOG_LEVEL                   — logging level override
+
+Legacy compatibility / bootstrap env:
+    BOT_STATE_DIR               — legacy fallback directory for state.db
+    REPO_PATH                   — legacy single-project runtime seed only
+    WORKTREE_ROOT               — optional legacy worktree-root override
 
 This script keeps PTB-specific code at the boundary; all logic lives in
 core.bot_runner and core.telegram_bridge, both fully unit-tested without
@@ -64,6 +70,7 @@ from core.bot_runner import (  # noqa: E402
     get_required_env,
 )
 from core.coordinator_role import COORDINATOR_ROLE  # noqa: E402
+from core.env_layout import BotRuntimeEnvConfig  # noqa: E402
 from core.multi_bot_bridge import MultiBotBridge  # noqa: E402
 from core.multi_bot_runtime import BotIdentity  # noqa: E402
 from core.multi_bot_sender import (  # noqa: E402
@@ -228,6 +235,12 @@ def _setup_logging(level: str) -> None:
     # Quiet down PTB's verbose internal loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram.ext").setLevel(logging.INFO)
+
+
+def _load_runtime_env() -> tuple[dict[str, str], BotRuntimeEnvConfig]:
+    load_dotenv(dotenv_path=ROOT / ".env")
+    env = dict(os.environ)
+    return env, BotRuntimeEnvConfig.from_env(env)
 
 
 def _build_send_callable(application, loop):
@@ -884,20 +897,18 @@ async def _start_single_bot_application(
 
 
 async def main(argv: list[str] | None = None) -> int:
+    env, bot_env = _load_runtime_env()
     parser = argparse.ArgumentParser(
         description="Run AI Dev Team Telegram bot (long-polling).",
     )
     parser.add_argument(
         "--log-level",
-        default=os.environ.get("LOG_LEVEL", "INFO"),
+        default=bot_env.shared.log_level or "INFO",
         help="Logging level: DEBUG / INFO / WARNING / ERROR",
     )
     args = parser.parse_args(argv)
 
     _setup_logging(args.log_level)
-
-    load_dotenv(dotenv_path=ROOT / ".env")
-    env = dict(os.environ)
 
     ptb_runtime = _load_ptb_runtime()
     if ptb_runtime is None:
@@ -936,13 +947,16 @@ async def main(argv: list[str] | None = None) -> int:
         )
         logger.info(
             "Bot starting. Owner whitelist: %s",
-            env.get("TELEGRAM_OWNER_CHAT_ID"),
+            bot_env.telegram_owner_chat_id,
         )
-        logger.info("Whisper enabled: %s", bool(env.get("OPENAI_API_KEY")))
-        logger.info("Vision enabled: %s", bool(env.get("OPENROUTER_API_KEY")))
+        logger.info("Whisper enabled: %s", bool(bot_env.openai_api_key))
+        logger.info("Vision enabled: %s", bool(bot_env.openrouter_api_key))
         logger.info(
             "Real LLM pipeline: %s",
-            bool(env.get("OPENROUTER_API_KEY") and env.get("REPO_PATH")),
+            bool(
+                bot_env.openrouter_api_key
+                and bot_env.legacy.has_project_runtime_seed
+            ),
         )
         try:
             await _start_running_multi_bot_runtime(multi_runtime)
@@ -1004,12 +1018,15 @@ async def main(argv: list[str] | None = None) -> int:
         )
     )
 
-    logger.info("Bot starting. Owner whitelist: %s", env.get("TELEGRAM_OWNER_CHAT_ID"))
-    logger.info("Whisper enabled: %s", bool(env.get("OPENAI_API_KEY")))
-    logger.info("Vision enabled: %s", bool(env.get("OPENROUTER_API_KEY")))
+    logger.info("Bot starting. Owner whitelist: %s", bot_env.telegram_owner_chat_id)
+    logger.info("Whisper enabled: %s", bool(bot_env.openai_api_key))
+    logger.info("Vision enabled: %s", bool(bot_env.openrouter_api_key))
     logger.info(
         "Real LLM pipeline: %s",
-        bool(env.get("OPENROUTER_API_KEY") and env.get("REPO_PATH")),
+        bool(
+            bot_env.openrouter_api_key
+            and bot_env.legacy.has_project_runtime_seed
+        ),
     )
     try:
         legacy_report = await _start_single_bot_application(

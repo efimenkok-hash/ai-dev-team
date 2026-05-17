@@ -107,6 +107,21 @@ def test_module_level_app_imports_without_telegram_runtime_or_demo_data(
     assert module.app.state.state_db_fallback_in_use is False
 
 
+def test_web_app_config_from_env_supports_legacy_bot_state_dir_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "legacy-state"
+    monkeypatch.delenv("STATE_DB_PATH", raising=False)
+    monkeypatch.setenv("BOT_STATE_DIR", str(state_dir))
+    sys.modules.pop("web.main", None)
+
+    module = importlib.import_module("web.main")
+    config = module.WebAppConfig.from_env()
+
+    assert config.state_db_path == state_dir / "state.db"
+
+
 def test_module_level_app_import_is_safe_without_state_db_env_override(
     tmp_path,
     monkeypatch,
@@ -114,6 +129,7 @@ def test_module_level_app_import_is_safe_without_state_db_env_override(
     fake_home = tmp_path / "not-a-directory"
     fake_home.write_text("home sentinel", encoding="utf-8")
     monkeypatch.delenv("STATE_DB_PATH", raising=False)
+    monkeypatch.delenv("BOT_STATE_DIR", raising=False)
     monkeypatch.setenv("HOME", str(fake_home))
     sys.modules.pop("web.main", None)
 
@@ -136,6 +152,7 @@ def test_module_level_import_does_not_silently_fallback_on_broken_default_db(
     db_dir.mkdir(parents=True)
     (db_dir / "state.db").write_text("not sqlite", encoding="utf-8")
     monkeypatch.delenv("STATE_DB_PATH", raising=False)
+    monkeypatch.delenv("BOT_STATE_DIR", raising=False)
     monkeypatch.setenv("HOME", str(fake_home))
     sys.modules.pop("web.main", None)
 

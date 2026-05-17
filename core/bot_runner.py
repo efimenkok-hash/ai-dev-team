@@ -62,6 +62,12 @@ from core.coordinator_team_assembly import (
     CoordinatorTeamAssemblyService,
 )
 from core.dispatcher_agents import build_dispatcher_agent_registry_factory
+from core.env_layout import (
+    BotRuntimeEnvConfig,
+    read_optional_env_text,
+    resolve_legacy_tier_sessions_path_from_env,
+    resolve_state_db_path_from_env,
+)
 from core.llm_dispatcher import LLMDispatcher
 from core.model_tier import default_registry as default_tier_registry
 from core.multi_bot_bridge import MultiBotBridge
@@ -164,18 +170,18 @@ def build_whisper_client(env: Mapping[str, str]) -> WhisperClient | None:
     None signals to TelegramBridge: voice messages are not supported in
     this run.
     """
-    key = env.get("OPENAI_API_KEY")
-    if not isinstance(key, str) or not key.strip():
+    key = read_optional_env_text(env, "OPENAI_API_KEY")
+    if key is None:
         return None
-    return WhisperClient(api_key=key.strip())
+    return WhisperClient(api_key=key)
 
 
 def build_vision_client(env: Mapping[str, str]) -> VisionClient | None:
     """Returns VisionClient if OPENROUTER_API_KEY is set, else None."""
-    key = env.get("OPENROUTER_API_KEY")
-    if not isinstance(key, str) or not key.strip():
+    key = read_optional_env_text(env, "OPENROUTER_API_KEY")
+    if key is None:
         return None
-    return VisionClient(api_key=key.strip())
+    return VisionClient(api_key=key)
 
 
 def build_dispatcher_from_env(
@@ -190,10 +196,10 @@ def build_dispatcher_from_env(
     """
     if not isinstance(env, Mapping):
         raise ValueError("env_must_be_mapping")
-    key = env.get("OPENROUTER_API_KEY")
-    if not isinstance(key, str) or not key.strip():
+    key = read_optional_env_text(env, "OPENROUTER_API_KEY")
+    if key is None:
         return None
-    return LLMDispatcher(api_key=key.strip(), observability=observability)
+    return LLMDispatcher(api_key=key, observability=observability)
 
 
 def build_multi_bot_runtime_spec_from_env(
@@ -327,8 +333,8 @@ def _build_observability(env: Mapping[str, str]) -> Observability | None:
     Returns None silently if the var is absent, empty, or the path cannot be
     opened (e.g. directory does not exist and cannot be created).
     """
-    path = env.get("OBS_LOG_PATH", "").strip()
-    if not path:
+    path = BotRuntimeEnvConfig.from_env(env).shared.obs_log_path
+    if path is None:
         return None
     try:
         return Observability(sink=JsonLinesSink(path))
@@ -338,24 +344,11 @@ def _build_observability(env: Mapping[str, str]) -> Observability | None:
 
 def _resolve_state_db_path(env: Mapping[str, str]) -> Path:
     """Resolve SQLite persistence path with legacy-dir fallback."""
-    if not isinstance(env, Mapping):
-        raise ValueError("env_must_be_mapping")
-    raw = env.get("STATE_DB_PATH", "").strip()
-    if raw:
-        return Path(raw).expanduser()
-    legacy_dir = env.get("BOT_STATE_DIR", "").strip()
-    if legacy_dir:
-        return (Path(legacy_dir) / "state.db").expanduser()
-    return Path("~/.ai-dev-team/state.db").expanduser()
+    return resolve_state_db_path_from_env(env)
 
 
 def _resolve_legacy_tier_sessions_path(env: Mapping[str, str]) -> Path | None:
-    if not isinstance(env, Mapping):
-        raise ValueError("env_must_be_mapping")
-    legacy_dir = env.get("BOT_STATE_DIR", "").strip()
-    if not legacy_dir:
-        return None
-    return (Path(legacy_dir) / "tier_sessions.json").expanduser()
+    return resolve_legacy_tier_sessions_path_from_env(env)
 
 
 def _try_build_state_db(env: Mapping[str, str]) -> StateDB | None:
@@ -620,7 +613,7 @@ def build_real_task_handler_from_env(
 
 def build_confirmation_gate(env: Mapping[str, str]) -> ConfirmationGate:
     """Optional override of cost threshold via env BOT_COST_THRESHOLD_USD."""
-    raw = env.get("BOT_COST_THRESHOLD_USD", "").strip()
+    raw = read_optional_env_text(env, "BOT_COST_THRESHOLD_USD") or ""
     if raw:
         try:
             threshold = float(raw)
@@ -2607,7 +2600,10 @@ def build_bridge_from_env(
     if send_callable is None or not callable(send_callable):
         raise ValueError("send_callable_required")
 
-    owner_raw = get_required_env(env, "TELEGRAM_OWNER_CHAT_ID")
+    bot_env = BotRuntimeEnvConfig.from_env(env)
+    owner_raw = bot_env.telegram_owner_chat_id
+    if owner_raw is None:
+        raise ValueError("missing_env:TELEGRAM_OWNER_CHAT_ID")
     owner_chat_ids = parse_owner_chat_ids(owner_raw)
 
     personas = default_registry()

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 import sqlite3
 import tempfile
 from dataclasses import dataclass
@@ -16,6 +15,11 @@ from core.agent_bus_models import ProjectThread
 from core.agent_role_catalog import BASELINE_INTERNAL_TEAM_ROLE_ORDER
 from core.coordinator_team_assembly import CoordinatorTeamAssemblyService
 from core.coordinator_team_proposal import CoordinatorTeamProposalService
+from core.env_layout import (
+    STATE_DB_SOURCE_DEFAULT,
+    WebRuntimeEnvConfig,
+    default_state_db_path,
+)
 from core.hire_approval import PendingHireRequest
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_team_state import ProjectSpecialistRoster
@@ -28,7 +32,7 @@ from web.project_events import (
 )
 
 DEFAULT_WEB_APP_NAME = "AI Dev Team Web Office API"
-DEFAULT_STATE_DB_PATH = Path("~/.ai-dev-team/state.db").expanduser()
+DEFAULT_STATE_DB_PATH = default_state_db_path()
 DEFAULT_FALLBACK_STATE_DB_PATH = (
     Path(tempfile.gettempdir()) / "ai-dev-team-web" / "state.db"
 )
@@ -105,14 +109,8 @@ class WebAppConfig:
 
     @classmethod
     def from_env(cls) -> WebAppConfig:
-        state_db_path = os.environ.get("STATE_DB_PATH")
-        return cls(
-            state_db_path=(
-                Path(state_db_path)
-                if state_db_path is not None
-                else DEFAULT_STATE_DB_PATH
-            )
-        )
+        runtime_env = WebRuntimeEnvConfig.from_env()
+        return cls(state_db_path=runtime_env.state_db_path)
 
 
 def get_state_db(request: Request) -> StateDB:
@@ -542,7 +540,13 @@ def _serialize_project_settings_view_context(
 
 
 def create_app(config: WebAppConfig | None = None) -> FastAPI:
-    resolved_config = config if config is not None else WebAppConfig.from_env()
+    state_db_source = "explicit"
+    if config is None:
+        runtime_env = WebRuntimeEnvConfig.from_env()
+        resolved_config = WebAppConfig(state_db_path=runtime_env.state_db_path)
+        state_db_source = runtime_env.state_db_source
+    else:
+        resolved_config = config
     if not isinstance(resolved_config, WebAppConfig):
         raise ValueError(f"invalid_web_app_config_type:{type(resolved_config).__name__}")
 
@@ -552,7 +556,7 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
     except Exception as exc:
         if (
             config is not None
-            or os.environ.get("STATE_DB_PATH") is not None
+            or state_db_source != STATE_DB_SOURCE_DEFAULT
             or not _is_default_bootstrap_fallback_error(exc)
         ):
             raise

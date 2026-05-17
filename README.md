@@ -12,7 +12,7 @@ Current production scope: coordinator-led Telegram control plane, one active wor
 | Ruff | clean |
 | Python | >= 3.10 |
 | Real pipeline | OpenRouter + git worktree + commit + project-aware `/push` + project-aware `/pr` |
-| Persistence | SQLite (`STATE_DB_PATH`) with legacy fallback |
+| Persistence | SQLite (`STATE_DB_PATH`, with `BOT_STATE_DIR` compatibility fallback) |
 
 ## What Works Today
 
@@ -69,9 +69,10 @@ pip install -r requirements-dev.txt
 cp .env.example .env
 ```
 
-Minimum `.env` for legacy-compatible single-project bootstrap:
+Minimum `.env` for a canonical single-bot runtime with legacy single-project bootstrap:
 
 ```dotenv
+STATE_DB_PATH=/Users/you/.ai-dev-team/state.db
 OPENROUTER_API_KEY=sk-or-v1-...
 TELEGRAM_BOT_TOKEN=1234567890:...
 TELEGRAM_OWNER_CHAT_ID=123456789
@@ -95,11 +96,24 @@ If `OPENROUTER_API_KEY` is missing, or if the bot cannot resolve any routable pr
 
 ## Environment
 
-Required for the full pipeline:
+Canonical shared runtime env:
+
+- `STATE_DB_PATH` - primary SQLite path for persisted state used by both the Telegram runtime and Web Office.
+- `OBS_LOG_PATH` - optional JSONL observability sink for progress, performance, and cost snapshots.
+- `LOG_LEVEL` - optional logging override for `scripts/run_telegram_bot.py`.
+
+Canonical bot runtime env:
 
 - `OPENROUTER_API_KEY`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_OWNER_CHAT_ID`
+- `TELEGRAM_AGENT_TOKENS` - canonical multi-bot role-to-env-key mapping input. Format: `coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN`. The values inside this string are env-var names, not raw Telegram tokens. When present, the entrypoint starts one PTB `Application` per configured identity, probes every configured bot with Telegram `get_me()` before startup, fails fast if any configured identity is invalid or unreachable, routes inbound messages through `MultiBotBridge`, and chooses outbound bot identity from the envelope `sender_role` or explicit `delivery_role` with coordinator fallback if a specific sender is unavailable. Secondary private owner DMs now stay on the identity thread the owner used; secondary group inbound still resolves to `secondary_bot_inbound_not_enabled`. Bound project chats still emit agent lifecycle progress through the matching bot identity.
+- `OPENAI_API_KEY` - optional Whisper voice transcription key. It is not the primary LLM routing key.
+- `BOT_COST_THRESHOLD_USD` - optional confirmation threshold for expensive tasks.
+
+Canonical web runtime env:
+
+- `STATE_DB_PATH` - Web Office reads the same persisted SQLite state contract as the bot runtime.
 
 Project runtime resolution for the full pipeline:
 
@@ -111,14 +125,14 @@ Project runtime resolution for the full pipeline:
 
 Optional:
 
-- `OPENAI_API_KEY` - enables Whisper voice transcription.
-- `TELEGRAM_AGENT_TOKENS` - optional role-to-env-key mapping for multi-bot runtime startup. Format: `coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN`. The values inside this string are env-var names, not raw Telegram tokens. When present, the entrypoint starts one PTB `Application` per configured identity, probes every configured bot with Telegram `get_me()` before startup, fails fast if any configured identity is invalid or unreachable, routes inbound messages through `MultiBotBridge`, and chooses outbound bot identity from the envelope `sender_role` or explicit `delivery_role` with coordinator fallback if a specific sender is unavailable. Secondary private owner DMs now stay on the identity thread the owner used; secondary group inbound still resolves to `secondary_bot_inbound_not_enabled`. Bound project chats still emit agent lifecycle progress through the matching bot identity.
-- `REPO_PATH` - legacy bootstrap/fallback for single-project compatibility. It is no longer the sole source of runtime selection once projects with runtime bindings already exist in `StateDB`.
+Legacy compatibility / bootstrap env:
+
+- `BOT_STATE_DIR` - compatibility directory only. If `STATE_DB_PATH` is unset, the runtime falls back to `BOT_STATE_DIR/state.db`.
+- `REPO_PATH` - legacy single-project bootstrap seed only. It is no longer the primary multi-project routing truth once persisted project runtime bindings already exist in `StateDB`.
 - `WORKTREE_ROOT` - optional legacy bootstrap override for the worktree root.
-- `STATE_DB_PATH` - SQLite path for tier sessions, task history, budget state, and the project registry/runtime bindings.
-- `BOT_STATE_DIR` - legacy compatibility directory. If `STATE_DB_PATH` is unset, the bot uses `BOT_STATE_DIR/state.db`.
-- `BOT_COST_THRESHOLD_USD` - confirmation threshold for expensive tasks.
-- `OBS_LOG_PATH` - JSONL log sink for observability and cost snapshots.
+
+Optional developer / test env:
+
 - `AI_DEV_TEAM_REAL_LLM=1` - enables the opt-in real integration test.
 
 ## Commands

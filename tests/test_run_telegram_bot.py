@@ -1763,3 +1763,24 @@ def test_main_legacy_mode_still_builds_single_application(tmp_path):
     built_apps[0].start.assert_awaited_once()
     built_apps[0].updater.start_polling.assert_awaited_once()
     mock_build_bridge.assert_called_once()
+
+
+def test_main_uses_log_level_loaded_from_dotenv_when_flag_is_omitted():
+    env: dict[str, str] = {}
+
+    def _fake_load_dotenv(*, dotenv_path):
+        env["LOG_LEVEL"] = "debug"
+
+    with (
+        patch(
+            "scripts.run_telegram_bot.load_dotenv",
+            side_effect=_fake_load_dotenv,
+        ),
+        patch("scripts.run_telegram_bot.os.environ", env),
+        patch("scripts.run_telegram_bot._setup_logging") as mock_setup_logging,
+        patch("scripts.run_telegram_bot._load_ptb_runtime", return_value=None),
+    ):
+        rc = asyncio.run(script.main([]))
+
+    assert rc == 3
+    mock_setup_logging.assert_called_once_with("DEBUG")
