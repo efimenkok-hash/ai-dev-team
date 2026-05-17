@@ -277,6 +277,8 @@ def test_project_view_renders_truthful_happy_path_from_persisted_state(
     assert "/projects/alpha-project/team" not in body
     assert "/projects/alpha_project/history" in body
     assert "/projects/alpha-project/history" not in body
+    assert "/projects/alpha_project/settings" in body
+    assert "/projects/alpha-project/settings" not in body
     assert "Recent persisted tasks" in body
     assert "task-alpha-2" in body
     assert "feature/task-alpha-2" in body

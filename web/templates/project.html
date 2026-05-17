@@ -92,6 +92,12 @@
         {% else %}
           <p class="summary-empty">Policy is not configured for this project.</p>
         {% endif %}
+
+        <div class="project-card-footer">
+          <a class="project-card-link" href="{{ request.url_for('project_settings_view', project_id=project.project_id) }}">
+            Open settings page
+          </a>
+        </div>
       </article>
     </section>
 

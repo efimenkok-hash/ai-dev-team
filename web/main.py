@@ -490,6 +490,57 @@ def _serialize_project_history_view_context(
     }
 
 
+def _serialize_project_settings_view_context(
+    registry: ProjectRegistry,
+    project_id: str,
+) -> dict[str, object]:
+    if not isinstance(registry, ProjectRegistry):
+        raise ValueError(
+            f"invalid_project_registry_type:{type(registry).__name__}"
+        )
+    snapshot = _get_project_snapshot_or_404(registry, project_id)
+    policy = snapshot.policy
+    chat_binding = snapshot.chat_binding
+    runtime_binding = snapshot.runtime_binding
+    return {
+        "project": _serialize_project(snapshot),
+        "bindings": {
+            "has_policy": policy is not None,
+            "has_chat_binding": chat_binding is not None,
+            "has_runtime_binding": runtime_binding is not None,
+        },
+        "policy": (
+            {
+                "allow_hiring": policy.allow_hiring,
+                "allow_agent_dm": policy.allow_agent_dm,
+                "require_owner_approval_for_hires": (
+                    policy.require_owner_approval_for_hires
+                ),
+            }
+            if policy is not None
+            else None
+        ),
+        "chat_binding": (
+            {
+                "chat_provider": chat_binding.chat_provider,
+                "chat_id": chat_binding.chat_id,
+            }
+            if chat_binding is not None
+            else None
+        ),
+        "runtime_binding": (
+            {
+                "adapter_name": runtime_binding.adapter_name,
+                "base_branch": runtime_binding.base_branch,
+                "branch_prefix": runtime_binding.branch_prefix,
+                "language": runtime_binding.language,
+            }
+            if runtime_binding is not None
+            else None
+        ),
+    }
+
+
 def create_app(config: WebAppConfig | None = None) -> FastAPI:
     resolved_config = config if config is not None else WebAppConfig.from_env()
     if not isinstance(resolved_config, WebAppConfig):
@@ -579,6 +630,19 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
         return templates.TemplateResponse(
             request,
             name="project_history.html",
+            context={
+                "request": request,
+                **context,
+            },
+        )
+
+    @app.get("/projects/{project_id}/settings", response_class=HTMLResponse)
+    def project_settings_view(project_id: str, request: Request):
+        registry = get_project_registry(request)
+        context = _serialize_project_settings_view_context(registry, project_id)
+        return templates.TemplateResponse(
+            request,
+            name="project_settings.html",
             context={
                 "request": request,
                 **context,
