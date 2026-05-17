@@ -71,6 +71,7 @@ from core.bot_runner import (  # noqa: E402
 )
 from core.coordinator_role import COORDINATOR_ROLE  # noqa: E402
 from core.env_layout import BotRuntimeEnvConfig  # noqa: E402
+from core.healthcheck_model import build_bot_startup_healthcheck_report  # noqa: E402
 from core.multi_bot_bridge import MultiBotBridge  # noqa: E402
 from core.multi_bot_runtime import BotIdentity  # noqa: E402
 from core.multi_bot_sender import (  # noqa: E402
@@ -916,7 +917,11 @@ async def main(argv: list[str] | None = None) -> int:
     _setup_logging(args.log_level)
 
     validation_report = validate_bot_startup_config(env)
-    if validation_report.has_errors:
+    startup_health_report = build_bot_startup_healthcheck_report(
+        startup_validation_report=validation_report,
+        env_config=bot_env,
+    )
+    if startup_health_report.is_failed:
         logger.error(
             "Startup config validation failed:\n%s",
             format_startup_validation_report(validation_report),

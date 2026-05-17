@@ -148,6 +148,33 @@ def test_module_level_app_import_is_safe_without_state_db_env_override(
     assert module.app.state.project_registry.list_projects() == []
 
 
+def test_health_endpoints_keep_import_safe_fallback_truthful_without_fake_failure(
+    tmp_path,
+    monkeypatch,
+):
+    fake_home = tmp_path / "not-a-directory"
+    fake_home.write_text("home sentinel", encoding="utf-8")
+    monkeypatch.delenv("STATE_DB_PATH", raising=False)
+    monkeypatch.delenv("BOT_STATE_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(fake_home))
+    sys.modules.pop("web.main", None)
+
+    module = importlib.import_module("web.main")
+
+    with TestClient(module.app) as client:
+        health = client.get("/healthz")
+        ready = client.get("/readyz")
+
+    assert module.app.state.state_db_fallback_in_use is True
+    assert health.status_code == 200
+    assert ready.status_code == 200
+    assert health.json()["ok"] is True
+    assert ready.json()["ok"] is True
+    assert ready.json()["ready"] is True
+    assert health.json()["state_db_fallback_in_use"] is True
+    assert ready.json()["state_db_fallback_in_use"] is True
+
+
 def test_module_level_import_does_not_silently_fallback_on_broken_default_db(
     tmp_path,
     monkeypatch,

@@ -20,6 +20,10 @@ from core.env_layout import (
     WebRuntimeEnvConfig,
     default_state_db_path,
 )
+from core.healthcheck_model import (
+    build_web_liveness_healthcheck_report,
+    build_web_readiness_healthcheck_report,
+)
 from core.hire_approval import PendingHireRequest
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_team_state import ProjectSpecialistRoster
@@ -68,6 +72,15 @@ def _is_default_bootstrap_fallback_error(exc: Exception) -> bool:
             "attempt to write a readonly database",
         }
     return False
+
+
+def _safe_schema_version(state_db: object) -> int | None:
+    if not isinstance(state_db, StateDB):
+        return None
+    try:
+        return state_db.schema_version()
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True)
@@ -662,33 +675,58 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
 
     @app.get("/healthz")
     def healthz(request: Request) -> dict[str, object]:
-        registry = get_project_registry(request)
-        db = get_state_db(request)
+        state_db = getattr(request.app.state, "state_db", None)
+        project_registry = getattr(request.app.state, "project_registry", None)
+        fallback_in_use = bool(
+            getattr(request.app.state, "state_db_fallback_in_use", False)
+        )
+        health_report = build_web_liveness_healthcheck_report(
+            state_db=state_db,
+            state_db_fallback_in_use=fallback_in_use,
+        )
         return {
-            "ok": True,
+            "ok": not health_report.is_failed,
             "app": request.app.title,
-            "schema_version": db.schema_version(),
-            "project_registry_ready": isinstance(registry, ProjectRegistry),
-            "state_db_path": str(db.path),
-            "state_db_fallback_in_use": bool(
-                getattr(request.app.state, "state_db_fallback_in_use", False)
+            "schema_version": _safe_schema_version(state_db),
+            "project_registry_ready": isinstance(project_registry, ProjectRegistry),
+            "state_db_path": (
+                str(state_db.path)
+                if isinstance(state_db, StateDB)
+                else None
             ),
+            "state_db_fallback_in_use": fallback_in_use,
         }
 
     @app.get("/readyz")
     def readyz(request: Request) -> dict[str, object]:
-        registry = get_project_registry(request)
-        db = get_state_db(request)
+        state_db = getattr(request.app.state, "state_db", None)
+        project_registry = getattr(request.app.state, "project_registry", None)
+        fallback_in_use = bool(
+            getattr(request.app.state, "state_db_fallback_in_use", False)
+        )
+        startup_validation_report = getattr(
+            request.app.state,
+            "startup_validation_report",
+            StartupValidationReport(scope="web"),
+        )
+        readiness_report = build_web_readiness_healthcheck_report(
+            startup_validation_report=startup_validation_report,
+            state_db=state_db,
+            project_registry=project_registry,
+            state_db_fallback_in_use=fallback_in_use,
+        )
         return {
-            "ok": True,
-            "ready": True,
+            "ok": not readiness_report.is_failed,
+            "ready": not readiness_report.is_failed,
             "app": request.app.title,
-            "schema_version": db.schema_version(),
-            "project_registry_ready": isinstance(registry, ProjectRegistry),
-            "state_db_path": str(db.path),
-            "state_db_fallback_in_use": bool(
-                getattr(request.app.state, "state_db_fallback_in_use", False)
+            "schema_version": _safe_schema_version(state_db),
+            "project_registry_ready": isinstance(project_registry, ProjectRegistry),
+            "state_db_path": (
+                str(state_db.path)
+                if isinstance(state_db, StateDB)
+                else None
             ),
+            "state_db_fallback_in_use": fallback_in_use,
         }
 
     @app.get("/api/projects")
