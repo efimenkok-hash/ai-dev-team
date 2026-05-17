@@ -92,6 +92,18 @@ Run the Telegram bot:
 .venv/bin/python scripts/run_telegram_bot.py
 ```
 
+Create a verified local backup of `state.db`:
+
+```bash
+.venv/bin/python scripts/backup_state_db.py
+# or choose an explicit target dir:
+.venv/bin/python scripts/backup_state_db.py --backup-dir /Users/you/state-db-backups
+```
+
+This backup primitive stays local-only in `C0.4`: it creates a SQLite-consistent
+snapshot plus a small manifest sidecar, verifies the artifact locally, and does
+not yet add cron scheduling, remote upload, or retention automation.
+
 If `OPENROUTER_API_KEY` is missing, or if the bot cannot resolve any routable project runtime, it still starts, but only in the simple acknowledgement mode rather than the full multi-agent pipeline.
 
 ## Environment
