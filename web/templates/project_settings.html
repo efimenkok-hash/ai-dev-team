@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+
+{% block title %}{{ project.name }} settings · AI Dev Team Web Office{% endblock %}
+
+{% block body %}
+  <main class="dashboard-shell">
+    <div class="page-chrome page-chrome-split">
+      <a class="back-link" href="{{ request.url_for('project_view', project_id=project.project_id) }}">Back to project</a>
+      <p class="page-context"><code>{{ project.project_id }}</code></p>
+    </div>
+
+    <section class="hero hero-project">
+      <div class="hero-copy">
+        <p class="hero-label">Project settings</p>
+        <h1>{{ project.name }}</h1>
+        <p class="hero-text">
+          Persisted project policy and binding state only. This page is read-only and reflects configured snapshot data without edit controls or runtime health claims.
+        </p>
+
+        <div class="project-identity-grid project-identity-grid-compact">
+          <article class="identity-item">
+            <span class="identity-label">Project status</span>
+            <strong class="identity-value identity-status">{{ project.status }}</strong>
+          </article>
+          <article class="identity-item">
+            <span class="identity-label">Project ID</span>
+            <strong class="identity-value"><code>{{ project.project_id }}</code></strong>
+          </article>
+        </div>
+      </div>
+
+      <div class="hero-metrics project-facts" aria-label="settings metrics">
+        <article class="metric-card">
+          <span class="metric-label">Policy</span>
+          <strong class="metric-value history-metric-copy">{{ "Present" if bindings.has_policy else "Missing" }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Chat binding</span>
+          <strong class="metric-value history-metric-copy">{{ "Present" if bindings.has_chat_binding else "Missing" }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Runtime binding</span>
+          <strong class="metric-value history-metric-copy">{{ "Present" if bindings.has_runtime_binding else "Missing" }}</strong>
+        </article>
+      </div>
+    </section>
+
+    <section class="detail-grid settings-grid" aria-label="project settings sections">
+      <article class="detail-card settings-card">
+        <div class="detail-card-header">
+          <p class="section-kicker">Wiring state</p>
+          <h2>Binding presence</h2>
+        </div>
+        <ul class="binding-list">
+          <li class="binding-pill binding-{{ 'ready' if bindings.has_policy else 'missing' }}">
+            {{ "Policy present" if bindings.has_policy else "Policy missing" }}
+          </li>
+          <li class="binding-pill binding-{{ 'ready' if bindings.has_chat_binding else 'missing' }}">
+            {{ "Chat binding present" if bindings.has_chat_binding else "Chat binding missing" }}
+          </li>
+          <li class="binding-pill binding-{{ 'ready' if bindings.has_runtime_binding else 'missing' }}">
+            {{ "Runtime binding present" if bindings.has_runtime_binding else "Runtime binding missing" }}
+          </li>
+        </ul>
+      </article>
+
+      <article class="detail-card settings-card">
+        <div class="detail-card-header">
+          <p class="section-kicker">Policy state</p>
+          <h2>Project policy</h2>
+        </div>
+        {% if policy %}
+          <dl class="project-meta policy-meta">
+            <div>
+              <dt>Allow hiring</dt>
+              <dd>{{ "enabled" if policy.allow_hiring else "disabled" }}</dd>
+            </div>
+            <div>
+              <dt>Allow agent DM</dt>
+              <dd>{{ "enabled" if policy.allow_agent_dm else "disabled" }}</dd>
+            </div>
+            <div>
+              <dt>Owner approval for hires</dt>
+              <dd>{{ "required" if policy.require_owner_approval_for_hires else "not required" }}</dd>
+            </div>
+          </dl>
+        {% else %}
+          <p class="summary-empty">Policy is not configured for this project.</p>
+        {% endif %}
+      </article>
+
+      <article class="detail-card settings-card">
+        <div class="detail-card-header">
+          <p class="section-kicker">Chat binding</p>
+          <h2>Chat configuration</h2>
+        </div>
+        {% if chat_binding %}
+          <dl class="project-meta settings-meta">
+            <div>
+              <dt>Provider</dt>
+              <dd>{{ chat_binding.chat_provider }}</dd>
+            </div>
+            <div>
+              <dt>Chat ID</dt>
+              <dd>{{ chat_binding.chat_id }}</dd>
+            </div>
+          </dl>
+        {% else %}
+          <p class="summary-empty">Chat binding is not configured for this project.</p>
+        {% endif %}
+      </article>
+
+      <article class="detail-card settings-card">
+        <div class="detail-card-header">
+          <p class="section-kicker">Runtime binding</p>
+          <h2>Runtime configuration</h2>
+        </div>
+        {% if runtime_binding %}
+          <dl class="project-meta settings-meta">
+            <div>
+              <dt>Adapter</dt>
+              <dd>{{ runtime_binding.adapter_name }}</dd>
+            </div>
+            <div>
+              <dt>Base branch</dt>
+              <dd>{{ runtime_binding.base_branch }}</dd>
+            </div>
+            <div>
+              <dt>Branch prefix</dt>
+              <dd>{{ runtime_binding.branch_prefix }}</dd>
+            </div>
+            <div>
+              <dt>Language</dt>
+              <dd>{{ runtime_binding.language }}</dd>
+            </div>
+          </dl>
+        {% else %}
+          <p class="summary-empty">Runtime binding is not configured for this project.</p>
+        {% endif %}
+      </article>
+    </section>
+  </main>
+{% endblock %}
