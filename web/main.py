@@ -23,6 +23,10 @@ from core.env_layout import (
 from core.hire_approval import PendingHireRequest
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_team_state import ProjectSpecialistRoster
+from core.startup_config_validation import (
+    StartupValidationReport,
+    validate_web_startup_config,
+)
 from core.state_db import StateDB
 from core.task_history import TaskSummary
 from web.project_events import (
@@ -541,7 +545,9 @@ def _serialize_project_settings_view_context(
 
 def create_app(config: WebAppConfig | None = None) -> FastAPI:
     state_db_source = "explicit"
+    startup_validation_report = StartupValidationReport(scope="web")
     if config is None:
+        startup_validation_report = validate_web_startup_config(None)
         runtime_env = WebRuntimeEnvConfig.from_env()
         resolved_config = WebAppConfig(state_db_path=runtime_env.state_db_path)
         state_db_source = runtime_env.state_db_source
@@ -580,6 +586,7 @@ def create_app(config: WebAppConfig | None = None) -> FastAPI:
     app.state.config = resolved_config
     app.state.state_db = state_db
     app.state.state_db_fallback_in_use = state_db_fallback_in_use
+    app.state.startup_validation_report = startup_validation_report
     app.state.project_registry = project_registry
     app.state.templates = templates
     app.state.project_events_stream_config = ProjectEventsStreamConfig(

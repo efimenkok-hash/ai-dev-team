@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from core.project_models import Project, ProjectPolicy
 from core.project_registry import ProjectRegistry, ProjectSnapshot
 from core.project_runtime import ProjectRuntimeBinding
+from core.startup_config_validation import StartupValidationReport
 from core.state_db import StateDB
 
 
@@ -89,6 +90,8 @@ def test_create_app_builds_valid_project_aware_web_application(tmp_path, monkeyp
     assert app.debug is True
     assert isinstance(app.state.state_db, StateDB)
     assert isinstance(app.state.project_registry, ProjectRegistry)
+    assert isinstance(app.state.startup_validation_report, StartupValidationReport)
+    assert app.state.startup_validation_report.is_valid is True
     assert app.state.state_db.path == (tmp_path / "custom-state.db")
     assert app.state.state_db.schema_version() == 11
     assert app.state.state_db_fallback_in_use is False
@@ -103,6 +106,8 @@ def test_module_level_app_imports_without_telegram_runtime_or_demo_data(
     assert isinstance(module.app, FastAPI)
     assert isinstance(module.app.state.state_db, StateDB)
     assert isinstance(module.app.state.project_registry, ProjectRegistry)
+    assert isinstance(module.app.state.startup_validation_report, StartupValidationReport)
+    assert module.app.state.startup_validation_report.is_valid is True
     assert module.app.state.project_registry.list_projects() == []
     assert module.app.state.state_db_fallback_in_use is False
 

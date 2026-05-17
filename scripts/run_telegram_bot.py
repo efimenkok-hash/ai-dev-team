@@ -78,6 +78,10 @@ from core.multi_bot_sender import (  # noqa: E402
     PerRoleOutboundSender,
     RoleBoundSender,
 )
+from core.startup_config_validation import (  # noqa: E402
+    format_startup_validation_report,
+    validate_bot_startup_config,
+)
 from core.telegram_bridge import (  # noqa: E402
     IncomingMessage,
     OutgoingEnvelope,
@@ -86,6 +90,7 @@ from core.telegram_bridge import (  # noqa: E402
 
 logger = logging.getLogger("ai_dev_team.bot")
 _LIFECYCLE_SERVICE = BotIdentityLifecycleService()
+_CONFIG_FAILURE_EXIT_CODE = 2
 
 
 class _StartupLifecycleError(RuntimeError):
@@ -910,6 +915,19 @@ async def main(argv: list[str] | None = None) -> int:
 
     _setup_logging(args.log_level)
 
+    validation_report = validate_bot_startup_config(env)
+    if validation_report.has_errors:
+        logger.error(
+            "Startup config validation failed:\n%s",
+            format_startup_validation_report(validation_report),
+        )
+        return _CONFIG_FAILURE_EXIT_CODE
+    if validation_report.has_warnings:
+        logger.warning(
+            "Startup config warnings:\n%s",
+            format_startup_validation_report(validation_report),
+        )
+
     ptb_runtime = _load_ptb_runtime()
     if ptb_runtime is None:
         logger.error(
@@ -979,12 +997,12 @@ async def main(argv: list[str] | None = None) -> int:
         token = get_required_env(env, "TELEGRAM_BOT_TOKEN")
     except ValueError as exc:
         logger.error("Configuration error: %s", exc)
-        return 2
+        return _CONFIG_FAILURE_EXIT_CODE
 
     legacy_runtime_spec = build_multi_bot_runtime_spec_from_env(env)
     if legacy_runtime_spec is None:
         logger.error("Legacy runtime spec could not be built from TELEGRAM_BOT_TOKEN")
-        return 2
+        return _CONFIG_FAILURE_EXIT_CODE
 
     application = ptb_runtime.ApplicationBuilder().token(token).build()
     legacy_report = _LIFECYCLE_SERVICE.build_initial_report(legacy_runtime_spec)

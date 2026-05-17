@@ -27,6 +27,7 @@ from core.bot_identity_lifecycle import (  # noqa: E402
     MultiBotLifecycleReport,
 )
 from core.coordinator_role import COORDINATOR_ROLE  # noqa: E402
+from core.env_layout import BotRuntimeEnvConfig  # noqa: E402
 from core.multi_bot_bridge import MultiBotBridge  # noqa: E402
 from core.multi_bot_runtime import (  # noqa: E402
     BotIdentity,
@@ -733,6 +734,47 @@ def test_main_wires_send_progress_callable_into_build_bridge(tmp_path):
     assert callable(captured["send_progress_callable"])
     assert captured.get("send_progress_envelope_callable") is not None
     assert callable(captured["send_progress_envelope_callable"])
+
+
+def test_main_returns_config_failure_before_ptb_runtime_on_fatal_validation():
+    env = {"TELEGRAM_BOT_TOKEN": "123:legacy"}
+    bot_env = BotRuntimeEnvConfig.from_env(env)
+
+    with (
+        patch(
+            "scripts.run_telegram_bot._load_runtime_env",
+            return_value=(env, bot_env),
+        ),
+        patch("scripts.run_telegram_bot._setup_logging"),
+        patch("scripts.run_telegram_bot._load_ptb_runtime") as mock_ptb_runtime,
+    ):
+        rc = asyncio.run(script.main([]))
+
+    assert rc == 2
+    mock_ptb_runtime.assert_not_called()
+
+
+def test_main_cli_log_level_override_still_wins_over_env_default():
+    env: dict[str, str] = {}
+
+    def _fake_load_dotenv(*, dotenv_path):
+        env["LOG_LEVEL"] = "info"
+        env["TELEGRAM_OWNER_CHAT_ID"] = "777"
+        env["TELEGRAM_BOT_TOKEN"] = "123:legacy"
+
+    with (
+        patch(
+            "scripts.run_telegram_bot.load_dotenv",
+            side_effect=_fake_load_dotenv,
+        ),
+        patch("scripts.run_telegram_bot.os.environ", env),
+        patch("scripts.run_telegram_bot._setup_logging") as mock_setup_logging,
+        patch("scripts.run_telegram_bot._load_ptb_runtime", return_value=None),
+    ):
+        rc = asyncio.run(script.main(["--log-level", "ERROR"]))
+
+    assert rc == 3
+    mock_setup_logging.assert_called_once_with("ERROR")
 
 
 # ---------------------------------------------------------------------------
@@ -1770,6 +1812,8 @@ def test_main_uses_log_level_loaded_from_dotenv_when_flag_is_omitted():
 
     def _fake_load_dotenv(*, dotenv_path):
         env["LOG_LEVEL"] = "debug"
+        env["TELEGRAM_OWNER_CHAT_ID"] = "777"
+        env["TELEGRAM_BOT_TOKEN"] = "123:legacy"
 
     with (
         patch(
