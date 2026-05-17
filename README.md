@@ -104,6 +104,9 @@ This backup primitive stays local-only in `C0.4`: it creates a SQLite-consistent
 snapshot plus a small manifest sidecar, verifies the artifact locally, and does
 not yet add cron scheduling, remote upload, or retention automation.
 
+For the canonical pre-hosting operator runbook under the new architecture, see
+[docs/DEPLOY_NEW_ARCHITECTURE.md](docs/DEPLOY_NEW_ARCHITECTURE.md).
+
 If `OPENROUTER_API_KEY` is missing, or if the bot cannot resolve any routable project runtime, it still starts, but only in the simple acknowledgement mode rather than the full multi-agent pipeline.
 
 ## Environment
@@ -212,7 +215,9 @@ It does not use your real `REPO_PATH`; the test creates its own isolated temp re
 
 ## Roadmap
 
-The active production roadmap lives in [docs/ROADMAP_TO_PRODUCTION.md](docs/ROADMAP_TO_PRODUCTION.md). Current priorities after pipeline validation are VPS hosting, web office, multi-bot architecture, UX polish, and dynamic team expansion.
+The active production roadmap lives in [docs/ROADMAP_TO_PRODUCTION.md](docs/ROADMAP_TO_PRODUCTION.md).
+The canonical pre-hosting operator runbook for the current architecture lives in
+[docs/DEPLOY_NEW_ARCHITECTURE.md](docs/DEPLOY_NEW_ARCHITECTURE.md).
 
 ## License
 
