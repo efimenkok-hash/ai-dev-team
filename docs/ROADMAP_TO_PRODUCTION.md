@@ -110,6 +110,31 @@
 - **Healthcheck-бот** — алерт в Telegram при недоступности >5min
 - **Optional**: домен (~$10/yr) для красоты
 
+### Локальное развертывание
+
+Отдельный local-first трек существует до и вне VPS rollout.
+
+Его цель:
+
+- поднять AI Dev Team нативно локально
+- не использовать Docker
+- не трогать live Docker-mounted main project
+- пройти локальную сертификацию team/UI/pilot task до safe attach к основному
+  проекту
+
+Canonical operator docs for this track:
+
+- `docs/LOCAL_ISOLATED_PILOT_RUNBOOK.md`
+- `docs/LOCAL_ISOLATED_PILOT_STATUS.md`
+
+Последовательность локального трека:
+
+- `L0.1` — isolated local pilot docs + bootstrap baseline
+- `L0.2` — local team / agent certification
+- `L0.3` — local Web Office / UI certification
+- `L0.4` — local pilot task on a sandbox repo
+- `L0.5` — safe attach to the main project in assist-mode
+
 ---
 
 ## Раздел 3 — Phase-by-phase plan с бюджетом
@@ -467,14 +492,18 @@ The user mentioned: PostgreSQL. Apply these domain-specific guidelines:
 2. **A2** — фикс промптов если нашлись проблемы.
 3. **A3** — cost enforcement.
 4. **B1+B2** — SQLite (без неё web-dashboard и multi-bot становятся хрупкими).
-5. **C1** (твой manual) — поднять Hetzner.
-6. **C2** — systemd, бот переезжает на сервер. **С этого момента весь дальнейший дев происходит против live-бота на VPS.**
-7. **D1+D2+D3** — web dashboard.
-8. **E1** (твой manual) — создать 8 ботов.
-9. **E2+E3+E4** — multi-bot архитектура.
-10. **F1+F2+F3** — UI polish.
-11. **G1+G2+G3** — hiring новых агентов.
-12. **H1-H4** — hardening.
+5. **L0.1-L0.5** — isolated local pilot track без Docker и без прямого attach к
+   live main project.
+6. **C1** (твой manual) — поднять Hetzner, если VPS rollout по-прежнему нужен
+   после local pilot certification.
+7. **C2** — systemd, бот переезжает на сервер. **С этого момента весь
+   дальнейший дев происходит против live-бота на VPS.**
+8. **D1+D2+D3** — web dashboard.
+9. **E1** (твой manual) — создать 8 ботов.
+10. **E2+E3+E4** — multi-bot архитектура.
+11. **F1+F2+F3** — UI polish.
+12. **G1+G2+G3** — hiring новых агентов.
+13. **H1-H4** — hardening.
 
 ---
 
