@@ -177,13 +177,13 @@ def test_project_history_view_renders_truthful_persisted_tasks_newest_first(
     )
     app.state.state_db.record_task(
         _summary(
-            task_id="task-alpha-older",
-            branch="feature/task-alpha-older",
-            commit_sha=None,
-            final_state="FAIL",
-            failure_reason="lint_failed",
-            tier_name="ECONOMY",
-            finished_at=1001.0,
+            task_id="task-alpha-newer",
+            branch="feature/task-alpha-newer",
+            commit_sha="feedface12345678",
+            final_state="SUCCESS",
+            failure_reason=None,
+            tier_name="PREMIUM",
+            finished_at=1004.0,
             project_id="alpha_project",
         )
     )
@@ -205,13 +205,13 @@ def test_project_history_view_renders_truthful_persisted_tasks_newest_first(
     )
     app.state.state_db.record_task(
         _summary(
-            task_id="task-alpha-newer",
-            branch="feature/task-alpha-newer",
-            commit_sha="feedface12345678",
-            final_state="SUCCESS",
-            failure_reason=None,
-            tier_name="PREMIUM",
-            finished_at=1004.0,
+            task_id="task-alpha-older",
+            branch="feature/task-alpha-older",
+            commit_sha=None,
+            final_state="FAIL",
+            failure_reason="lint_failed",
+            tier_name="ECONOMY",
+            finished_at=1001.0,
             project_id="alpha_project",
         )
     )

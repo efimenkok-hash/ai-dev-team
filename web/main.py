@@ -243,6 +243,18 @@ def _serialize_project_history(
     }
 
 
+def _sort_task_summaries_recent_first(
+    items: list[TaskSummary],
+) -> list[TaskSummary]:
+    if not isinstance(items, list):
+        raise ValueError(f"invalid_task_summaries_type:{type(items).__name__}")
+    return sorted(
+        items,
+        key=lambda summary: (float(summary.finished_at), summary.task_id),
+        reverse=True,
+    )
+
+
 def _serialize_pending_hire_request(
     request: PendingHireRequest,
 ) -> dict[str, object]:
@@ -389,6 +401,7 @@ def _serialize_project_view_context(
         normalized_project_id,
         limit=DEFAULT_PROJECT_HISTORY_LIMIT,
     )
+    history_items = _sort_task_summaries_recent_first(history_items)
     thread_items = registry.list_project_threads(normalized_project_id)
 
     history_preview = [
@@ -475,6 +488,7 @@ def _serialize_project_history_view_context(
         normalized_project_id,
         limit=DEFAULT_PROJECT_HISTORY_LIMIT,
     )
+    history_items = _sort_task_summaries_recent_first(history_items)
     serialized_items = [
         _serialize_task_summary(summary)
         for summary in history_items

@@ -280,6 +280,7 @@ def test_project_view_renders_truthful_happy_path_from_persisted_state(
     assert "/projects/alpha_project/settings" in body
     assert "/projects/alpha-project/settings" not in body
     assert "Recent persisted tasks" in body
+    assert body.index("task-alpha-2") < body.index("task-alpha-1")
     assert "task-alpha-2" in body
     assert "feature/task-alpha-2" in body
     assert "Persisted threads" in body
