@@ -134,6 +134,7 @@ Canonical operator docs for this track:
 - `docs/LOCAL_SUCCESSFUL_TELEGRAM_TASK_LOOP.md`
 - `docs/LOCAL_TELEGRAM_QUALITY_BARRIER_DIAGNOSTICS.md`
 - `docs/LOCAL_LIVE_DIAGNOSTICS_DETAIL_CERTIFICATION.md`
+- `docs/LOCAL_LIVE_ROSTER_EXPANSION.md`
 
 Последовательность локального трека:
 
@@ -153,6 +154,8 @@ Canonical operator docs for this track:
   loops (`docs/LOCAL_TELEGRAM_QUALITY_BARRIER_DIAGNOSTICS.md`)
 - `L0.9` — fresh live diagnostics-detail proof on the patched runtime
   (`docs/LOCAL_LIVE_DIAGNOSTICS_DETAIL_CERTIFICATION.md`)
+- `L0.10` — next bounded live Telegram roster wave / per-role delivery proof
+  (`docs/LOCAL_LIVE_ROSTER_EXPANSION.md`)
 
 ---
 
