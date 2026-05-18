@@ -4,6 +4,8 @@ Checked on `2026-05-18`.
 
 Canonical runbook:
 - `docs/LOCAL_ISOLATED_PILOT_RUNBOOK.md`
+Canonical team certification:
+- `docs/LOCAL_TEAM_AGENT_CERTIFICATION.md`
 
 ## Outcome
 

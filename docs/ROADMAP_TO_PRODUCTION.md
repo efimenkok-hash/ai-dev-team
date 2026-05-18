@@ -126,11 +126,13 @@ Canonical operator docs for this track:
 
 - `docs/LOCAL_ISOLATED_PILOT_RUNBOOK.md`
 - `docs/LOCAL_ISOLATED_PILOT_STATUS.md`
+- `docs/LOCAL_TEAM_AGENT_CERTIFICATION.md`
 
 Последовательность локального трека:
 
 - `L0.1` — isolated local pilot docs + bootstrap baseline
 - `L0.2` — local team / agent certification
+  (`docs/LOCAL_TEAM_AGENT_CERTIFICATION.md`)
 - `L0.3` — local Web Office / UI certification
 - `L0.4` — local pilot task on a sandbox repo
 - `L0.5` — safe attach to the main project in assist-mode
