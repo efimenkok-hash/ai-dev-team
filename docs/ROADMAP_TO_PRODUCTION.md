@@ -130,6 +130,7 @@ Canonical operator docs for this track:
 - `docs/LOCAL_WEB_OFFICE_CERTIFICATION.md`
 - `docs/LOCAL_PILOT_TASK_EXECUTION.md`
 - `docs/LOCAL_LIVE_TELEGRAM_CONTOUR.md`
+- `docs/LOCAL_MULTI_AGENT_TELEGRAM_LOOP.md`
 
 Последовательность локального трека:
 
@@ -141,6 +142,8 @@ Canonical operator docs for this track:
   (`docs/LOCAL_PILOT_TASK_EXECUTION.md`)
 - `L0.5` — live local Telegram contour
   (`docs/LOCAL_LIVE_TELEGRAM_CONTOUR.md`)
+- `L0.6` — first live roster expansion / role-aware multi-agent Telegram loop
+  (`docs/LOCAL_MULTI_AGENT_TELEGRAM_LOOP.md`)
 
 ---
 
@@ -502,8 +505,9 @@ The user mentioned: PostgreSQL. Apply these domain-specific guidelines:
 2. **A2** — фикс промптов если нашлись проблемы.
 3. **A3** — cost enforcement.
 4. **B1+B2** — SQLite (без неё web-dashboard и multi-bot становятся хрупкими).
-5. **L0.1-L0.5** — isolated local pilot track без Docker, с первым real local
-   Telegram contour и без прямого attach к live main project.
+5. **L0.1-L0.6** — isolated local pilot track без Docker, с первым real local
+   Telegram contour, first bounded multi-agent task loop и без прямого attach к
+   live main project.
 6. **C1** (твой manual) — поднять Hetzner, если VPS rollout по-прежнему нужен
    после local pilot certification.
 7. **C2** — systemd, бот переезжает на сервер. **С этого момента весь
