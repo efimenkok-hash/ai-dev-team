@@ -135,6 +135,7 @@ Canonical operator docs for this track:
 - `docs/LOCAL_TELEGRAM_QUALITY_BARRIER_DIAGNOSTICS.md`
 - `docs/LOCAL_LIVE_DIAGNOSTICS_DETAIL_CERTIFICATION.md`
 - `docs/LOCAL_LIVE_ROSTER_EXPANSION.md`
+- `docs/LOCAL_SECURITY_AGENT_LIVE_IDENTITY.md`
 
 Последовательность локального трека:
 
@@ -156,6 +157,11 @@ Canonical operator docs for this track:
   (`docs/LOCAL_LIVE_DIAGNOSTICS_DETAIL_CERTIFICATION.md`)
 - `L0.10` — next bounded live Telegram roster wave / per-role delivery proof
   (`docs/LOCAL_LIVE_ROSTER_EXPANSION.md`)
+- `L0.11` — first specialist-to-live promotion for `security_agent`
+  (`docs/LOCAL_SECURITY_AGENT_LIVE_IDENTITY.md`)
+- `L0.12` — wire `TELEGRAM_SECURITY_BOT_TOKEN` and certify direct live DM
+  proof for `security_agent`
+  (`docs/LOCAL_SECURITY_AGENT_LIVE_IDENTITY.md`)
 
 ---
 

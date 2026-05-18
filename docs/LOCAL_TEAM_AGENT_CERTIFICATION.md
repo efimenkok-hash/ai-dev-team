@@ -129,7 +129,8 @@ Current truth:
 
 ## Runtime-Exposed Roles
 
-The current runtime-exposed roles are the baseline internal team roles only:
+The current runtime-exposed catalog now includes the baseline internal team
+plus the first promoted specialist subset:
 
 - `coordinator_agent`
 - `planning_agent`
@@ -140,20 +141,29 @@ The current runtime-exposed roles are the baseline internal team roles only:
 - `tester_agent`
 - `qa_agent`
 - `fixer_agent`
+- `security_agent`
 
-This is the truthful current meaning of runtime exposure at `L0.2`:
+This is the truthful current meaning of runtime exposure after `L0.11`:
 
 - these roles are the identities the current runtime/control-plane semantics
   are built around
 - they back the assembled baseline team shown in `/agents`
-- they are the only roles currently classified as runtime-exposed in
-  `core/agent_role_catalog.py`
+- `security_agent` remains a specialist role and does **not** become a
+  baseline internal team member
+- `security_agent` is only an optional live Telegram identity when
+  `TELEGRAM_AGENT_TOKENS` explicitly maps it to
+  `TELEGRAM_SECURITY_BOT_TOKEN`
+- the currently still-closed specialist roles remain `devops_agent` and
+  `data_agent`
+- the current live 3-bot contour still remains valid when that extra mapping
+  is absent
+- the exact specialist live-identity proof/boundary now lives in
+  `docs/LOCAL_SECURITY_AGENT_LIVE_IDENTITY.md`
 
 ## Logical-Only Roles
 
-The current logical-only roles are the specialist roles:
+The current still logical-only specialist roles are:
 
-- `security_agent`
 - `devops_agent`
 - `data_agent`
 
@@ -163,7 +173,10 @@ Logical-only means:
 - the role has a persona
 - the role can be selected/consulted logically
 - the role can be represented in project specialist state
-- the role is not yet separately certified here as a live Telegram bot identity
+- the role is not yet separately promoted as a live Telegram bot identity
+
+`security_agent` is no longer logical-only in the runtime-exposed catalog, but
+it still remains a specialist role rather than a baseline internal team role.
 
 This step does **not** certify that all logical roles are already fully
 separate Telegram bot identities.

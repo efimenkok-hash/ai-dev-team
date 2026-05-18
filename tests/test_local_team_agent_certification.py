@@ -33,7 +33,7 @@ def test_local_team_agent_certification_doc_covers_team_contract_truthfully():
         "devops_agent",
         "data_agent",
         "runtime-exposed roles",
-        "logical-only roles",
+        "Logical-Only Roles",
         "/agents",
         "/projects/{project_id}",
         "/projects/{project_id}/team",
@@ -41,6 +41,10 @@ def test_local_team_agent_certification_doc_covers_team_contract_truthfully():
         "TELEGRAM_OWNER_CHAT_ID",
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_AGENT_TOKENS",
+        "TELEGRAM_SECURITY_BOT_TOKEN",
+        "docs/LOCAL_SECURITY_AGENT_LIVE_IDENTITY.md",
+        "does **not** become a",
+        "baseline internal team member",
     )
 
     for marker in required_markers:

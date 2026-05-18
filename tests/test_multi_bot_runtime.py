@@ -84,10 +84,18 @@ def test_bot_identity_rejects_unknown_role():
         _identity(role="ghost_agent")
 
 
-@pytest.mark.parametrize(
-    "role",
-    ("security_agent", "devops_agent", "data_agent"),
-)
+def test_bot_identity_accepts_promoted_security_specialist_runtime_role():
+    identity = _identity(
+        role="security_agent",
+        token_env_key="TELEGRAM_SECURITY_BOT_TOKEN",
+        token="777:security",
+    )
+
+    assert identity.agent_role == "security_agent"
+    assert identity.token_env_key == "TELEGRAM_SECURITY_BOT_TOKEN"
+
+
+@pytest.mark.parametrize("role", ("devops_agent", "data_agent"))
 def test_bot_identity_rejects_specialist_role_not_runtime_exposed(role: str):
     with pytest.raises(
         ValueError,
@@ -467,6 +475,29 @@ def test_build_multi_bot_runtime_spec_accepts_partial_role_coverage():
     )
 
 
+def test_build_multi_bot_runtime_spec_accepts_promoted_security_identity():
+    spec = build_multi_bot_runtime_spec(
+        {
+            "TELEGRAM_AGENT_TOKENS": (
+                "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                "security_agent=TELEGRAM_SECURITY_BOT_TOKEN"
+            ),
+            "TELEGRAM_BOT_TOKEN": "123:coord",
+            "TELEGRAM_SECURITY_BOT_TOKEN": "777:security",
+        }
+    )
+
+    assert spec is not None
+    assert tuple(spec.role_map.by_role.keys()) == (
+        COORDINATOR_ROLE,
+        "security_agent",
+    )
+    assert (
+        spec.role_map.by_role["security_agent"].token_env_key
+        == "TELEGRAM_SECURITY_BOT_TOKEN"
+    )
+
+
 def test_build_multi_bot_runtime_spec_wraps_invalid_binding_syntax():
     with pytest.raises(
         ValueError,
@@ -506,7 +537,6 @@ def test_build_multi_bot_runtime_spec_uses_explicit_persona_registry_validation(
 @pytest.mark.parametrize(
     ("role", "env_key", "token"),
     (
-        ("security_agent", "TELEGRAM_SECURITY_BOT_TOKEN", "777:security"),
         ("devops_agent", "TELEGRAM_DEVOPS_BOT_TOKEN", "778:devops"),
         ("data_agent", "TELEGRAM_DATA_BOT_TOKEN", "779:data"),
     ),

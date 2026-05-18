@@ -64,8 +64,12 @@ def _role_map(*identities: BotIdentity) -> PerRoleBotMap:
     )
 
 
-def _runtime_env(tmp_path) -> dict[str, str]:
-    return {
+def _runtime_env(
+    tmp_path,
+    *,
+    include_security: bool = False,
+) -> dict[str, str]:
+    env = {
         "TELEGRAM_OWNER_CHAT_ID": "777",
         "STATE_DB_PATH": str(tmp_path / "state.db"),
         "TELEGRAM_AGENT_TOKENS": (
@@ -77,9 +81,19 @@ def _runtime_env(tmp_path) -> dict[str, str]:
         "TELEGRAM_WRITER_BOT_TOKEN": "456:writer",
         "TELEGRAM_REVIEWER_BOT_TOKEN": "789:reviewer",
     }
+    if include_security:
+        env["TELEGRAM_AGENT_TOKENS"] += (
+            ",security_agent=TELEGRAM_SECURITY_BOT_TOKEN"
+        )
+        env["TELEGRAM_SECURITY_BOT_TOKEN"] = "999:security"
+    return env
 
 
-def _make_bridge(task_handler) -> MultiBotBridge:
+def _make_bridge(
+    task_handler,
+    *,
+    include_security: bool = False,
+) -> MultiBotBridge:
     coordinator = _identity(
         token_env_key="TELEGRAM_BOT_TOKEN",
         token="123:coord",
@@ -94,6 +108,15 @@ def _make_bridge(task_handler) -> MultiBotBridge:
         token_env_key="TELEGRAM_REVIEWER_BOT_TOKEN",
         token="789:reviewer",
     )
+    identities = [coordinator, writer, reviewer]
+    if include_security:
+        identities.append(
+            _identity(
+                "security_agent",
+                token_env_key="TELEGRAM_SECURITY_BOT_TOKEN",
+                token="999:security",
+            )
+        )
 
     def _send(_out) -> None:
         return None
@@ -107,7 +130,7 @@ def _make_bridge(task_handler) -> MultiBotBridge:
     return MultiBotBridge(
         runtime_spec=MultiBotRuntimeSpec(
             primary_bot=coordinator,
-            role_map=_role_map(coordinator, writer, reviewer),
+            role_map=_role_map(*identities),
             source="telegram_agent_tokens",
         ),
         primary_bridge=primary_bridge,
@@ -119,20 +142,22 @@ def _build_runtime(
     *,
     ptb_runtime: MockPtbRuntime | None = None,
     bridge: MultiBotBridge | None = None,
+    include_security: bool = False,
 ) -> script.RunningMultiBotRuntime:
     resolved_ptb_runtime = ptb_runtime or MockPtbRuntime()
     resolved_bridge = bridge or _make_bridge(
         lambda _text, _msg: BridgeReply(
             persona_role=COORDINATOR_ROLE,
             body="принял",
-        )
+        ),
+        include_security=include_security,
     )
     with patch(
         "scripts.run_telegram_bot.build_multi_bot_bridge_from_env",
         return_value=resolved_bridge,
     ):
         runtime = script._build_running_multi_bot_runtime(
-            _runtime_env(tmp_path),
+            _runtime_env(tmp_path, include_security=include_security),
             ImmediateExecutorLoop(),
             ptb_runtime=resolved_ptb_runtime,
         )
@@ -234,6 +259,38 @@ def test_mock_ptb_runtime_builds_per_role_applications_truthfully(tmp_path):
     )
     for running in runtime.applications_by_role.values():
         assert len(running.application.handlers) == 1
+
+
+def test_mock_ptb_runtime_starts_promoted_security_identity_truthfully(
+    tmp_path,
+):
+    ptb_runtime = MockPtbRuntime(
+        app_specs_by_token={
+            "123:coord": MockPtbApplicationSpec(bot_username="coord_bot"),
+            "456:writer": MockPtbApplicationSpec(bot_username="writer_bot"),
+            "789:reviewer": MockPtbApplicationSpec(
+                bot_username="reviewer_bot"
+            ),
+            "999:security": MockPtbApplicationSpec(
+                bot_username="security_bot"
+            ),
+        }
+    )
+
+    runtime = _build_runtime(
+        tmp_path,
+        ptb_runtime=ptb_runtime,
+        include_security=True,
+    )
+
+    asyncio.run(script._start_running_multi_bot_runtime(runtime))
+
+    assert "security_agent" in runtime.applications_by_role
+    security_state = runtime.lifecycle_report.states_by_role["security_agent"]
+    assert security_state.reachability.reachable is True
+    assert security_state.reachability.bot_username == "security_bot"
+    assert security_state.started is True
+    assert security_state.polling_started is True
 
 
 def test_coordinator_inbound_reaches_bridge_through_registered_handler(tmp_path):

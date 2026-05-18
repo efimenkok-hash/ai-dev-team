@@ -170,4 +170,5 @@ def test_kb_for_role_rejects_unknown_role_honestly():
 
 def test_kb_does_not_change_runtime_exposed_role_semantics():
     assert has_role("security_agent") is True
-    assert is_runtime_exposed_agent_role("security_agent") is False
+    assert is_runtime_exposed_agent_role("security_agent") is True
+    assert is_runtime_exposed_agent_role("devops_agent") is False
