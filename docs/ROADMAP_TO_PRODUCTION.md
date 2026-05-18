@@ -127,6 +127,8 @@ Canonical operator docs for this track:
 - `docs/LOCAL_ISOLATED_PILOT_RUNBOOK.md`
 - `docs/LOCAL_ISOLATED_PILOT_STATUS.md`
 - `docs/LOCAL_TEAM_AGENT_CERTIFICATION.md`
+- `docs/LOCAL_WEB_OFFICE_CERTIFICATION.md`
+- `docs/LOCAL_PILOT_TASK_EXECUTION.md`
 
 Последовательность локального трека:
 
@@ -135,6 +137,7 @@ Canonical operator docs for this track:
   (`docs/LOCAL_TEAM_AGENT_CERTIFICATION.md`)
 - `L0.3` — local Web Office / UI certification
 - `L0.4` — local pilot task on a sandbox repo
+  (`docs/LOCAL_PILOT_TASK_EXECUTION.md`)
 - `L0.5` — safe attach to the main project in assist-mode
 
 ---
