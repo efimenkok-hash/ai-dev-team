@@ -39,10 +39,27 @@ def test_local_security_agent_live_identity_doc_is_truthful() -> None:
         "/api/projects/sandbox_project/threads",
         "task-1779122095-e24170",
         "@ai_dev_team_security_agent_bot",
+        "live identities before = `3`",
     )
 
     for marker in required_markers:
         assert marker in text
+
+    if "Outcome: `security_agent live identity certified`" in text:
+        certified_markers = (
+            "TELEGRAM_SECURITY_BOT_TOKEN_present=true",
+            "TELEGRAM_SECURITY_BOT_TOKEN_len=46",
+            "security_agent=TELEGRAM_SECURITY_BOT_TOKEN",
+            "`('coordinator_agent', 'reviewer_agent', 'security_agent', 'writer_agent')`",
+            "live identities after = `4`",
+            "`security_agent` is now live",
+            "`Координатор: 🛠 Доступные команды`",
+            "direct target chat: `@ai_dev_team_security_agent_bot`",
+            "the reply body for slash-commands is still coordinator-branded",
+            "not evidence that\n  `security_agent` activation failed",
+        )
+        for marker in certified_markers:
+            assert marker in text
 
     if "Outcome: `security_agent live identity partially blocked`" in text:
         blocked_markers = (
@@ -79,6 +96,7 @@ def test_roadmap_syncs_l11_security_agent_live_identity_step() -> None:
         in roadmap
     )
     assert "`L0.12`" in roadmap
+    assert "`L0.13`" in roadmap
     assert "TELEGRAM_SECURITY_BOT_TOKEN" in roadmap
     assert "direct live DM" in roadmap
     assert "security_agent" in roadmap

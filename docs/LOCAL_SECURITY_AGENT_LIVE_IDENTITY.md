@@ -1,29 +1,30 @@
-# L0.12 — live activation proof for `security_agent`
+# L0.13 — live direct-DM certification for `security_agent`
 
 ## Step scope
 
-This step is only about the first real live activation attempt for the already
-promoted specialist identity:
+This step closes the first promoted specialist activation:
 
 - `security_agent` remains a specialist role
 - `security_agent` does not become a baseline internal team member
-- `security_agent` may become a fourth live Telegram identity only through a
-  real local `TELEGRAM_SECURITY_BOT_TOKEN`
-- this step is about real token wiring, startup truth, and a direct DM proof
+- `security_agent` is allowed as an optional live Telegram identity only
+  through explicit local env wiring
+- this step is only about the real local secret path, live runtime startup,
+  reachability, polling, and one bounded direct DM proof
 
 This step does **not**:
 
 - activate `devops_agent`
 - activate `data_agent`
+- open a broader specialist wave
 - jump to 20–30 live bots
 - attach Hedgekeeper
 - enable write-assisted main-project work
 - start VPS/prod rollout
-- introduce any broad UI or product refactor
+- introduce any broad UI or orchestration refactor
 
-## Exact env/token contract
+## Exact local env/token contract
 
-The runtime/doc contract from `L0.11` remains valid:
+The runtime/doc contract from `L0.11-L0.12` remains valid:
 
 - `security_agent` is an optional live Telegram identity
 - it is enabled only when `TELEGRAM_AGENT_TOKENS` explicitly maps
@@ -36,96 +37,117 @@ The runtime/doc contract from `L0.11` remains valid:
 - example:
   `TELEGRAM_AGENT_TOKENS=coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN,reviewer_agent=TELEGRAM_REVIEWER_BOT_TOKEN,security_agent=TELEGRAM_SECURITY_BOT_TOKEN`
 
-Actual local env truth on this Mac during `L0.12`:
+Actual local env truth on this Mac during accepted `L0.13` work:
 
 - `TELEGRAM_OWNER_CHAT_ID_present=true`
 - `TELEGRAM_BOT_TOKEN_present=true`
 - `TELEGRAM_WRITER_BOT_TOKEN_present=true`
 - `TELEGRAM_REVIEWER_BOT_TOKEN_present=true`
-- `TELEGRAM_SECURITY_BOT_TOKEN_present=false`
-- `TELEGRAM_SECURITY_BOT_TOKEN_len=0`
-- current `TELEGRAM_AGENT_TOKENS` still equals:
-  `coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN,reviewer_agent=TELEGRAM_REVIEWER_BOT_TOKEN`
+- `TELEGRAM_SECURITY_BOT_TOKEN_present=true`
+- `TELEGRAM_SECURITY_BOT_TOKEN_len=46`
+- actual local `TELEGRAM_AGENT_TOKENS` equals:
+  `coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN,reviewer_agent=TELEGRAM_REVIEWER_BOT_TOKEN,security_agent=TELEGRAM_SECURITY_BOT_TOKEN`
 
-So the local secret/token path needed for a real `security_agent` activation is
-still absent.
+Important truthfulness note:
 
-## Actual live runtime path used
+- the token did already exist locally in a saved env snapshot before this step
+- `L0.13` converted that from a saved local secret snapshot into the actual
+  runtime env path by merging the required values into the real local `.env`
+- the stray repo-root `.env.save` file was then removed from the workspace root
+  so the secret no longer sat in an untracked non-runtime snapshot there
 
-The `L0.12` activation attempt stayed truthful and stopped at the precondition
-boundary instead of faking a startup:
+## Exact runtime path actually used
 
-1. load the actual local `.env`
-2. verify presence/absence of the required Telegram token keys
-3. build the current multi-bot spec from the real env
-4. confirm that the current real contour still resolves only to:
-   `('coordinator_agent', 'reviewer_agent', 'writer_agent')`
-5. attempt the minimal truthful activation shape by extending
-   `TELEGRAM_AGENT_TOKENS` in-memory with:
-   `security_agent=TELEGRAM_SECURITY_BOT_TOKEN`
-6. stop on the exact runtime blocker:
-   `ValueError: telegram_agent_token_env_missing:TELEGRAM_SECURITY_BOT_TOKEN`
+`L0.13` used the real local contour and the same isolated live DB/log path that
+already backed the certified local Telegram contour:
 
-Because the real token path is still absent, there was no truthful basis to
-start a new 4-bot PTB runtime, call Telegram `getMe`, or claim polling for a
-live `security_agent` bot.
+1. merge the saved local `TELEGRAM_SECURITY_BOT_TOKEN` and
+   `TELEGRAM_AGENT_TOKENS` values into the actual local `.env`
+2. confirm that `.env.save` is no longer present at the repo root
+3. verify the real local env resolves to a 4-role runtime contract:
+   `('coordinator_agent', 'reviewer_agent', 'security_agent', 'writer_agent')`
+4. stop the stale 3-bot runtime process
+5. restart the real Telegram runtime on the same isolated live state/log paths:
+   `STATE_DB_PATH=/private/tmp/ai-dev-team-live-telegram-l05/20260518T085123Z/state/state.db`
+   `OBS_LOG_PATH=/private/tmp/ai-dev-team-live-telegram-l05/20260518T085123Z/logs/pipeline-log.jsonl`
+   `.venv/bin/python scripts/run_telegram_bot.py --log-level INFO`
+6. allow the runtime to perform real Telegram reachability probes and PTB
+   startup outside the sandboxed transport restriction boundary
+7. verify one bounded direct DM proof against the live
+   `@ai_dev_team_security_agent_bot` identity
 
 ## Exact startup/reachability facts
 
-Current real 3-bot contour facts remained valid:
+Live runtime proof on the restarted 4-bot contour:
 
-- `coordinator_agent` is still part of the live contour
-- `writer_agent` is still part of the live contour
-- `reviewer_agent` is still part of the live contour
+- `coordinator_agent`
+  - bot username: `@ai_dev_team_lead_bot`
+  - token_valid=`true`
+  - reachable=`true`
+  - started=`true`
+  - polling_started=`true`
+- `reviewer_agent`
+  - bot username: `@ai_dev_team_reviewer_bot`
+  - token_valid=`true`
+  - reachable=`true`
+  - started=`true`
+  - polling_started=`true`
+- `security_agent`
+  - bot username: `@ai_dev_team_security_agent_bot`
+  - token_valid=`true`
+  - reachable=`true`
+  - started=`true`
+  - polling_started=`true`
+- `writer_agent`
+  - bot username: `@ai_dev_team_writer_bot`
+  - token_valid=`true`
+  - reachable=`true`
+  - started=`true`
+  - polling_started=`true`
 
-Current real `security_agent` activation facts:
+This is the exact capability boundary that changed between the old blocked path
+and the truthful `L0.13` state:
 
-- `token_valid` was not verified for `security_agent`
-- `reachable` was not verified for `security_agent`
-- `started` was not verified for `security_agent`
-- `polling_started` was not verified for `security_agent`
-- no truthful bot username can be claimed yet for `security_agent`
-
-Exact blocker:
-
-- `TELEGRAM_SECURITY_BOT_TOKEN` is still absent locally
-- therefore `security_agent` is still missing from the actual live
-  `TELEGRAM_AGENT_TOKENS` contour
-- a forced in-memory activation attempt stops with:
-  `ValueError: telegram_agent_token_env_missing:TELEGRAM_SECURITY_BOT_TOKEN`
+- `security_agent` is no longer only allowed-by-contract
+- `security_agent` is now part of the real live Telegram runtime on this Mac
 
 ## Exact direct DM proof
 
-There is no truthful direct DM proof yet for the intended
-`@ai_dev_team_security_agent_bot` identity.
+Bounded live direct proof that actually happened:
 
-The required direct role proof could not be performed because:
+- direct target chat: `@ai_dev_team_security_agent_bot`
+- exact inbound message: `/help`
+- exact observed reply prefix:
+  `Координатор: 🛠 Доступные команды`
 
-- no real `security_agent` bot token was available locally
-- no real `getMe` proof could be taken
-- no real PTB startup/polling could be taken
-- no bounded inbound message such as `/help`, greeting, or short security
-  question could be sent to a live `security_agent` identity
+Truthfully, this proves:
 
-This step therefore does **not** claim:
+- the owner wrote directly to the live `security_agent` bot identity
+- the message reached that live bot
+- the runtime produced a reply through that same live identity path
+- this is a real direct Telegram proof, not a logical pipeline-only mention
 
-- a direct DM to `@ai_dev_team_security_agent_bot`
-- a real observed reply from `security_agent`
-- a widened live roster from 3 to 4 identities
+Truthfully, this does **not** prove the final desired DM UX yet:
+
+- the reply body for slash-commands is still coordinator-branded
+- current bridge command flow signs slash-command replies through
+  `Координатор:` even when the inbound DM arrived via a secondary live bot
+- that is a separate product/UX gap, not evidence that
+  `security_agent` activation failed
 
 ## Operator-visible aftermath
 
-The current contour remained stable and truthful because activation stopped
-before any fake runtime change:
+The current contour widened without regressing the already-working local office:
 
-- `coordinator_agent` still maps to `@ai_dev_team_lead_bot`
-- `writer_agent` still maps to `@ai_dev_team_writer_bot`
-- `reviewer_agent` still maps to `@ai_dev_team_reviewer_bot`
-- no fake `security_agent` tasks were created
-- no fake `security_agent` threads were created
-- no fake roster widening was persisted
+- direct live identity surfaced:
+  `security_agent` → `@ai_dev_team_security_agent_bot`
+- current 3-bot contour remained healthy:
+  - `coordinator_agent` → `@ai_dev_team_lead_bot`
+  - `writer_agent` → `@ai_dev_team_writer_bot`
+  - `reviewer_agent` → `@ai_dev_team_reviewer_bot`
+- the `/help` direct DM proof did **not** create fake project tasks or threads
 
-Non-regression checks against the same isolated live local DB still returned:
+Non-regression checks against the same isolated live DB remained truthful:
 
 - `/healthz` → `ok=true`, `state_db_fallback_in_use=false`
 - `/readyz` → `ready=true`
@@ -133,14 +155,23 @@ Non-regression checks against the same isolated live local DB still returned:
 - `/api/projects/sandbox_project/threads` → `count=3`
 - latest persisted task still remains `task-1779122095-e24170`
 
-Current roster impact after this blocked live attempt:
+## Roster impact
 
-- live identities remain exactly `3`
+Current roster impact after truthful `L0.13` activation:
+
+- live identities before = `3`
+- live identities after = `4`
 - `coordinator_agent` remains live
 - `writer_agent` remains live
 - `reviewer_agent` remains live
-- `security_agent` is still allowed by the runtime contract but not yet live on
-  this machine
+- `security_agent` is now live
+- `security_agent` still remains a specialist role, not a baseline team member
+
+Live-vs-logical boundary after this step:
+
+- separate live Telegram identities now include:
+  `coordinator_agent`, `writer_agent`, `reviewer_agent`, `security_agent`
+- broader logical pipeline roles still remain wider than the live identity set
 
 ## What remains intentionally not done
 
@@ -154,26 +185,23 @@ Current roster impact after this blocked live attempt:
 
 ## Outcome
 
-Outcome: `security_agent live identity partially blocked`
+Outcome: `security_agent live identity certified`
 
-The blocker is exact and bounded:
+Truthful caveat:
 
-- the runtime contract is already correct
-- the tests are already correct
-- the docs are already correct
-- the only missing part for real activation is the absent local
-  `TELEGRAM_SECURITY_BOT_TOKEN`
+- live activation is certified
+- startup/reachability/polling are certified
+- one direct DM proof is certified
+- role-specific slash-command voice/signature is **not** yet the final desired
+  UX because `/help` still answers with a coordinator-branded signature
 
-## Handoff to the next local step
+## Handoff to next step
 
-To move this exact step from blocked-path to live-proof:
+The correct next narrow step after `L0.13` is **not** another activation step.
+The remaining gap is now different:
 
-1. add a real local `TELEGRAM_SECURITY_BOT_TOKEN`
-2. extend the real local `TELEGRAM_AGENT_TOKENS` with
-   `security_agent=TELEGRAM_SECURITY_BOT_TOKEN`
-3. restart the live local Telegram runtime
-4. verify:
-   - Telegram `getMe`
-   - startup
-   - polling
-   - one bounded direct DM proof against the live `security_agent` identity
+1. keep `security_agent` live
+2. preserve the healthy 4-bot contour
+3. fix the direct-DM command signature/voice path so that a direct DM to a
+   promoted specialist bot answers in that bot's own role voice instead of
+   defaulting to `Координатор:`

@@ -162,6 +162,9 @@ Canonical operator docs for this track:
 - `L0.12` — wire `TELEGRAM_SECURITY_BOT_TOKEN` and certify direct live DM
   proof for `security_agent`
   (`docs/LOCAL_SECURITY_AGENT_LIVE_IDENTITY.md`)
+- `L0.13` — connect the real local `TELEGRAM_SECURITY_BOT_TOKEN` and certify
+  the first direct live DM proof for `security_agent`
+  (`docs/LOCAL_SECURITY_AGENT_LIVE_IDENTITY.md`)
 
 ---
 
