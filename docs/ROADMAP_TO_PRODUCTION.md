@@ -165,6 +165,9 @@ Canonical operator docs for this track:
 - `L0.13` — connect the real local `TELEGRAM_SECURITY_BOT_TOKEN` and certify
   the first direct live DM proof for `security_agent`
   (`docs/LOCAL_SECURITY_AGENT_LIVE_IDENTITY.md`)
+- `L0.14` — fix direct-DM role voice for live specialist bots and certify
+  a personal reply from `security_agent`
+  (`docs/LOCAL_DIRECT_DM_ROLE_VOICE.md`)
 
 ---
 

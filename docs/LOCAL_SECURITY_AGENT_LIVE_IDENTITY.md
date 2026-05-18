@@ -195,6 +195,12 @@ Truthful caveat:
 - role-specific slash-command voice/signature is **not** yet the final desired
   UX because `/help` still answers with a coordinator-branded signature
 
+Historical note:
+
+- that remaining direct-DM role-voice gap was later closed in `L0.14`
+- canonical follow-up artifact:
+  `docs/LOCAL_DIRECT_DM_ROLE_VOICE.md`
+
 ## Handoff to next step
 
 The correct next narrow step after `L0.13` is **not** another activation step.

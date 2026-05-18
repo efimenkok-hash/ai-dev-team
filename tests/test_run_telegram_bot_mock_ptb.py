@@ -7,6 +7,7 @@ import pytest
 
 import scripts.run_telegram_bot as script
 from core.agent_personas import default_registry
+from core.bot_commands import CommandName, CommandRegistry
 from core.coordinator_role import COORDINATOR_ROLE
 from core.multi_bot_bridge import MultiBotBridge
 from core.multi_bot_runtime import BotIdentity, MultiBotRuntimeSpec, PerRoleBotMap
@@ -443,6 +444,68 @@ def test_secondary_owner_private_dm_stays_on_same_identity_thread(
     assert sent["text"] == "Архитектор: готово"
     for other_role in other_roles:
         runtime.applications_by_role[other_role].application.bot.send_message.assert_not_called()
+
+
+def test_secondary_security_owner_private_dm_command_uses_security_voice(tmp_path):
+    coordinator = _identity(
+        token_env_key="TELEGRAM_BOT_TOKEN",
+        token="123:coord",
+    )
+    writer = _identity(
+        "writer_agent",
+        token_env_key="TELEGRAM_WRITER_BOT_TOKEN",
+        token="456:writer",
+    )
+    reviewer = _identity(
+        "reviewer_agent",
+        token_env_key="TELEGRAM_REVIEWER_BOT_TOKEN",
+        token="789:reviewer",
+    )
+    security = _identity(
+        "security_agent",
+        token_env_key="TELEGRAM_SECURITY_BOT_TOKEN",
+        token="999:security",
+    )
+    reg = CommandRegistry()
+    reg.register(CommandName.HELP, lambda c, ctx: "/help: список")
+    primary_bridge = TelegramBridge(
+        owner_chat_ids=frozenset({777}),
+        send=lambda _out: None,
+        personas=default_registry(),
+        commands=reg,
+    )
+    bridge = MultiBotBridge(
+        runtime_spec=MultiBotRuntimeSpec(
+            primary_bot=coordinator,
+            role_map=_role_map(coordinator, writer, reviewer, security),
+            source="telegram_agent_tokens",
+        ),
+        primary_bridge=primary_bridge,
+    )
+    runtime = _build_runtime(
+        tmp_path,
+        bridge=bridge,
+        include_security=True,
+    )
+    target_app = runtime.applications_by_role["security_agent"].application
+    update = MockPtbUpdateFactory.text(
+        chat_id=777,
+        user_id=777,
+        text="/help",
+        message_id=13,
+    )
+    fake_future = MagicMock()
+    fake_future.result.return_value = None
+
+    with patch(
+        "scripts.run_telegram_bot.asyncio.run_coroutine_threadsafe",
+        side_effect=_close_coro_and_return(fake_future),
+    ):
+        asyncio.run(target_app.dispatch_update(update))
+
+    target_app.bot.send_message.assert_called_once()
+    sent = target_app.bot.send_message.call_args.kwargs
+    assert sent["text"].startswith("Безопасник:")
 
 
 def test_role_aware_outbound_uses_exact_delivery_role_and_coordinator_fallback(

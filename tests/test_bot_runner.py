@@ -4474,6 +4474,33 @@ def test_build_bridge_from_env_command_flow(tmp_path):
     assert captured[0].text.startswith("Координатор:")
 
 
+def test_build_bridge_from_env_secondary_direct_dm_command_uses_bot_voice(tmp_path):
+    db = StateDB(tmp_path / "state.db")
+    ProjectRegistry(db).register_project(
+        ProjectSnapshot(
+            project=_project(),
+            policy=_policy(allow_agent_dm=True),
+        )
+    )
+    env = _bridge_env(
+        tmp_path,
+        TELEGRAM_OWNER_CHAT_ID="101",
+        OPENROUTER_API_KEY="sk-or-test",
+    )
+    send, captured = _captured_send()
+    dispatcher = LLMDispatcher(api_key="sk-test")
+    dispatcher.dispatch = MagicMock(return_value=_llm_response())  # type: ignore[method-assign]
+
+    with patch("core.bot_runner.build_dispatcher_from_env", return_value=dispatcher):
+        bridge = build_bridge_from_env(env, send_callable=send)
+
+    result = bridge.handle(_direct_dm_msg(text="/help", incoming_bot_role="security_agent"))
+
+    assert result.handled is True
+    assert captured[0].text.startswith("Безопасник:")
+    dispatcher.dispatch.assert_not_called()
+
+
 def test_build_bridge_from_env_intruder_denied(tmp_path):
     env = _bridge_env(tmp_path, TELEGRAM_OWNER_CHAT_ID="777")
     send, captured = _captured_send()

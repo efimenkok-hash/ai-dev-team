@@ -40,6 +40,7 @@ def test_local_security_agent_live_identity_doc_is_truthful() -> None:
         "task-1779122095-e24170",
         "@ai_dev_team_security_agent_bot",
         "live identities before = `3`",
+        "docs/LOCAL_DIRECT_DM_ROLE_VOICE.md",
     )
 
     for marker in required_markers:
@@ -97,6 +98,7 @@ def test_roadmap_syncs_l11_security_agent_live_identity_step() -> None:
     )
     assert "`L0.12`" in roadmap
     assert "`L0.13`" in roadmap
+    assert "`L0.14`" in roadmap
     assert "TELEGRAM_SECURITY_BOT_TOKEN" in roadmap
     assert "direct live DM" in roadmap
     assert "security_agent" in roadmap

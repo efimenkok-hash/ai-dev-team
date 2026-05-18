@@ -721,15 +721,18 @@ class TelegramBridge:
         msg: IncomingMessage,
         ctx: _BridgeContext,
     ) -> None:
+        reply_role = self._resolve_command_reply_role(msg)
         if self._commands is None:
             self._safe_send(
                 OutgoingMessage(
                     chat_id=msg.chat_id,
-                    text=self._sign_coordinator(
+                    text=self._sign_with_role(
+                        reply_role,
                         "Команды сейчас не зарегистрированы."
                     ),
                 ),
                 ctx,
+                sender_role=reply_role,
                 incoming=msg,
             )
             return
@@ -739,11 +742,13 @@ class TelegramBridge:
             self._safe_send(
                 OutgoingMessage(
                     chat_id=msg.chat_id,
-                    text=self._sign_coordinator(
+                    text=self._sign_with_role(
+                        reply_role,
                         f"Команда /{cmd.name.value} не имеет хендлера."
                     ),
                 ),
                 ctx,
+                sender_role=reply_role,
                 incoming=msg,
             )
             return
@@ -751,21 +756,24 @@ class TelegramBridge:
             self._safe_send(
                 OutgoingMessage(
                     chat_id=msg.chat_id,
-                    text=self._sign_coordinator(
+                    text=self._sign_with_role(
+                        reply_role,
                         f"Ошибка при выполнении /{cmd.name.value}: "
                         f"{_short_err(exc)}"
                     ),
                 ),
                 ctx,
+                sender_role=reply_role,
                 incoming=msg,
             )
             return
         self._safe_send(
             OutgoingMessage(
                 chat_id=msg.chat_id,
-                text=self._sign_coordinator(reply_text),
+                text=self._sign_with_role(reply_role, reply_text),
             ),
             ctx,
+            sender_role=reply_role,
             incoming=msg,
         )
 
@@ -918,6 +926,18 @@ class TelegramBridge:
         lines.append("")
         lines.append("Ответьте «да» / «нет».")
         return "\n".join(lines)
+
+    def _resolve_command_reply_role(self, msg: IncomingMessage) -> str:
+        if not self._owner_dm_routing.is_owner_dm_message(msg):
+            return COORDINATOR_ROLE
+        role = msg.incoming_bot_role
+        if role is None:
+            return COORDINATOR_ROLE
+        try:
+            self._personas.for_role(role)
+        except KeyError:
+            return COORDINATOR_ROLE
+        return role
 
     def _sign_coordinator(self, body: str) -> str:
         return self._coordinator.format_signature(body)
