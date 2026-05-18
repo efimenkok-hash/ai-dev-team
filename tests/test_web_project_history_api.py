@@ -260,6 +260,7 @@ def test_api_project_history_returns_project_scoped_persisted_tasks_newest_first
                 "commit_sha": "feedface12345678",
                 "final_state": "SUCCESS",
                 "failure_reason": None,
+                "failure_detail": None,
                 "tier_name": "PREMIUM",
                 "finished_at": 1004.0,
             },
@@ -269,6 +270,7 @@ def test_api_project_history_returns_project_scoped_persisted_tasks_newest_first
                 "commit_sha": None,
                 "final_state": "FAIL",
                 "failure_reason": "lint_failed",
+                "failure_detail": None,
                 "tier_name": "ECONOMY",
                 "finished_at": 1001.0,
             },
@@ -282,6 +284,7 @@ def test_api_project_history_returns_project_scoped_persisted_tasks_newest_first
             "commit_sha",
             "final_state",
             "failure_reason",
+            "failure_detail",
             "tier_name",
             "finished_at",
         }
@@ -384,4 +387,3 @@ def test_api_project_history_does_not_break_projects_status_health_or_ready(
     assert status_response.status_code == 200
     assert health_response.status_code == 200
     assert ready_response.status_code == 200
-

@@ -328,6 +328,59 @@ def test_project_view_renders_truthful_empty_sections_without_fake_activity(
     assert "No pending hire requests." in body
     assert "No persisted task history yet." in body
     assert "No persisted threads yet." in body
+
+
+def test_project_view_history_preview_shows_failure_detail_when_available(
+    tmp_path,
+    monkeypatch,
+):
+    from core.task_history import compose_failure_reason
+
+    module = _import_web_main(tmp_path, monkeypatch)
+    app = module.create_app(
+        module.WebAppConfig(
+            state_db_path=tmp_path / "project-view-history-detail.db",
+            project_events_poll_interval_seconds=0.01,
+        )
+    )
+    registry = app.state.project_registry
+    registry.register_project(
+        _snapshot(
+            tmp_path,
+            project_id="alpha_project",
+            slug="alpha-project",
+            owner_user_id=101,
+            name="Alpha Project",
+            description="Primary project.",
+            with_policy=True,
+            with_chat_binding=True,
+            with_runtime_binding=True,
+        )
+    )
+    app.state.state_db.record_task(
+        TaskSummary(
+            task_id="task-alpha-diagnostics",
+            branch="feature/task-alpha-diagnostics",
+            commit_sha=None,
+            final_state="FAIL",
+            failure_reason=compose_failure_reason(
+                "review_fix_loop_exceeded",
+                "review=REJECTED; next fix: src/example.py: restore square implementation",
+            ),
+            tier_name="ECONOMY",
+            finished_at=1006.0,
+            project_id="alpha_project",
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/projects/alpha_project")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "task-alpha-diagnostics" in body
+    assert "FAIL · feature/task-alpha-diagnostics" in body
+    assert "review=REJECTED; next fix: src/example.py: restore square implementation" in body
     assert "task-alpha-1" not in body
     assert "thread_000001" not in body
 

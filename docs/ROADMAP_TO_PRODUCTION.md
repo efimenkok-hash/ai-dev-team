@@ -132,6 +132,7 @@ Canonical operator docs for this track:
 - `docs/LOCAL_LIVE_TELEGRAM_CONTOUR.md`
 - `docs/LOCAL_MULTI_AGENT_TELEGRAM_LOOP.md`
 - `docs/LOCAL_SUCCESSFUL_TELEGRAM_TASK_LOOP.md`
+- `docs/LOCAL_TELEGRAM_QUALITY_BARRIER_DIAGNOSTICS.md`
 
 Последовательность локального трека:
 
@@ -147,6 +148,8 @@ Canonical operator docs for this track:
   (`docs/LOCAL_MULTI_AGENT_TELEGRAM_LOOP.md`)
 - `L0.7` — first successful live Telegram task loop / owner-facing recovery
   path (`docs/LOCAL_SUCCESSFUL_TELEGRAM_TASK_LOOP.md`)
+- `L0.8` — owner-visible quality-barrier diagnostics for live Telegram task
+  loops (`docs/LOCAL_TELEGRAM_QUALITY_BARRIER_DIAGNOSTICS.md`)
 
 ---
 

@@ -176,6 +176,11 @@
               <li>
                 <strong><code>{{ item.task_id }}</code></strong>
                 <span>{{ item.final_state }} · {{ item.branch }}</span>
+                {% if item.failure_detail %}
+                  <span class="summary-inline-detail">{{ item.failure_detail }}</span>
+                {% elif item.failure_reason %}
+                  <span class="summary-inline-detail">{{ item.failure_reason }}</span>
+                {% endif %}
               </li>
             {% endfor %}
           </ul>

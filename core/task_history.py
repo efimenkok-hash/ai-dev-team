@@ -40,6 +40,53 @@ if TYPE_CHECKING:
 
 _DEFAULT_MAXLEN = 50
 _PROJECT_ID_MAX_LEN = 64
+_FAILURE_REASON_DETAIL_SEPARATOR = " | detail: "
+
+
+def compose_failure_reason(
+    failure_reason: str | None,
+    failure_detail: str | None,
+) -> str | None:
+    if failure_reason is None:
+        return None
+    if not isinstance(failure_reason, str):
+        raise ValueError("failure_reason_must_be_str_or_none")
+    normalized_reason = failure_reason.strip()
+    if not normalized_reason:
+        raise ValueError("empty_failure_reason")
+    if failure_detail is None:
+        return normalized_reason
+    if not isinstance(failure_detail, str):
+        raise ValueError("failure_detail_must_be_str_or_none")
+    normalized_detail = " ".join(failure_detail.split()).strip()
+    if not normalized_detail:
+        return normalized_reason
+    return (
+        normalized_reason
+        + _FAILURE_REASON_DETAIL_SEPARATOR
+        + normalized_detail
+    )
+
+
+def split_failure_reason_detail(
+    failure_reason: str | None,
+) -> tuple[str | None, str | None]:
+    if failure_reason is None:
+        return (None, None)
+    if not isinstance(failure_reason, str):
+        raise ValueError("failure_reason_must_be_str_or_none")
+    normalized_reason = failure_reason.strip()
+    if not normalized_reason:
+        return (None, None)
+    if _FAILURE_REASON_DETAIL_SEPARATOR not in normalized_reason:
+        return (normalized_reason, None)
+    reason_code, detail = normalized_reason.split(
+        _FAILURE_REASON_DETAIL_SEPARATOR,
+        1,
+    )
+    normalized_code = reason_code.strip() or None
+    normalized_detail = " ".join(detail.split()).strip() or None
+    return (normalized_code, normalized_detail)
 
 
 @dataclass(frozen=True)

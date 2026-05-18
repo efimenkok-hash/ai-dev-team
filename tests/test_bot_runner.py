@@ -3050,6 +3050,34 @@ def test_log_handler_failed_task_shows_reason():
     assert "ruff_error" in text
 
 
+def test_log_handler_failed_task_shows_diagnostics_detail():
+    """Detailed failure reasons should surface as separate diagnostics text."""
+    import time
+
+    from core.task_history import TaskSummary, compose_failure_reason
+
+    h = TaskHistory()
+    h.record(
+        TaskSummary(
+            task_id="task-quality-fail",
+            branch="feature/task-quality-fail",
+            commit_sha=None,
+            final_state="FAIL",
+            failure_reason=compose_failure_reason(
+                "review_fix_loop_exceeded",
+                "review=REJECTED; next fix: src/example.py: restore square implementation",
+            ),
+            tier_name="ECONOMY",
+            finished_at=time.time(),
+        )
+    )
+    handler = make_log_handler(task_history=h)
+    text = handler(parse_command("/log task-quality-fail"), None)
+    assert "review_fix_loop_exceeded" in text
+    assert "Диагностика" in text
+    assert "restore square implementation" in text
+
+
 def test_stop_handler_no_runner_returns_stub():
     """Without a runner /stop should return an informative stub, not crash."""
     handler = make_stop_handler()

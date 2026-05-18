@@ -102,7 +102,7 @@ from core.project_team_commands import (
 from core.real_task_handler import RealTaskHandlerConfig, make_real_task_handler
 from core.sandbox_workspace import SandboxWorkspace
 from core.state_db import StateDB
-from core.task_history import TaskHistory
+from core.task_history import TaskHistory, split_failure_reason_detail
 from core.telegram_bridge import (
     BridgeReply,
     IncomingMessage,
@@ -1861,8 +1861,11 @@ def _format_task_summary(summary: Any) -> str:  # summary: TaskSummary
         f"💼 Тариф:  {s.tier_name}",
         f"🕐 Время:  {ts}",
     ]
-    if s.failure_reason:
-        lines.append(f"⚠️  Причина: {s.failure_reason}")
+    reason_code, failure_detail = split_failure_reason_detail(s.failure_reason)
+    if reason_code:
+        lines.append(f"⚠️  Причина: {reason_code}")
+    if failure_detail:
+        lines.append(f"🧭 Диагностика: {failure_detail}")
     return "\n".join(lines)
 
 

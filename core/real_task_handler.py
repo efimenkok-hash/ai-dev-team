@@ -125,7 +125,12 @@ from core.sandbox_workspace import (
     WorktreeHandle,
 )
 from core.specialization_hints import SpecializationHints
-from core.task_history import TaskHistory, TaskSummary
+from core.task_history import (
+    TaskHistory,
+    TaskSummary,
+    compose_failure_reason,
+    split_failure_reason_detail,
+)
 from core.telegram_bridge import (
     BridgeReply,
     IncomingMessage,
@@ -212,6 +217,165 @@ def _default_agent_registry_factory(_tier: TierConfig) -> AgentRegistry:
     core.dispatcher_agents instead.
     """
     return default_agent_registry()
+
+
+def _normalize_failure_diagnostic_text(
+    value: object,
+    *,
+    max_chars: int = 220,
+) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split()).strip()
+    if not normalized:
+        return None
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 1].rstrip() + "…"
+
+
+def _build_review_diagnostics_preview(review_payload: str) -> str | None:
+    parsed = extract_json_object(review_payload)
+    if parsed is None:
+        return None
+    parts: list[str] = []
+
+    verdict = parsed.get("verdict")
+    if isinstance(verdict, str) and verdict.strip():
+        parts.append(f"review={verdict.strip()}")
+
+    summary = parsed.get("summary")
+    if isinstance(summary, dict):
+        counters: list[str] = []
+        for key, label in (
+            ("critical", "c"),
+            ("major", "m"),
+            ("minor", "n"),
+        ):
+            value = summary.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                counters.append(f"{label}={value}")
+        if counters:
+            parts.append("summary " + " ".join(counters))
+
+    fixer_items = parsed.get("for_fixer")
+    fixer_previews: list[str] = []
+    if isinstance(fixer_items, list):
+        for item in fixer_items[:2]:
+            if not isinstance(item, dict):
+                continue
+            path = _normalize_failure_diagnostic_text(
+                item.get("path") or item.get("file")
+            )
+            issue = _normalize_failure_diagnostic_text(
+                item.get("instruction")
+                or item.get("issue")
+                or item.get("summary")
+            )
+            severity = _normalize_failure_diagnostic_text(item.get("severity"))
+            if path is None and issue is None:
+                continue
+            preview = ""
+            if severity is not None:
+                preview += f"{severity} "
+            if path is not None:
+                preview += path
+            if issue is not None:
+                preview += f": {issue}" if preview else issue
+            fixer_previews.append(preview)
+    if fixer_previews:
+        parts.append("next fix: " + " | ".join(fixer_previews))
+
+    if not parts:
+        return None
+    return _normalize_failure_diagnostic_text("; ".join(parts))
+
+
+def _build_qa_diagnostics_preview(qa_payload: str) -> str | None:
+    parsed = extract_json_object(qa_payload)
+    if parsed is None:
+        return None
+    parts: list[str] = []
+
+    verdict = parsed.get("verdict")
+    if isinstance(verdict, str) and verdict.strip():
+        parts.append(f"qa={verdict.strip()}")
+
+    checks = parsed.get("checks")
+    if isinstance(checks, dict):
+        failing_checks = [
+            f"{key}={value}"
+            for key, value in checks.items()
+            if isinstance(key, str)
+            and isinstance(value, str)
+            and value.strip().upper() == "FAIL"
+        ]
+        if failing_checks:
+            parts.append("checks " + ", ".join(failing_checks))
+
+    blockers = parsed.get("blockers")
+    blocker_preview: list[str] = []
+    if isinstance(blockers, list):
+        for blocker in blockers[:2]:
+            preview = _normalize_failure_diagnostic_text(blocker, max_chars=80)
+            if preview is not None:
+                blocker_preview.append(preview)
+    if blocker_preview:
+        parts.append("blockers: " + " | ".join(blocker_preview))
+
+    fixer_items = parsed.get("for_fixer")
+    fixer_previews: list[str] = []
+    if isinstance(fixer_items, list):
+        for item in fixer_items[:2]:
+            if not isinstance(item, dict):
+                continue
+            issue = _normalize_failure_diagnostic_text(
+                item.get("instruction")
+                or item.get("issue")
+                or item.get("summary")
+            )
+            if issue is not None:
+                fixer_previews.append(issue)
+    if fixer_previews:
+        parts.append("next fix: " + " | ".join(fixer_previews))
+
+    if not parts:
+        return None
+    return _normalize_failure_diagnostic_text("; ".join(parts))
+
+
+def _build_quality_barrier_diagnostics(
+    *,
+    memory: PipelineMemory,
+    task_id: str,
+    failure_reason: str | None,
+) -> str | None:
+    if not isinstance(memory, PipelineMemory):
+        raise ValueError(f"invalid_memory:{type(memory).__name__}")
+    if failure_reason is None:
+        return None
+    if not isinstance(failure_reason, str) or not failure_reason.strip():
+        raise ValueError("invalid_failure_reason")
+    normalized_reason = failure_reason.strip()
+
+    if normalized_reason in {
+        "review_fix_loop_exceeded",
+        "review_rejected_without_for_fixer",
+    }:
+        review_payload = memory.get_artifact(task_id, "review")
+        if review_payload is None:
+            return None
+        return _build_review_diagnostics_preview(review_payload)
+
+    if normalized_reason.startswith("qa_fix_loop_exceeded") or normalized_reason == (
+        "qa_failed_without_for_fixer"
+    ):
+        qa_payload = memory.get_artifact(task_id, "qa")
+        if qa_payload is None:
+            return None
+        return _build_qa_diagnostics_preview(qa_payload)
+
+    return None
 
 
 def make_real_task_handler(
@@ -534,15 +698,16 @@ def make_real_task_handler(
                 # _build_on_complete send the ⏹ message.
                 cancelled = token.is_set()
                 final_state = result.final_state
+                raw_failure_reason = (
+                    "cancelled_by_user" if cancelled else result.failure_reason
+                )
 
                 summary: dict = {
                     "task_id": task_id,
                     "final_state": "CANCELLED" if cancelled else final_state.value,
                     "branch": handle.branch,
                     "worktree": str(handle.path),
-                    "failure_reason": (
-                        "cancelled_by_user" if cancelled else result.failure_reason
-                    ),
+                    "failure_reason": raw_failure_reason,
                     "tier_name": tier_name,
                     "commit_sha": None,
                 }
@@ -621,6 +786,18 @@ def make_real_task_handler(
                     memory=memory,
                     task_id=task_id,
                 )
+                failure_diagnostics = _build_quality_barrier_diagnostics(
+                    memory=memory,
+                    task_id=task_id,
+                    failure_reason=raw_failure_reason,
+                )
+                if failure_diagnostics is not None:
+                    summary["failure_diagnostics"] = failure_diagnostics
+                    summary["failure_reason_code"] = raw_failure_reason
+                    summary["failure_reason"] = compose_failure_reason(
+                        raw_failure_reason,
+                        failure_diagnostics,
+                    )
                 return summary
             finally:
                 if handle is not None:
@@ -1036,6 +1213,12 @@ def make_real_task_handler(
                 )
             else:
                 owner_escalation_reply = result.get("owner_escalation_reply")
+                failure_reason_code, persisted_failure_detail = (
+                    split_failure_reason_detail(result.get("failure_reason"))
+                )
+                failure_diagnostics = result.get("failure_diagnostics")
+                if not isinstance(failure_diagnostics, str) or not failure_diagnostics.strip():
+                    failure_diagnostics = persisted_failure_detail
                 _safe_send_envelope(
                     _build_terminal_envelope(
                         chat_id=chat_id,
@@ -1052,7 +1235,13 @@ def make_real_task_handler(
                             if owner_escalation_reply
                             else ""
                         )
-                        + f"  reason  `{result.get('failure_reason', '?')}`"
+                        + (
+                            f"  detail  {failure_diagnostics}\n"
+                            if failure_diagnostics
+                            else ""
+                        )
+                        + f"  reason  `{failure_reason_code or '?'}"
+                        f"`"
                         ),
                     )
                 )

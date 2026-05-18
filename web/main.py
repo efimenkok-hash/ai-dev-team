@@ -32,7 +32,7 @@ from core.startup_config_validation import (
     validate_web_startup_config,
 )
 from core.state_db import StateDB
-from core.task_history import TaskSummary
+from core.task_history import TaskSummary, split_failure_reason_detail
 from web.project_events import (
     ProjectEventsStreamConfig,
     resolve_project_snapshot,
@@ -213,12 +213,16 @@ def _serialize_project_status(snapshot: ProjectSnapshot) -> dict[str, object]:
 def _serialize_task_summary(summary: TaskSummary) -> dict[str, object]:
     if not isinstance(summary, TaskSummary):
         raise ValueError(f"invalid_task_summary_type:{type(summary).__name__}")
+    failure_reason_code, failure_detail = split_failure_reason_detail(
+        summary.failure_reason
+    )
     return {
         "task_id": summary.task_id,
         "branch": summary.branch,
         "commit_sha": summary.commit_sha,
         "final_state": summary.final_state,
-        "failure_reason": summary.failure_reason,
+        "failure_reason": failure_reason_code,
+        "failure_detail": failure_detail,
         "tier_name": summary.tier_name,
         "finished_at": float(summary.finished_at),
     }

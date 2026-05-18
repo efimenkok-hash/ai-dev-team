@@ -1124,6 +1124,86 @@ def test_project_aware_fail_path_seeds_owner_escalation_and_uses_reply(
     assert any("agent_exception:RuntimeError:kaboom" in text for text in failure_messages)
 
 
+def test_project_aware_review_fix_failure_surfaces_actionable_diagnostics(
+    runner,
+    sandbox,
+    tier_store,
+    fake_repo,
+    tmp_path,
+):
+    from unittest.mock import patch
+
+    from core.task_history import TaskHistory, split_failure_reason_detail
+
+    tier_store.set_active(-100123, "ECONOMY")
+    send, captured = _make_progress_capture()
+    snapshot = _project_snapshot(
+        fake_repo,
+        chat_binding=_chat_binding(chat_id=-100123),
+    )
+    runtime_router = _runtime_router_for_snapshot(
+        tmp_path,
+        snapshot,
+        db_name="review-fix-diagnostics.db",
+    )
+    task_id = "task-review-fix-diagnostics-001"
+    history = TaskHistory()
+    review_rejected = (
+        '{"review_id":"r2","verdict":"REJECTED","files":[{"path":"src/example.py",'
+        '"verdict":"REJECTED","issues":[{"severity":"major","issue":"missing square"}]}],'
+        '"summary":{"total_issues":1,"critical":0,"major":1,"minor":0,'
+        '"files_approved":0,"files_rejected":1},"for_fixer":[{"path":"src/example.py",'
+        '"severity":"major","instruction":"restore square implementation"}]}'
+    )
+
+    def _agents(_tier):
+        agents = happy_agents(None)
+        agents["reviewer_agent"] = lambda *_args: review_rejected
+        agents["fixer_agent"] = lambda *_args: "def f(): return 42"
+        return agents
+
+    with patch("core.project_runtime_router._build_sandbox", return_value=sandbox):
+        handler = make_real_task_handler(
+            runner=runner,
+            runtime_router=runtime_router,
+            tier_store=tier_store,
+            send_progress=send,
+            agent_registry_factory=_agents,
+            task_history=history,
+            task_id_factory=lambda: task_id,
+        )
+        handler(
+            "Implement the release workflow.",
+            IncomingMessage(
+                chat_id=-100123,
+                user_id=777,
+                message_id=1,
+                text="Implement the release workflow.",
+                project_id="alpha_project",
+                project_slug="alpha-project",
+                project_context_source="bound_chat",
+            ),
+        )
+        _wait_until_idle(runner)
+        _wait_for_count(captured, lambda c: any("Не получилось" in t for _, t in c))
+
+    persisted = history.get(task_id)
+    assert persisted is not None
+    reason_code, detail = split_failure_reason_detail(persisted.failure_reason)
+    assert reason_code == "review_fix_loop_exceeded"
+    assert detail is not None
+    assert "review=REJECTED" in detail
+    assert "summary c=0 m=1 n=0" in detail
+    assert "src/example.py" in detail
+    assert "restore square implementation" in detail
+
+    failure_messages = [text for _, text in captured if "Не получилось" in text]
+    assert failure_messages
+    assert any("reason  `review_fix_loop_exceeded`" in text for text in failure_messages)
+    assert any("detail  review=REJECTED" in text for text in failure_messages)
+    assert any("restore square implementation" in text for text in failure_messages)
+
+
 def test_project_aware_blocked_path_seeds_owner_escalation(
     runner,
     sandbox,

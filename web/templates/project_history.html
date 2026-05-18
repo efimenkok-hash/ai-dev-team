@@ -86,6 +86,9 @@
                 {% if item.failure_reason %}
                   <p class="history-failure">Failure reason: {{ item.failure_reason }}</p>
                 {% endif %}
+                {% if item.failure_detail %}
+                  <p class="history-detail">Failure detail: {{ item.failure_detail }}</p>
+                {% endif %}
               </article>
             {% endfor %}
           </div>

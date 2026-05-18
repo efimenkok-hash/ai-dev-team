@@ -279,6 +279,69 @@ def test_project_history_view_renders_truthful_empty_state_without_fake_activity
     assert "sample task" not in body.lower()
 
 
+def test_project_history_view_surfaces_failure_detail_preview(
+    tmp_path,
+    monkeypatch,
+):
+    from core.task_history import compose_failure_reason
+
+    module = _import_web_main(tmp_path, monkeypatch)
+    app = module.create_app(
+        module.WebAppConfig(
+            state_db_path=tmp_path / "history-view-detail.db",
+            project_events_poll_interval_seconds=0.01,
+        )
+    )
+    app.state.project_registry.register_project(
+        _snapshot(
+            tmp_path,
+            project_id="alpha_project",
+            slug="alpha-project",
+            owner_user_id=101,
+            name="Alpha Project",
+            description="Primary project.",
+            with_policy=True,
+            with_chat_binding=True,
+            with_runtime_binding=True,
+        )
+    )
+    app.state.state_db.record_task(
+        _summary(
+            task_id="task-alpha-diagnostics",
+            branch="feature/task-alpha-diagnostics",
+            commit_sha=None,
+            final_state="FAIL",
+            failure_reason=compose_failure_reason(
+                "review_fix_loop_exceeded",
+                "review=REJECTED; next fix: src/example.py: restore square implementation",
+            ),
+            tier_name="ECONOMY",
+            finished_at=1005.0,
+            project_id="alpha_project",
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/projects/alpha_project/history")
+        history = client.get("/api/projects/alpha_project/history")
+
+    assert response.status_code == 200
+    assert history.status_code == 200
+    body = response.text
+    assert "Failure reason: review_fix_loop_exceeded" in body
+    assert (
+        "Failure detail: review=REJECTED; next fix: src/example.py: restore square implementation"
+        in body
+    )
+    payload = history.json()
+    assert payload["count"] == 1
+    assert payload["items"][0]["failure_reason"] == "review_fix_loop_exceeded"
+    assert (
+        payload["items"][0]["failure_detail"]
+        == "review=REJECTED; next fix: src/example.py: restore square implementation"
+    )
+
+
 def test_project_history_view_returns_truthful_404_for_unknown_and_slug_like_paths(
     tmp_path,
     monkeypatch,
