@@ -119,8 +119,8 @@
 - поднять AI Dev Team нативно локально
 - не использовать Docker
 - не трогать live Docker-mounted main project
-- пройти локальную сертификацию team/UI/pilot task до safe attach к основному
-  проекту
+- пройти локальную сертификацию team/UI/pilot task и first live Telegram
+  contour до любого safe attach к основному проекту
 
 Canonical operator docs for this track:
 
@@ -129,6 +129,7 @@ Canonical operator docs for this track:
 - `docs/LOCAL_TEAM_AGENT_CERTIFICATION.md`
 - `docs/LOCAL_WEB_OFFICE_CERTIFICATION.md`
 - `docs/LOCAL_PILOT_TASK_EXECUTION.md`
+- `docs/LOCAL_LIVE_TELEGRAM_CONTOUR.md`
 
 Последовательность локального трека:
 
@@ -138,7 +139,8 @@ Canonical operator docs for this track:
 - `L0.3` — local Web Office / UI certification
 - `L0.4` — local pilot task on a sandbox repo
   (`docs/LOCAL_PILOT_TASK_EXECUTION.md`)
-- `L0.5` — safe attach to the main project in assist-mode
+- `L0.5` — live local Telegram contour
+  (`docs/LOCAL_LIVE_TELEGRAM_CONTOUR.md`)
 
 ---
 
@@ -500,8 +502,8 @@ The user mentioned: PostgreSQL. Apply these domain-specific guidelines:
 2. **A2** — фикс промптов если нашлись проблемы.
 3. **A3** — cost enforcement.
 4. **B1+B2** — SQLite (без неё web-dashboard и multi-bot становятся хрупкими).
-5. **L0.1-L0.5** — isolated local pilot track без Docker и без прямого attach к
-   live main project.
+5. **L0.1-L0.5** — isolated local pilot track без Docker, с первым real local
+   Telegram contour и без прямого attach к live main project.
 6. **C1** (твой manual) — поднять Hetzner, если VPS rollout по-прежнему нужен
    после local pilot certification.
 7. **C2** — systemd, бот переезжает на сервер. **С этого момента весь
