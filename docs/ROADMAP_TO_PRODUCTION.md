@@ -220,6 +220,9 @@ class StateDB:
 **Цель**: Бот крутится постоянно, не падает.
 
 #### C1. Hetzner setup (manual, ~30 min)
+Current `C1.2` execution status lives in:
+- `docs/VPS_BASELINE_BOOTSTRAP.md`
+
 1. Регистрация на hetzner.cloud
 2. Создать сервер CPX22 (Ubuntu 24.04, `hel1` / Helsinki; exact checked
    purchase-ready spec in `docs/HOSTING_PROVIDER_DECISION.md`)
