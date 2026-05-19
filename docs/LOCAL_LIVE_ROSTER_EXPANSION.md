@@ -172,6 +172,8 @@ Important truth boundary after the later specialist promotion steps:
   maps it to `TELEGRAM_DEVOPS_BOT_TOKEN`
 - this `L0.10` artifact still truthfully records that the actual live roster
   at that step stayed at only three separate Telegram identities
+- the current later live-certified result for the second promoted specialist
+  now lives in `docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md`
 
 ### Logical pipeline roles already proven in execution
 
@@ -194,7 +196,9 @@ So after this step the correct statement is:
 - more roles are cataloged as runtime-exposed candidates
 - `security_agent` is now an allowed specialist live-identity candidate, but
   it was not yet started live during `L0.10`
-- but only three roles are actually separate live Telegram identities today
+- but only three roles were actually separate live Telegram identities on
+  `L0.10`; later certified live widening now reaches five identities through
+  `security_agent` and `devops_agent`
 
 This step does **not** allow anyone to say that the whole baseline team is
 already live as separate bots.

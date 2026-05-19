@@ -47,8 +47,10 @@ def test_local_team_agent_certification_doc_covers_team_contract_truthfully():
         "docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md",
         "does **not** become a",
         "baseline internal team member",
-        "the current accepted live contour on this Mac is already the 4-bot contour",
-        "`coordinator_agent`, `writer_agent`, `reviewer_agent`, `security_agent`",
+        "the current accepted live contour on this Mac is already the 5-bot contour",
+        "`coordinator_agent`, `writer_agent`, `reviewer_agent`, `security_agent`,",
+        "`devops_agent`",
+        "the later live-certified second specialist proof now lives in",
         "promoted specialist subset `security_agent` and `devops_agent`",
     )
 
@@ -67,6 +69,7 @@ def test_local_team_agent_certification_doc_covers_team_contract_truthfully():
         "specialist roles are already separately exposed as Telegram bot identities",
         "runtime-exposed roles are clearly limited to the baseline internal team",
         "the current live 3-bot contour still remains valid when that extra mapping is absent",
+        "the current accepted live contour on this Mac is already the 4-bot contour",
     )
 
     for marker in forbidden_markers:

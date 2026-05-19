@@ -163,9 +163,10 @@ specialist promotion steps:
 - the currently still-closed specialist role remains `data_agent`
 - the baseline 3-bot contour still remains a truthful fallback when promoted
   specialist mappings are absent
-- the current accepted live contour on this Mac is already the 4-bot contour:
-  `coordinator_agent`, `writer_agent`, `reviewer_agent`, `security_agent`
-- the next truthful widening attempt for a fifth live bot is documented in
+- the current accepted live contour on this Mac is already the 5-bot contour:
+  `coordinator_agent`, `writer_agent`, `reviewer_agent`, `security_agent`,
+  `devops_agent`
+- the later live-certified second specialist proof now lives in
   `docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md`
 - the exact specialist live-identity proof/boundary now lives in
   `docs/LOCAL_SECURITY_AGENT_LIVE_IDENTITY.md`

@@ -29,6 +29,7 @@ def test_local_devops_agent_live_identity_doc_is_truthful() -> None:
         "does not become a baseline internal team member",
         "optional live Telegram identity",
         "@ai_dev_team_lead_bot",
+        "@ai_dev_team_dev_ops_bot",
         "@ai_dev_team_writer_bot",
         "@ai_dev_team_reviewer_bot",
         "@ai_dev_team_security_agent_bot",
@@ -39,22 +40,21 @@ def test_local_devops_agent_live_identity_doc_is_truthful() -> None:
         "task-1779122095-e24170",
         "docs/LOCAL_DIRECT_DM_ROLE_VOICE.md",
         "live identities before = `4`",
+        "TELEGRAM_DEVOPS_BOT_TOKEN_present=true",
+        "TELEGRAM_DEVOPS_BOT_TOKEN_len=46",
+        "`('coordinator_agent', 'devops_agent', 'reviewer_agent', 'security_agent', 'writer_agent')`",
+        "token_valid=`true`",
+        "reachable=`true`",
+        "started=`true`",
+        "polling_started=`true`",
+        "inbound message: `/help`",
+        "`Девопс: 🛠 Доступные команды`",
+        "live identities after = `5`",
+        "Outcome: `devops_agent live identity certified`",
     )
 
     for marker in required_markers:
         assert marker in text
-
-    if "Outcome: `devops_agent live identity partially blocked`" in text:
-        blocked_markers = (
-            "TELEGRAM_DEVOPS_BOT_TOKEN_present=false",
-            "TELEGRAM_DEVOPS_BOT_TOKEN_len=0",
-            "ValueError: telegram_agent_token_env_missing:TELEGRAM_DEVOPS_BOT_TOKEN",
-            "`('coordinator_agent', 'reviewer_agent', 'security_agent', 'writer_agent')`",
-            "live identities after = `4`",
-            "There is no truthful direct DM proof yet for `devops_agent`.",
-        )
-        for marker in blocked_markers:
-            assert marker in text
 
     forbidden_markers = (
         "all specialists are now live",
@@ -63,6 +63,10 @@ def test_local_devops_agent_live_identity_doc_is_truthful() -> None:
         "vps rollout is complete",
         "production deploy is complete",
         "data_agent is now live-enabled",
+        "There is no truthful direct DM proof yet for `devops_agent`.",
+        "ValueError: telegram_agent_token_env_missing:TELEGRAM_DEVOPS_BOT_TOKEN",
+        "TELEGRAM_DEVOPS_BOT_TOKEN_present=false",
+        "live identities after = `4`",
     )
 
     for marker in forbidden_markers:
@@ -75,6 +79,6 @@ def test_roadmap_syncs_l15_devops_agent_live_identity_step() -> None:
     )
 
     assert "docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md" in roadmap
-    assert "`L0.15`" in roadmap
+    assert "`L0.16`" in roadmap
     assert "devops_agent" in roadmap
-    assert "second specialist Telegram" in roadmap
+    assert "real `TELEGRAM_DEVOPS_BOT_TOKEN`" in roadmap

@@ -1,17 +1,16 @@
-# L0.15 — second specialist live-identity attempt for `devops_agent`
+# L0.16 — live activation proof for `devops_agent`
 
 ## Step scope
 
-This step applies the already-proven specialist promotion pattern to the next
-bounded target:
+This step completes the second specialist promotion pattern that was opened in
+`L0.15`:
 
 - `devops_agent` remains a specialist role
 - `devops_agent` does not become a baseline internal team member
-- `devops_agent` may become an optional live Telegram identity only through
+- `devops_agent` is allowed as an optional live Telegram identity only through
   explicit local env wiring
-- this step is only about the second narrow specialist promotion contract,
-  the local token path, live startup feasibility, and one bounded direct DM
-  proof if the token exists
+- this step is only about the real local token path, fifth-bot startup, and
+  one bounded personal direct DM proof
 
 This step does **not**:
 
@@ -21,87 +20,61 @@ This step does **not**:
 - attach Hedgekeeper
 - enable write-assisted main-project work
 - start VPS/prod rollout
-- change direct-DM role voice semantics again
-- introduce any broad orchestration or UI refactor
+- refactor the runtime contract again
 
-## Exact runtime contract for `devops_agent`
+## Exact local env/token contract
 
-The runtime contract after `L0.15` is:
-
-- `security_agent` remains a promoted optional live specialist identity
-- `devops_agent` is now also allowed as a promoted optional live specialist
-  identity
-- `data_agent` still remains closed as a live identity on this step
-- neither `security_agent` nor `devops_agent` becomes a baseline internal team
-  member
-
-Truthful boundary:
-
-- runtime-exposed catalog now includes:
-  - baseline internal team
-  - `security_agent`
-  - `devops_agent`
-- actual live activation still requires explicit mapping in
-  `TELEGRAM_AGENT_TOKENS`
-
-## Exact env/token contract
-
-`.env.example` now truthfully documents:
+`.env.example` truthfully documents:
 
 - `TELEGRAM_DEVOPS_BOT_TOKEN`
 - example promoted mapping:
   `devops_agent=TELEGRAM_DEVOPS_BOT_TOKEN`
-- example second-specialist multi-bot mapping:
+- example five-bot multi-identity mapping:
   `TELEGRAM_AGENT_TOKENS=coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN,reviewer_agent=TELEGRAM_REVIEWER_BOT_TOKEN,security_agent=TELEGRAM_SECURITY_BOT_TOKEN,devops_agent=TELEGRAM_DEVOPS_BOT_TOKEN`
 
-Actual local env truth on this Mac during `L0.15`:
+Actual local env truth on this Mac during `L0.16`:
 
 - `TELEGRAM_OWNER_CHAT_ID_present=true`
 - `TELEGRAM_BOT_TOKEN_present=true`
 - `TELEGRAM_WRITER_BOT_TOKEN_present=true`
 - `TELEGRAM_REVIEWER_BOT_TOKEN_present=true`
 - `TELEGRAM_SECURITY_BOT_TOKEN_present=true`
-- `TELEGRAM_DEVOPS_BOT_TOKEN_present=false`
-- `TELEGRAM_DEVOPS_BOT_TOKEN_len=0`
-- actual local `TELEGRAM_AGENT_TOKENS` still equals:
-  `coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN,reviewer_agent=TELEGRAM_REVIEWER_BOT_TOKEN,security_agent=TELEGRAM_SECURITY_BOT_TOKEN`
+- `TELEGRAM_DEVOPS_BOT_TOKEN_present=true`
+- `TELEGRAM_DEVOPS_BOT_TOKEN_len=46`
+- actual local `TELEGRAM_AGENT_TOKENS` equals:
+  `coordinator_agent=TELEGRAM_BOT_TOKEN,writer_agent=TELEGRAM_WRITER_BOT_TOKEN,reviewer_agent=TELEGRAM_REVIEWER_BOT_TOKEN,security_agent=TELEGRAM_SECURITY_BOT_TOKEN,devops_agent=TELEGRAM_DEVOPS_BOT_TOKEN`
 
-Important truthfulness note:
+## Exact runtime path actually used
 
-- there is no stray `.env.save` snapshot in the repo root anymore
-- the blocker is no longer secret-sprawl ambiguity
-- the blocker is simply that the real local runtime env still has no
-  `TELEGRAM_DEVOPS_BOT_TOKEN`
-
-## Exact runtime path used
-
-`L0.15` used three bounded truth sources:
-
-1. update the runtime-exposed catalog so `devops_agent` is allowed by contract
-2. verify the actual local `.env` still resolves only to the current 4-role
-   live contour:
-   `('coordinator_agent', 'reviewer_agent', 'security_agent', 'writer_agent')`
-3. perform one minimal truthful activation attempt by extending
-   `TELEGRAM_AGENT_TOKENS` in-memory with:
-   `devops_agent=TELEGRAM_DEVOPS_BOT_TOKEN`
-4. stop on the exact blocker:
-   `ValueError: telegram_agent_token_env_missing:TELEGRAM_DEVOPS_BOT_TOKEN`
-5. restart the real local Telegram runtime on the patched code with the same
-   isolated live DB/log path to verify that the current 4-bot contour still
-   stays healthy without the missing devops token
-
-Patched runtime restart path used for non-regression:
+This live proof used the same isolated live persistence paths as the accepted
+local Telegram contour:
 
 - `STATE_DB_PATH=/private/tmp/ai-dev-team-live-telegram-l05/20260518T085123Z/state/state.db`
 - `OBS_LOG_PATH=/private/tmp/ai-dev-team-live-telegram-l05/20260518T085123Z/logs/pipeline-log.jsonl`
-- `.venv/bin/python scripts/run_telegram_bot.py --log-level INFO`
 
-## Exact startup/reachability proof or exact blocker
+Runtime path used:
 
-Current real 4-bot contour remained healthy on the patched code:
+1. load the real local `.env`
+2. build the multi-bot runtime spec through `core.bot_runner.build_multi_bot_runtime_spec_from_env(...)`
+3. confirm the assembled role order:
+   `('coordinator_agent', 'devops_agent', 'reviewer_agent', 'security_agent', 'writer_agent')`
+4. start the real Telegram runtime:
+   `.venv/bin/python scripts/run_telegram_bot.py --log-level INFO`
+5. wait for live Telegram reachability, PTB startup, and polling confirmation
+6. send one bounded direct DM command to the live `devops_agent` identity
+
+## Exact startup/reachability facts
+
+Live startup succeeded for the widened 5-bot contour:
 
 - `coordinator_agent`
   - bot username: `@ai_dev_team_lead_bot`
+  - token_valid=`true`
+  - reachable=`true`
+  - started=`true`
+  - polling_started=`true`
+- `devops_agent`
+  - bot username: `@ai_dev_team_dev_ops_bot`
   - token_valid=`true`
   - reachable=`true`
   - started=`true`
@@ -125,51 +98,56 @@ Current real 4-bot contour remained healthy on the patched code:
   - started=`true`
   - polling_started=`true`
 
-Exact `devops_agent` blocker:
+This resolves the exact `L0.15` blocker:
 
-- `devops_agent` is now allowed by the runtime contract
-- but the actual local env still has no `TELEGRAM_DEVOPS_BOT_TOKEN`
-- the first truthful activation attempt stops with:
-  `ValueError: telegram_agent_token_env_missing:TELEGRAM_DEVOPS_BOT_TOKEN`
+- the local `TELEGRAM_DEVOPS_BOT_TOKEN` now exists
+- the real runtime now accepts and starts `devops_agent`
+- the fifth live bot is no longer just contract-opened; it is live
 
-Because of that blocker, there is still no truthful live proof yet for:
+## Exact direct personal DM-proof
 
-- `token_valid` on `devops_agent`
-- `reachable` on `devops_agent`
-- `started` on `devops_agent`
-- `polling_started` on `devops_agent`
-- a real `getMe` identity check for `devops_agent`
-- a truthful bot username claim for a live `devops_agent` bot on this Mac
+Direct personal DM proof used:
 
-## Exact direct DM proof
+- inbound message: `/help`
+- target identity: `@ai_dev_team_dev_ops_bot`
+- exact observed reply prefix:
+  `Девопс: 🛠 Доступные команды`
 
-There is no truthful direct DM proof yet for `devops_agent`.
+Observed reply body then listed the command surface:
 
-This step therefore does **not** claim:
+- `/project`
+- `/projects`
+- `/switch`
+- `/team`
+- `/budget`
+- `/agents`
+- `/tier`
+- `/log`
+- `/stop`
+- `/retry`
+- `/push`
+- `/pr`
+- `/help`
 
-- a real direct DM to a live `devops_agent` bot identity
-- a real observed reply from `devops_agent`
-- a widened live roster from `4` to `5`
+This is a truthful personal direct DM proof because:
 
-The blocker is bounded and exact:
+- the inbound message went directly to the live `devops_agent` bot identity
+- the reply was visibly branded as `Девопс:`
+- the response did not fall back to `Координатор:`
+- this is direct live identity proof, not only a logical pipeline mention
 
-- direct personal DM proof is blocked only because the actual local
-  `TELEGRAM_DEVOPS_BOT_TOKEN` is still missing
-- the direct-DM voice path itself is already solved generically by
-  `docs/LOCAL_DIRECT_DM_ROLE_VOICE.md`
+The personal direct-DM voice behavior remains aligned with
+`docs/LOCAL_DIRECT_DM_ROLE_VOICE.md`.
 
 ## Operator-visible aftermath
 
-Current operator-visible truth after the blocked live attempt:
+The widened live contour after `L0.16` is now:
 
-- existing live contour remains:
-  - `coordinator_agent` → `@ai_dev_team_lead_bot`
-  - `writer_agent` → `@ai_dev_team_writer_bot`
-  - `reviewer_agent` → `@ai_dev_team_reviewer_bot`
-  - `security_agent` → `@ai_dev_team_security_agent_bot`
-- no fake `devops_agent` tasks were created
-- no fake `devops_agent` threads were created
-- no fake roster widening was persisted
+- `coordinator_agent` → `@ai_dev_team_lead_bot`
+- `writer_agent` → `@ai_dev_team_writer_bot`
+- `reviewer_agent` → `@ai_dev_team_reviewer_bot`
+- `security_agent` → `@ai_dev_team_security_agent_bot`
+- `devops_agent` → `@ai_dev_team_dev_ops_bot`
 
 Operator-surface readback against the same live `STATE_DB_PATH` remained
 truthful:
@@ -182,17 +160,19 @@ truthful:
 - `thread_count=3`
 - latest persisted task still remains `task-1779122095-e24170`
 
+The bounded `/help` DM proof did **not** create fake task/thread artifacts.
+
 ## Roster impact
 
-Current roster impact after truthful `L0.15` blocked activation:
+Current roster impact after truthful `L0.16` activation:
 
 - live identities before = `4`
-- live identities after = `4`
+- live identities after = `5`
 - `coordinator_agent` remains live
 - `writer_agent` remains live
 - `reviewer_agent` remains live
 - `security_agent` remains live
-- `devops_agent` is now allowed by contract but not yet live on this machine
+- `devops_agent` is now live on this machine
 - `devops_agent` still remains a specialist role, not a baseline team member
 
 ## What remains intentionally not done
@@ -206,26 +186,13 @@ Current roster impact after truthful `L0.15` blocked activation:
 
 ## Outcome
 
-Outcome: `devops_agent live identity partially blocked`
-
-The blocker is exact and bounded:
-
-- the runtime contract is now correct
-- the docs/tests are now correct
-- the direct-DM voice contract is already solved
-- the only missing piece for real activation on this Mac is the absent local
-  `TELEGRAM_DEVOPS_BOT_TOKEN`
+Outcome: `devops_agent live identity certified`
 
 ## Handoff to next step
 
-To move this exact step from blocked-path to live-proof:
+The second specialist promotion pattern is now proven end-to-end:
 
-1. add a real local `TELEGRAM_DEVOPS_BOT_TOKEN`
-2. extend the real local `TELEGRAM_AGENT_TOKENS` with
-   `devops_agent=TELEGRAM_DEVOPS_BOT_TOKEN`
-3. restart the live local Telegram runtime
-4. verify:
-   - Telegram `getMe`
-   - startup
-   - polling
-   - one bounded direct DM proof against the live `devops_agent` identity
+1. `security_agent` is live and personal
+2. `devops_agent` is live and personal
+3. the next bounded expansion step, if chosen, should stay narrow again:
+   one specialist at a time rather than a broad all-specialists wave

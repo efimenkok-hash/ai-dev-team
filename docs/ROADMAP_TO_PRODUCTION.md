@@ -171,6 +171,9 @@ Canonical operator docs for this track:
 - `L0.15` — live-activate `devops_agent` as the second specialist Telegram
   identity and certify its personal DM contour
   (`docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md`)
+- `L0.16` — connect the real `TELEGRAM_DEVOPS_BOT_TOKEN` and certify the
+  first personal live DM proof for `devops_agent`
+  (`docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md`)
 
 ---
 
