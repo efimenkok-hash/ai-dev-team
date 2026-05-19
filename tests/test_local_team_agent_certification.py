@@ -43,15 +43,21 @@ def test_local_team_agent_certification_doc_covers_team_contract_truthfully():
         "TELEGRAM_AGENT_TOKENS",
         "TELEGRAM_SECURITY_BOT_TOKEN",
         "TELEGRAM_DEVOPS_BOT_TOKEN",
+        "TELEGRAM_DATA_BOT_TOKEN",
         "docs/LOCAL_SECURITY_AGENT_LIVE_IDENTITY.md",
         "docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md",
+        "docs/LOCAL_DATA_AGENT_LIVE_IDENTITY.md",
         "does **not** become a",
         "baseline internal team member",
         "the current accepted live contour on this Mac is already the 5-bot contour",
         "`coordinator_agent`, `writer_agent`, `reviewer_agent`, `security_agent`,",
         "`devops_agent`",
         "the later live-certified second specialist proof now lives in",
-        "promoted specialist subset `security_agent` and `devops_agent`",
+        "the later third specialist contract-opened attempt now lives in",
+        "promoted specialist subset `security_agent`, `devops_agent`, and",
+        "`data_agent`",
+        "There is no remaining logical-only specialist role inside the current",
+        "specialist catalog after `L0.17`.",
     )
 
     for marker in required_markers:

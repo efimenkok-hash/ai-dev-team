@@ -929,6 +929,51 @@ def test_build_running_multi_bot_runtime_accepts_promoted_devops_identity(
     assert len(runtime.applications_by_role["devops_agent"].application.handlers) == 1
 
 
+def test_build_running_multi_bot_runtime_accepts_promoted_data_identity(
+    tmp_path,
+):
+    built_tokens: list[str] = []
+
+    def _app_factory(token):
+        built_tokens.append(token)
+        return _FakeApplication(token)
+
+    runtime = script._build_running_multi_bot_runtime(
+        {
+            "TELEGRAM_OWNER_CHAT_ID": "777",
+            "STATE_DB_PATH": str(tmp_path / "state.db"),
+            "TELEGRAM_AGENT_TOKENS": (
+                "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                "data_agent=TELEGRAM_DATA_BOT_TOKEN"
+            ),
+            "TELEGRAM_BOT_TOKEN": "123:coord",
+            "TELEGRAM_DATA_BOT_TOKEN": "779:data",
+        },
+        _ImmediateLoop(),
+        ptb_runtime=_FakePTBRuntime(_app_factory),
+    )
+
+    assert runtime is not None
+    assert built_tokens == ["123:coord", "779:data"]
+    assert tuple(runtime.applications_by_role.keys()) == (
+        COORDINATOR_ROLE,
+        "data_agent",
+    )
+    assert runtime.outbound_sender.enabled_roles() == (
+        COORDINATOR_ROLE,
+        "data_agent",
+    )
+    assert runtime.progress_sender.enabled_roles() == (
+        COORDINATOR_ROLE,
+        "data_agent",
+    )
+    assert (
+        runtime.lifecycle_report.states_by_role["data_agent"].application_built
+        is True
+    )
+    assert len(runtime.applications_by_role["data_agent"].application.handlers) == 1
+
+
 def test_multi_bot_runtime_routes_coordinator_reply_through_coordinator_sender(
     tmp_path,
 ):

@@ -36,6 +36,7 @@ SPECIALIST_ROLE_ORDER: tuple[str, ...] = (
 OPTIONAL_LIVE_SPECIALIST_ROLE_ORDER: tuple[str, ...] = (
     "security_agent",
     "devops_agent",
+    "data_agent",
 )
 
 # Selectable logical roles are LLM-backed internal participants that can be

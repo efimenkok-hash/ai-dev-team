@@ -92,14 +92,21 @@ def test_role_classification_helpers_work_for_baseline_and_specialists():
     assert is_selectable_agent_role("devops_agent") is True
     assert is_runtime_exposed_agent_role("devops_agent") is True
 
+    assert is_known_agent_role("data_agent") is True
+    assert is_baseline_internal_team_role("data_agent") is False
+    assert is_specialist_role("data_agent") is True
+    assert is_selectable_agent_role("data_agent") is True
+    assert is_runtime_exposed_agent_role("data_agent") is True
 
-def test_runtime_exposed_roles_include_baseline_and_two_promoted_specialists():
+
+def test_runtime_exposed_roles_include_baseline_and_three_promoted_specialists():
     assert RUNTIME_EXPOSED_AGENT_ROLES == frozenset(
-        BASELINE_INTERNAL_TEAM_ROLE_ORDER + ("security_agent", "devops_agent")
+        BASELINE_INTERNAL_TEAM_ROLE_ORDER
+        + ("security_agent", "devops_agent", "data_agent")
     )
     assert is_runtime_exposed_agent_role("security_agent") is True
     assert is_runtime_exposed_agent_role("devops_agent") is True
-    assert is_runtime_exposed_agent_role("data_agent") is False
+    assert is_runtime_exposed_agent_role("data_agent") is True
 
 
 def test_unknown_role_is_not_treated_as_known_or_specialist():

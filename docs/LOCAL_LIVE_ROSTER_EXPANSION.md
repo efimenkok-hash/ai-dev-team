@@ -156,6 +156,7 @@ runtime-exposed roles:
 - `fixer_agent`
 - `security_agent`
 - `devops_agent`
+- `data_agent`
 
 Important truth boundary after the later specialist promotion steps:
 
@@ -170,10 +171,18 @@ Important truth boundary after the later specialist promotion steps:
   team member
 - `devops_agent` becomes live only when `TELEGRAM_AGENT_TOKENS` explicitly
   maps it to `TELEGRAM_DEVOPS_BOT_TOKEN`
+- `data_agent` is also runtime-exposed in the catalog after the later third
+  specialist promotion contract
+- `data_agent` still remains a specialist role, not a baseline internal
+  team member
+- `data_agent` becomes live only when `TELEGRAM_AGENT_TOKENS` explicitly
+  maps it to `TELEGRAM_DATA_BOT_TOKEN`
 - this `L0.10` artifact still truthfully records that the actual live roster
   at that step stayed at only three separate Telegram identities
 - the current later live-certified result for the second promoted specialist
   now lives in `docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md`
+- the later third specialist contract-opened attempt now lives in
+  `docs/LOCAL_DATA_AGENT_LIVE_IDENTITY.md`
 
 ### Logical pipeline roles already proven in execution
 
@@ -198,7 +207,8 @@ So after this step the correct statement is:
   it was not yet started live during `L0.10`
 - but only three roles were actually separate live Telegram identities on
   `L0.10`; later certified live widening now reaches five identities through
-  `security_agent` and `devops_agent`
+  `security_agent` and `devops_agent`, while `data_agent` is later
+  contract-opened but not yet live-certified
 
 This step does **not** allow anyone to say that the whole baseline team is
 already live as separate bots.

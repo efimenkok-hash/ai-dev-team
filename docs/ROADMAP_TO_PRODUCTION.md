@@ -174,6 +174,9 @@ Canonical operator docs for this track:
 - `L0.16` — connect the real `TELEGRAM_DEVOPS_BOT_TOKEN` and certify the
   first personal live DM proof for `devops_agent`
   (`docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md`)
+- `L0.17` — open `data_agent` as the third specialist live identity and
+  truthfully attempt to carry it to live DM proof
+  (`docs/LOCAL_DATA_AGENT_LIVE_IDENTITY.md`)
 
 ---
 

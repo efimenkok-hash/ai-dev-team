@@ -89,6 +89,7 @@ def test_bot_identity_rejects_unknown_role():
     (
         ("security_agent", "TELEGRAM_SECURITY_BOT_TOKEN", "777:security"),
         ("devops_agent", "TELEGRAM_DEVOPS_BOT_TOKEN", "778:devops"),
+        ("data_agent", "TELEGRAM_DATA_BOT_TOKEN", "779:data"),
     ),
 )
 def test_bot_identity_accepts_promoted_specialist_runtime_role(
@@ -104,16 +105,6 @@ def test_bot_identity_accepts_promoted_specialist_runtime_role(
 
     assert identity.agent_role == role
     assert identity.token_env_key == env_key
-
-
-@pytest.mark.parametrize("role", ("data_agent",))
-def test_bot_identity_rejects_specialist_role_not_runtime_exposed(role: str):
-    with pytest.raises(
-        ValueError,
-        match=fr"runtime_agent_role_not_allowed:{role}",
-    ):
-        _identity(role=role)
-
 
 # ---------------------------------------------------------------------------
 # PerRoleBotMap
@@ -532,6 +523,29 @@ def test_build_multi_bot_runtime_spec_accepts_promoted_devops_identity():
     )
 
 
+def test_build_multi_bot_runtime_spec_accepts_promoted_data_identity():
+    spec = build_multi_bot_runtime_spec(
+        {
+            "TELEGRAM_AGENT_TOKENS": (
+                "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                "data_agent=TELEGRAM_DATA_BOT_TOKEN"
+            ),
+            "TELEGRAM_BOT_TOKEN": "123:coord",
+            "TELEGRAM_DATA_BOT_TOKEN": "779:data",
+        }
+    )
+
+    assert spec is not None
+    assert tuple(spec.role_map.by_role.keys()) == (
+        COORDINATOR_ROLE,
+        "data_agent",
+    )
+    assert (
+        spec.role_map.by_role["data_agent"].token_env_key
+        == "TELEGRAM_DATA_BOT_TOKEN"
+    )
+
+
 def test_build_multi_bot_runtime_spec_wraps_invalid_binding_syntax():
     with pytest.raises(
         ValueError,
@@ -568,28 +582,19 @@ def test_build_multi_bot_runtime_spec_uses_explicit_persona_registry_validation(
     assert spec.primary_bot.agent_role == COORDINATOR_ROLE
 
 
-@pytest.mark.parametrize(
-    ("role", "env_key", "token"),
-    (
-        ("data_agent", "TELEGRAM_DATA_BOT_TOKEN", "779:data"),
-    ),
-)
-def test_build_multi_bot_runtime_spec_rejects_specialist_runtime_identity_activation(
-    role: str,
-    env_key: str,
-    token: str,
-):
+def test_build_multi_bot_runtime_spec_rejects_unknown_runtime_identity_activation():
     with pytest.raises(
         ValueError,
-        match=fr"telegram_agent_role_not_runtime_exposed:{role}",
+        match="telegram_agent_role_unknown:analytics_agent",
     ):
         build_multi_bot_runtime_spec(
             {
                 "TELEGRAM_AGENT_TOKENS": (
-                    f"coordinator_agent=TELEGRAM_BOT_TOKEN,{role}={env_key}"
+                    "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                    "analytics_agent=TELEGRAM_ANALYTICS_BOT_TOKEN"
                 ),
                 "TELEGRAM_BOT_TOKEN": "123:coord",
-                env_key: token,
+                "TELEGRAM_ANALYTICS_BOT_TOKEN": "780:analytics",
             }
         )
 
