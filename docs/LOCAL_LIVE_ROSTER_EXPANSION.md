@@ -142,7 +142,7 @@ Still only:
 ### Runtime-exposed roles in the product catalog
 
 The product catalog in `core/agent_role_catalog.py` now classifies the whole
-baseline internal team plus the first promoted specialist subset as
+baseline internal team plus the later promoted specialist subset as
 runtime-exposed roles:
 
 - `coordinator_agent`
@@ -155,14 +155,21 @@ runtime-exposed roles:
 - `qa_agent`
 - `fixer_agent`
 - `security_agent`
+- `devops_agent`
 
-Important truth boundary after `L0.11`:
+Important truth boundary after the later specialist promotion steps:
 
 - `security_agent` is runtime-exposed in the catalog
 - `security_agent` still remains a specialist role, not a baseline internal
   team member
 - `security_agent` becomes live only when `TELEGRAM_AGENT_TOKENS` explicitly
   maps it to `TELEGRAM_SECURITY_BOT_TOKEN`
+- `devops_agent` is also runtime-exposed in the catalog after the later second
+  specialist promotion contract
+- `devops_agent` still remains a specialist role, not a baseline internal
+  team member
+- `devops_agent` becomes live only when `TELEGRAM_AGENT_TOKENS` explicitly
+  maps it to `TELEGRAM_DEVOPS_BOT_TOKEN`
 - this `L0.10` artifact still truthfully records that the actual live roster
   at that step stayed at only three separate Telegram identities
 

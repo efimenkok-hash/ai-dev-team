@@ -168,6 +168,9 @@ Canonical operator docs for this track:
 - `L0.14` — fix direct-DM role voice for live specialist bots and certify
   a personal reply from `security_agent`
   (`docs/LOCAL_DIRECT_DM_ROLE_VOICE.md`)
+- `L0.15` — live-activate `devops_agent` as the second specialist Telegram
+  identity and certify its personal DM contour
+  (`docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md`)
 
 ---
 

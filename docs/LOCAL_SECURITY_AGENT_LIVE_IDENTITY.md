@@ -200,6 +200,8 @@ Historical note:
 - that remaining direct-DM role-voice gap was later closed in `L0.14`
 - canonical follow-up artifact:
   `docs/LOCAL_DIRECT_DM_ROLE_VOICE.md`
+- the second specialist live-identity follow-up later moved to:
+  `docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md`
 
 ## Handoff to next step
 

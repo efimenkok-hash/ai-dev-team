@@ -42,9 +42,14 @@ def test_local_team_agent_certification_doc_covers_team_contract_truthfully():
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_AGENT_TOKENS",
         "TELEGRAM_SECURITY_BOT_TOKEN",
+        "TELEGRAM_DEVOPS_BOT_TOKEN",
         "docs/LOCAL_SECURITY_AGENT_LIVE_IDENTITY.md",
+        "docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md",
         "does **not** become a",
         "baseline internal team member",
+        "the current accepted live contour on this Mac is already the 4-bot contour",
+        "`coordinator_agent`, `writer_agent`, `reviewer_agent`, `security_agent`",
+        "promoted specialist subset `security_agent` and `devops_agent`",
     )
 
     for marker in required_markers:
@@ -60,6 +65,8 @@ def test_local_team_agent_certification_doc_covers_team_contract_truthfully():
         "all 12 agents are already fully separate Telegram bot identities",
         "every known role is already a dedicated Telegram bot identity",
         "specialist roles are already separately exposed as Telegram bot identities",
+        "runtime-exposed roles are clearly limited to the baseline internal team",
+        "the current live 3-bot contour still remains valid when that extra mapping is absent",
     )
 
     for marker in forbidden_markers:

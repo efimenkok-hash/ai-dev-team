@@ -142,8 +142,10 @@ plus the first promoted specialist subset:
 - `qa_agent`
 - `fixer_agent`
 - `security_agent`
+- `devops_agent`
 
-This is the truthful current meaning of runtime exposure after `L0.11`:
+This is the truthful current meaning of runtime exposure after the later
+specialist promotion steps:
 
 - these roles are the identities the current runtime/control-plane semantics
   are built around
@@ -153,18 +155,26 @@ This is the truthful current meaning of runtime exposure after `L0.11`:
 - `security_agent` is only an optional live Telegram identity when
   `TELEGRAM_AGENT_TOKENS` explicitly maps it to
   `TELEGRAM_SECURITY_BOT_TOKEN`
-- the currently still-closed specialist roles remain `devops_agent` and
-  `data_agent`
-- the current live 3-bot contour still remains valid when that extra mapping
-  is absent
+- `devops_agent` also remains a specialist role and does **not** become a
+  baseline internal team member
+- `devops_agent` is only an optional live Telegram identity when
+  `TELEGRAM_AGENT_TOKENS` explicitly maps it to
+  `TELEGRAM_DEVOPS_BOT_TOKEN`
+- the currently still-closed specialist role remains `data_agent`
+- the baseline 3-bot contour still remains a truthful fallback when promoted
+  specialist mappings are absent
+- the current accepted live contour on this Mac is already the 4-bot contour:
+  `coordinator_agent`, `writer_agent`, `reviewer_agent`, `security_agent`
+- the next truthful widening attempt for a fifth live bot is documented in
+  `docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md`
 - the exact specialist live-identity proof/boundary now lives in
   `docs/LOCAL_SECURITY_AGENT_LIVE_IDENTITY.md`
+  and `docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md`
 
 ## Logical-Only Roles
 
-The current still logical-only specialist roles are:
+The current still logical-only specialist role is:
 
-- `devops_agent`
 - `data_agent`
 
 Logical-only means:
@@ -175,8 +185,9 @@ Logical-only means:
 - the role can be represented in project specialist state
 - the role is not yet separately promoted as a live Telegram bot identity
 
-`security_agent` is no longer logical-only in the runtime-exposed catalog, but
-it still remains a specialist role rather than a baseline internal team role.
+`security_agent` and `devops_agent` are no longer logical-only in the
+runtime-exposed catalog, but they still remain specialist roles rather than
+baseline internal team roles.
 
 This step does **not** certify that all logical roles are already fully
 separate Telegram bot identities.
@@ -292,8 +303,10 @@ Local pilot evidence boundary from `L0.1`:
 - the baseline internal team is explicit and stable
 - specialist roles are explicit and stable
 - persona coverage exists for all known roles
-- runtime-exposed roles are clearly limited to the baseline internal team
-- logical-only specialist roles are clearly separated from runtime exposure
+- runtime-exposed roles are now truthfully the baseline internal team plus the
+  promoted specialist subset `security_agent` and `devops_agent`
+- logical-only specialist roles are still clearly separated from runtime
+  exposure, and the current still-closed role is `data_agent`
 - assembled team semantics are truthful and bounded
 - `/agents` and Web Office team/project surfaces expose the existing model
   without pretending all roles are already fully live Telegram identities

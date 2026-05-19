@@ -1601,6 +1601,26 @@ def test_private_security_dm_command_reply_uses_security_voice():
     assert sender.sent[0].text.startswith("Безопасник:")
 
 
+def test_private_devops_dm_command_reply_uses_devops_voice():
+    sender = CapturingSender()
+    reg = CommandRegistry()
+    reg.register(CommandName.HELP, lambda c, ctx: "/help: список")
+    bridge = _make_bridge(sender=sender, commands=reg)
+
+    bridge.handle(
+        _msg(
+            chat_id=OWNER_CHAT_ID,
+            user_id=OWNER_CHAT_ID,
+            text="/help",
+            incoming_bot_role="devops_agent",
+        )
+    )
+
+    assert sender.sent[0].sender_role == "devops_agent"
+    assert sender.sent[0].delivery_role == "devops_agent"
+    assert sender.sent[0].text.startswith("Девопс:")
+
+
 def test_non_owner_secondary_private_dm_denial_stays_in_same_bot_thread():
     sender = CapturingSender()
     bridge = _make_bridge(sender=sender)

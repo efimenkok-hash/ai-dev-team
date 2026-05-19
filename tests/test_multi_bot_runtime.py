@@ -84,18 +84,29 @@ def test_bot_identity_rejects_unknown_role():
         _identity(role="ghost_agent")
 
 
-def test_bot_identity_accepts_promoted_security_specialist_runtime_role():
+@pytest.mark.parametrize(
+    ("role", "env_key", "token"),
+    (
+        ("security_agent", "TELEGRAM_SECURITY_BOT_TOKEN", "777:security"),
+        ("devops_agent", "TELEGRAM_DEVOPS_BOT_TOKEN", "778:devops"),
+    ),
+)
+def test_bot_identity_accepts_promoted_specialist_runtime_role(
+    role: str,
+    env_key: str,
+    token: str,
+):
     identity = _identity(
-        role="security_agent",
-        token_env_key="TELEGRAM_SECURITY_BOT_TOKEN",
-        token="777:security",
+        role=role,
+        token_env_key=env_key,
+        token=token,
     )
 
-    assert identity.agent_role == "security_agent"
-    assert identity.token_env_key == "TELEGRAM_SECURITY_BOT_TOKEN"
+    assert identity.agent_role == role
+    assert identity.token_env_key == env_key
 
 
-@pytest.mark.parametrize("role", ("devops_agent", "data_agent"))
+@pytest.mark.parametrize("role", ("data_agent",))
 def test_bot_identity_rejects_specialist_role_not_runtime_exposed(role: str):
     with pytest.raises(
         ValueError,
@@ -498,6 +509,29 @@ def test_build_multi_bot_runtime_spec_accepts_promoted_security_identity():
     )
 
 
+def test_build_multi_bot_runtime_spec_accepts_promoted_devops_identity():
+    spec = build_multi_bot_runtime_spec(
+        {
+            "TELEGRAM_AGENT_TOKENS": (
+                "coordinator_agent=TELEGRAM_BOT_TOKEN,"
+                "devops_agent=TELEGRAM_DEVOPS_BOT_TOKEN"
+            ),
+            "TELEGRAM_BOT_TOKEN": "123:coord",
+            "TELEGRAM_DEVOPS_BOT_TOKEN": "778:devops",
+        }
+    )
+
+    assert spec is not None
+    assert tuple(spec.role_map.by_role.keys()) == (
+        COORDINATOR_ROLE,
+        "devops_agent",
+    )
+    assert (
+        spec.role_map.by_role["devops_agent"].token_env_key
+        == "TELEGRAM_DEVOPS_BOT_TOKEN"
+    )
+
+
 def test_build_multi_bot_runtime_spec_wraps_invalid_binding_syntax():
     with pytest.raises(
         ValueError,
@@ -537,7 +571,6 @@ def test_build_multi_bot_runtime_spec_uses_explicit_persona_registry_validation(
 @pytest.mark.parametrize(
     ("role", "env_key", "token"),
     (
-        ("devops_agent", "TELEGRAM_DEVOPS_BOT_TOKEN", "778:devops"),
         ("data_agent", "TELEGRAM_DATA_BOT_TOKEN", "779:data"),
     ),
 )

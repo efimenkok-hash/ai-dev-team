@@ -69,6 +69,7 @@ def _runtime_env(
     tmp_path,
     *,
     include_security: bool = False,
+    include_devops: bool = False,
 ) -> dict[str, str]:
     env = {
         "TELEGRAM_OWNER_CHAT_ID": "777",
@@ -87,6 +88,11 @@ def _runtime_env(
             ",security_agent=TELEGRAM_SECURITY_BOT_TOKEN"
         )
         env["TELEGRAM_SECURITY_BOT_TOKEN"] = "999:security"
+    if include_devops:
+        env["TELEGRAM_AGENT_TOKENS"] += (
+            ",devops_agent=TELEGRAM_DEVOPS_BOT_TOKEN"
+        )
+        env["TELEGRAM_DEVOPS_BOT_TOKEN"] = "998:devops"
     return env
 
 
@@ -94,6 +100,7 @@ def _make_bridge(
     task_handler,
     *,
     include_security: bool = False,
+    include_devops: bool = False,
 ) -> MultiBotBridge:
     coordinator = _identity(
         token_env_key="TELEGRAM_BOT_TOKEN",
@@ -116,6 +123,14 @@ def _make_bridge(
                 "security_agent",
                 token_env_key="TELEGRAM_SECURITY_BOT_TOKEN",
                 token="999:security",
+            )
+        )
+    if include_devops:
+        identities.append(
+            _identity(
+                "devops_agent",
+                token_env_key="TELEGRAM_DEVOPS_BOT_TOKEN",
+                token="998:devops",
             )
         )
 
@@ -144,6 +159,7 @@ def _build_runtime(
     ptb_runtime: MockPtbRuntime | None = None,
     bridge: MultiBotBridge | None = None,
     include_security: bool = False,
+    include_devops: bool = False,
 ) -> script.RunningMultiBotRuntime:
     resolved_ptb_runtime = ptb_runtime or MockPtbRuntime()
     resolved_bridge = bridge or _make_bridge(
@@ -152,13 +168,18 @@ def _build_runtime(
             body="принял",
         ),
         include_security=include_security,
+        include_devops=include_devops,
     )
     with patch(
         "scripts.run_telegram_bot.build_multi_bot_bridge_from_env",
         return_value=resolved_bridge,
     ):
         runtime = script._build_running_multi_bot_runtime(
-            _runtime_env(tmp_path, include_security=include_security),
+            _runtime_env(
+                tmp_path,
+                include_security=include_security,
+                include_devops=include_devops,
+            ),
             ImmediateExecutorLoop(),
             ptb_runtime=resolved_ptb_runtime,
         )
@@ -292,6 +313,38 @@ def test_mock_ptb_runtime_starts_promoted_security_identity_truthfully(
     assert security_state.reachability.bot_username == "security_bot"
     assert security_state.started is True
     assert security_state.polling_started is True
+
+
+def test_mock_ptb_runtime_starts_promoted_devops_identity_truthfully(
+    tmp_path,
+):
+    ptb_runtime = MockPtbRuntime(
+        app_specs_by_token={
+            "123:coord": MockPtbApplicationSpec(bot_username="coord_bot"),
+            "456:writer": MockPtbApplicationSpec(bot_username="writer_bot"),
+            "789:reviewer": MockPtbApplicationSpec(
+                bot_username="reviewer_bot"
+            ),
+            "998:devops": MockPtbApplicationSpec(
+                bot_username="devops_bot"
+            ),
+        }
+    )
+
+    runtime = _build_runtime(
+        tmp_path,
+        ptb_runtime=ptb_runtime,
+        include_devops=True,
+    )
+
+    asyncio.run(script._start_running_multi_bot_runtime(runtime))
+
+    assert "devops_agent" in runtime.applications_by_role
+    devops_state = runtime.lifecycle_report.states_by_role["devops_agent"]
+    assert devops_state.reachability.reachable is True
+    assert devops_state.reachability.bot_username == "devops_bot"
+    assert devops_state.started is True
+    assert devops_state.polling_started is True
 
 
 def test_coordinator_inbound_reaches_bridge_through_registered_handler(tmp_path):
