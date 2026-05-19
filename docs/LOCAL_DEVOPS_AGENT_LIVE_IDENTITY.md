@@ -177,9 +177,11 @@ Current roster impact after truthful `L0.16` activation:
 
 ## What remains intentionally not done
 
-- `data_agent` was not yet activated during `L0.16`; the later contract-opened
-  attempt now lives in `docs/LOCAL_DATA_AGENT_LIVE_IDENTITY.md`
-- all specialist roles are still not live
+- `data_agent` was not yet activated during `L0.16`; the later live-certified
+  third specialist proof now lives in `docs/LOCAL_DATA_AGENT_LIVE_IDENTITY.md`
+- the third specialist role was not yet live during `L0.16`; later full
+  specialist-catalog live proof now lives in
+  `docs/LOCAL_DATA_AGENT_LIVE_IDENTITY.md`
 - 20–30 live agents are still not running
 - Hedgekeeper is still not attached
 - write-assisted main-project work is still not enabled

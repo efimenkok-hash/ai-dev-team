@@ -49,15 +49,16 @@ def test_local_team_agent_certification_doc_covers_team_contract_truthfully():
         "docs/LOCAL_DATA_AGENT_LIVE_IDENTITY.md",
         "does **not** become a",
         "baseline internal team member",
-        "the current accepted live contour on this Mac is already the 5-bot contour",
+        "the current accepted live contour on this Mac is already the 6-bot contour",
         "`coordinator_agent`, `writer_agent`, `reviewer_agent`, `security_agent`,",
-        "`devops_agent`",
+        "`devops_agent`, `data_agent`",
         "the later live-certified second specialist proof now lives in",
-        "the later third specialist contract-opened attempt now lives in",
+        "the later third specialist live-certified proof now lives in",
         "promoted specialist subset `security_agent`, `devops_agent`, and",
         "`data_agent`",
         "There is no remaining logical-only specialist role inside the current",
         "specialist catalog after `L0.17`.",
+        "All three are currently live on this Mac",
     )
 
     for marker in required_markers:

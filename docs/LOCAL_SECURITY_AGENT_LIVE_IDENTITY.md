@@ -175,9 +175,10 @@ Live-vs-logical boundary after this step:
 
 ## What remains intentionally not done
 
-- `devops_agent` is still not activated
-- `data_agent` is still not activated
-- all specialist roles are still not live
+- `devops_agent` and `data_agent` were not yet activated during `L0.13`; the
+  later follow-up proofs now live in
+  `docs/LOCAL_DEVOPS_AGENT_LIVE_IDENTITY.md`
+  and `docs/LOCAL_DATA_AGENT_LIVE_IDENTITY.md`
 - 20–30 live agents are still not running
 - Hedgekeeper is still not attached
 - write-assisted main-project work is still not enabled
